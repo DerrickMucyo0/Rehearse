@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react'
+import Interview from './Interview'
 
 type BackendStatus = 'Checking backend…' | 'Backend connected' | 'Backend unavailable'
 
@@ -40,6 +41,7 @@ export default function App() {
     <main>
       <h1>Rehearse</h1>
       <p>Practice. Diagnose. Drill. Improve.</p>
+      <Interview />
       <p className="backend-status" role="status">{status}</p>
     </main>
   )
