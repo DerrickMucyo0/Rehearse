@@ -32,3 +32,109 @@ Notes:
 - npm and pip showed optional upgrade notices; neither tool was upgraded.
 - Final pre-commit checks: backend test passed with warnings treated as errors;
   frontend build and lint passed. Work stops at this foundation.
+
+## Milestone 2 — Interview Session Engine
+
+Goal:
+Build a deterministic text interview flow from session creation to completion.
+
+Built:
+- UUID-based session creation, retrieval, and answer submission endpoints.
+- Five fixed questions, ordered answers, and active/completed state.
+- Pydantic validation and 404/409/422 responses for invalid operations.
+- Minimal interview form, progress, completion state, and visible request errors.
+- Preserved the health endpoint and frontend backend-status indicator.
+
+Design decisions:
+- Routes delegate state management to a small in-memory service. Storage can be
+  replaced behind its start/get/submit interface without rewriting route behavior.
+- A lock protects each state transition; responses are detached copies.
+- Answers include the current question index to reject duplicate/stale writes.
+- The frontend checks server state before retrying an answer, retains text on
+  failure, disables pending submissions, and applies a ten-second request timeout.
+- Whitespace is trimmed; blank, non-string, and over-10,000-character answers are rejected.
+- Completed sessions have no current question; their index equals the question count.
+- No runtime dependencies added; frontend regression testing adds Vitest, jsdom,
+  React Testing Library, and Playwright. Development stays on `feat/interview-session`.
+
+Verification:
+- `backend/.venv/bin/python -m pytest -W error`: 24 passed, no warnings.
+- Frontend build/type check and lint: passed.
+- Tests cover health, creation/retrieval, unique IDs, session independence,
+  advancement, final completion, immutable state after rejected submissions,
+  stale/future indices, unknown sessions, malformed UUIDs, and invalid answers/bodies.
+- User manually verified the complete flow in Chrome; see final verification below.
+
+Problems encountered:
+- Initial API/interface checks passed; regression-test development and the
+  completion investigation are recorded below.
+- Lost answer responses could otherwise cause an accidental second submission;
+  index validation and frontend state reconciliation handle this case.
+
+Current limitations:
+- Process-local sessions disappear on restart/reload and require a single worker.
+- No persistence, expiry, session listing, or browser-refresh recovery. An abandoned
+  session remains in memory until the backend stops.
+- A lost creation response may leave an unused session; starting again creates another.
+- No authentication, AI, voice, recording, scoring, analytics, or database.
+- Work is limited to Issue #1; no next milestone started.
+
+### Completion-screen follow-up
+
+- Investigated the reported return to the initial screen after answer five.
+  A direct TestClient run confirmed HTTP 200 with `status: completed`, five
+  answers, index 5, and `current_question: null`.
+- The frontend regression reproduction retained the completed session; no
+  automatic state reset was reproduced. The existing completion screen reused
+  “Start Interview”, making its action indistinguishable from the initial action.
+- Updated only completion wording to “Interview Complete”, confirmation that all
+  questions were completed, and “Start New Interview”. Backend logic is unchanged.
+- Added Vitest, jsdom, and React Testing Library as development dependencies and
+  `npm test`. Two tests exercise all five submissions through the frontend API
+  helper with mocked HTTP responses, explicit restart, and failed restart while
+  preserving completion. Both failed on the old wording before the change.
+- Initial type checking caught an unsupported `exact` option in the new role
+  queries; removed it (string role names already match exactly).
+- At this stage, browser recheck was still required; the reported state reset
+  was not reproduced in the automated environment. Final verification follows.
+- Final checks: backend 24 passed with warnings treated as errors; frontend
+  2 regression tests passed; strict TypeScript/build and lint passed.
+
+### Live-browser completion investigation
+
+- The user reported that the reset persisted after the wording change. The
+  previous change did not establish or fix the cause of that reported reset.
+- Inspected the actual Vite server on localhost:5173: its working directory is
+  this project's frontend, and served source maps match App.tsx, Interview.tsx,
+  and interviewApi.ts on disk. A fresh Chrome context connected to Vite normally.
+- Traced five real submissions in Chrome against the existing Vite/FastAPI pair.
+  The fifth POST returned HTTP 200, status completed, five answers, index 5,
+  and current_question null. The page retained the requested completion content.
+- App mounts Interview unconditionally. There is no completion callback, changing
+  key, or explicit session-clearing operation. submitAnswer returns the completed
+  response, submit stores it, and the completed branch renders in place.
+- Added a Playwright full-App integration regression using actual API responses,
+  with no API or component mocks. It verifies the mounted region remains the
+  same DOM node, no extra navigation/creation occurs, completion remains visible
+  during an idle observation, and only an explicit restart creates a second session.
+- Checks passed: backend 24 tests with warnings treated as errors; frontend 2
+  component tests; 1 real-browser integration test; strict type check/build; lint.
+- The live browser logged a favicon 404, but no JavaScript exceptions. A favicon
+  request does not change React session state. No unrelated favicon change made.
+- No production application code changed in this investigation. No state reset
+  reproduced; the exact cause of the earlier behavior was not established.
+  Requested its preserved Network and Console trace to distinguish navigation,
+  reload/remount, stale tab code, or an unexpected response.
+
+### Final manual verification
+
+- The user verified Issue #1 in Chrome: Start Interview opens question 1, answers
+  advance through all five questions, and empty answers do not advance.
+- The final answer displays “Interview Complete”, “You completed all 5 questions.”,
+  and “Start New Interview”. Explicit restart creates a new interview at question 1.
+- The backend connection remains healthy. The earlier reported reset is no longer
+  observed in this verification; its historical cause was not established.
+- Retained both component and real-browser regression tests for this verified flow.
+- Final pre-commit verification: backend 24 passed with warnings treated as errors;
+  frontend component tests 2 passed; Playwright Chrome E2E 1 passed; strict
+  TypeScript/build, lint, and `git diff --check` passed.
