@@ -228,3 +228,66 @@ Verification:
   prototype with no global concurrency/rate limits or authentication.
 - Prepared as three commits: backend audio API/tests, frontend recording flow/tests,
   and milestone documentation. No push or merge; work stops at this milestone.
+
+## Issue #7 — Speech-to-text transcription
+
+- Confirmed clean `feat/speech-transcription` and inspected the existing audio/session
+  service, multipart validation, recording hook/UI, API helpers, tests, and dependencies.
+- Added a small `TranscriptionService` protocol with dependency injection and a separate
+  `ElevenLabsTranscriptionService`. Routes and application result models do not expose
+  SDK objects. Shared multipart/audio validation now serves upload and transcription.
+- Installed and inspected official ElevenLabs Python SDK 2.70.0 signatures and response
+  models. Uses `AsyncElevenLabs.speech_to_text.convert`, `model_id="scribe_v2"`, and
+  `timestamps_granularity="word"`, with event tagging/diarization disabled. An explicit
+  httpx dependency owns the async transport lifetime; no unrelated upgrades requested.
+- `POST /api/sessions/{session_id}/transcriptions` accepts audio/question_index, validates
+  the current session/question before provider work and again afterward, and returns
+  text, optional language, and useful word intervals. Never submits or advances a session.
+- Word timings are retained for later deterministic pause/pacing/filler analysis;
+  no measurements, AI follow-ups, Nemotron, TTS, realtime transcription, database,
+  authentication, or deployment changes implemented.
+- Reads `ELEVENLABS_API_KEY` from the backend environment only at transcription time.
+  Empty `.env.example` fits the existing ignore rules; no dotenv or frontend key added.
+- Missing configuration returns 503, provider/network deadline timeout 504, and provider
+  failures or malformed/empty/overlong transcripts 502. Errors are sanitized. The SDK
+  has retries disabled and a 60-second total deadline; browser requests allow 75 seconds.
+- Extended AudioAnswer with Transcribe Recording while retaining upload-only Send Recording.
+  Transcripts fill the existing textarea for review/edit and explicit Submit Answer.
+  Any existing textarea content disables transcription; typing/submission are locked
+  during the request. Duplicate requests are guarded and unmount aborts/ignores results.
+  The MediaRecorder hook and cleanup behavior remain unchanged.
+- Rehearse retains no permanent audio and closes temporary files on request exit.
+  Transcription deliberately sends audio to ElevenLabs; provider retention follows the
+  account's policies. Browser cancellation cannot guarantee cancellation at the provider.
+
+Verification:
+- Backend suite with warnings as errors: 108 passed, including 59 new transcription
+  cases. Existing 49 audio/session/health cases remain passing. Tests cover session
+  and upload validation, non-advancement, stale results, file closure, missing config,
+  provider failure/timeouts, malformed output, optional metadata, word timing mapping,
+  and the installed SDK's multipart request shape with a mocked HTTP transport.
+- Frontend component suite: 30 passed, including 10 new transcription cases covering
+  loading/duplicate prevention, editable draft population, explicit submission, draft
+  protection, errors/retry, unusable results, and abort/late-result handling. Existing
+  typed completion and microphone-cleanup tests remain passing.
+- Strict TypeScript/Vite build, Oxlint, and `git diff --check` passed. Existing CI commands
+  and workflow remain unchanged. Final diff/status reviewed for milestone-only scope.
+- Tests use fake transcribers or mocked SDK transport and explicitly block real provider
+  transport in transcription tests. No real API key or real provider call used.
+- No secrets, recorded audio, .env files with values, dependencies, environments, caches,
+  or build artifacts included. README documents hidden environment entry, privacy,
+  API behavior/statuses, and exact manual checks with a real key.
+- User manual end-to-end verification passed in Chrome with a fresh interview and
+  real microphone recording: ElevenLabs Scribe v2 returned the transcript, the UI
+  displayed the review/edit confirmation, and the textarea contained editable text.
+  Transcription did not advance the question; explicit Submit Answer advanced from
+  Question 1 to Question 2. Existing-text replacement protection also worked.
+- The earlier 401 authentication issue was resolved by replacing/rotating the provider
+  key. It was not an application-code defect. No real key is included in the repository.
+- Removed temporary execution breadcrumbs, their flag/helper/call sites, and tests
+  specific to those breadcrumbs. Retained default-dependency route regression coverage.
+- Retained opt-in, sanitized failure diagnostics (`REHEARSE_TRANSCRIPTION_DEBUG=1`,
+  off by default): one stderr line containing a fixed stage/category and numeric
+  provider status if available. No exception text, headers, body, transcript, audio,
+  or credentials are emitted. HTTP 503/504/502 behavior is unchanged.
+- No new product features, frontend key exposure, commit, or push.

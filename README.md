@@ -2,7 +2,8 @@
 
 Rehearse is a communication practice platform in development for interviews,
 public speaking, negotiations, and presentations. The current prototype supports
-text interviews with five fixed questions, answer submission, and a completion state.
+interviews with five fixed questions, typed or transcribed draft answers, explicit answer
+submission, and a completion state.
 
 ## Current architecture
 
@@ -142,8 +143,9 @@ back to its default encoder. The actual recorded MIME type is preserved in multi
 uploads. An unsupported default format receives an actionable backend error.
 
 Audio acceptance **does not advance the question** or add a text answer. Continue with
-a typed answer to advance through the existing five-question interview. Transcription,
-speech-to-text, AI, voice synthesis, and permanent audio storage are intentionally absent.
+a typed or reviewed transcript answer to advance through the existing five-question
+interview. The upload-only action does not transcribe; use Transcribe Recording for
+speech-to-text. AI follow-ups, voice synthesis, and permanent audio storage remain absent.
 Recordings remain temporarily in browser memory; replacing the recording or leaving the
 question releases the reference. The backend discards uploads after validation. Multipart
 parsing may spool larger files to temporary storage; those files are closed and removed
@@ -213,3 +215,136 @@ The existing CI commands remain unchanged: `python -m pytest -W error`, `npm tes
 
 Manual verification passed in Chrome on Mac: microphone permission, recording start/stop,
 audio upload and acceptance, and typed-answer submission/question advancement.
+
+
+## Speech-to-text transcription (Issue #7)
+
+**Record Answer → Stop Recording → Transcribe Recording → review/edit → Submit Answer**.
+ElevenLabs Scribe v2 currently transcribes recordings through the official Python SDK.
+The backend adapter maps results to application-owned text, optional language, and
+word timestamps (`text`, `start`, `end`, in seconds). Word timings are preserved for
+future deterministic pause/pacing/filler analysis; no such analysis is implemented.
+Spacing/audio-event entries and words without timing are omitted from the timing list.
+
+Transcription never submits an answer or advances the interview. The existing textarea
+receives the transcript and remains editable after the request finishes. To protect
+user work, Transcribe Recording is disabled whenever the textarea contains any text
+(including whitespace). Clear it explicitly before transcribing. The textarea and
+Submit Answer are disabled while transcription is pending. Failed requests keep the
+recording for retry and unlock typing. Duplicate requests are blocked; leaving the
+component aborts the browser request and ignores late results.
+
+Send Recording remains the upload-only validation action and needs no provider key.
+Transcribe Recording is a separate operation; sending first is not required.
+
+### Server configuration
+
+Install the updated requirements in the backend virtual environment:
+
+```sh
+python -m pip install -r backend/requirements-dev.txt
+```
+
+Set `ELEVENLABS_API_KEY` in the **backend process environment only**, then start/restart
+Uvicorn. For the project's macOS zsh terminal, enter the key without echoing it or putting
+its value into shell history:
+
+```zsh
+read -rs "ELEVENLABS_API_KEY?ElevenLabs API key: "
+echo
+export ELEVENLABS_API_KEY
+python -m uvicorn app.main:app --app-dir backend --reload --host 127.0.0.1 --port 8000
+```
+
+`.env.example` contains only the empty variable name. `.env` files are ignored, but the
+application does **not** automatically load them; no dotenv dependency is needed.
+Never use a `VITE_` variable for this key, include it in frontend configuration, or
+commit a real value. The application and all non-transcription endpoints work without
+the key. A transcription request without configuration returns a controlled 503.
+CI/tests require no real key and use fake transcribers or an SDK mock HTTP transport.
+
+### Transcription API and errors
+
+`POST /api/sessions/{session_id}/transcriptions` accepts the same multipart `audio`
+and `question_index` fields and limits as `/audio`. Shared validation rejects invalid
+uploads before contacting the provider. The session/question is checked again after
+transcription to reject an answer that became stale while the provider was running.
+HTTP 200 returns only application metadata, for example:
+
+```json
+{
+  "session_id": "<existing session UUID>",
+  "question_index": 0,
+  "text": "Hello there.",
+  "language": "eng",
+  "words": [{"text": "Hello", "start": 0.0, "end": 0.5}]
+}
+```
+
+Existing validation statuses remain: 400 malformed multipart/parser limits, 404 unknown
+session, 409 completed/stale question, 413 oversized upload, 415 unsupported media,
+and 422 invalid/empty input. Transcription adds:
+
+- 503: server API key is missing/blank.
+- 504: provider network timeout or the 60-second total provider deadline expires.
+- 502: provider failure (including rejected credentials/quota), malformed or empty
+  result, invalid timings, or transcript over the existing 10,000-character answer limit.
+
+Errors are generic and do not expose provider exceptions, credentials, or raw responses.
+The SDK does not automatically retry; the user may retry explicitly. Browser requests
+have a 75-second timeout to allow for upload and the backend provider deadline.
+
+### Privacy and limitations
+
+Transcribe Recording sends the recording to ElevenLabs. Rehearse does not permanently
+store audio, log raw audio/keys/provider responses, or persist transcripts separately.
+Temporary upload files close after success or failure. Draft transcripts stay in the
+browser; explicitly submitted text uses the existing process-local session storage.
+ElevenLabs processing/retention is governed by your provider account and policies;
+Rehearse's lack of permanent audio storage is not a promise of provider-side deletion.
+Aborting a browser request does not guarantee cancellation of provider work already
+started. The backend deadline bounds how long Rehearse waits.
+
+This remains a local prototype without authentication or rate limits. Keep the
+key-enabled backend local. No realtime transcription, Nemotron, AI follow-ups, TTS,
+database, authentication, or additional scoring/measurements were added.
+
+### Manual verification with a real key
+
+1. Install backend requirements and configure the key in the backend terminal as above.
+   Start Uvicorn. In another terminal with Node.js 24, run `cd frontend`, `npm ci`,
+   and `npm run dev`. Open `http://localhost:5173` in Chrome.
+2. Start an interview. Leave the answer empty, click Record Answer, allow microphone
+   access, speak a short sentence, and Stop Recording. Check microphone release.
+3. Click **Transcribe Recording** directly. Confirm the loading state and disabled
+   transcription/textarea/submit controls while waiting.
+4. Confirm the transcript appears in the existing textarea and the question has not
+   advanced. In DevTools Network, inspect the transcription response for text,
+   language, and word timing entries. No API key should appear in browser requests.
+5. Edit the transcript, then click **Submit Answer**. Confirm only this advances to
+   the next question. Continue to completion and verify explicit restart.
+6. Type a draft before requesting transcription. Confirm Transcribe Recording is
+   disabled and the draft stays intact. Clear the textarea to enable transcription.
+7. Stop Uvicorn, run `unset ELEVENLABS_API_KEY`, and restart it. Start a new interview
+   (sessions reset on restart), record, and transcribe. Confirm the controlled
+   configuration error and that typed answers and Send Recording still work.
+8. Restore the key using hidden input and restart for further manual tests. To test
+   browser network failure, record first, stop the backend, and attempt transcription;
+   confirm an error and that the textarea becomes editable again.
+
+Automated tests verify SDK request shape/mapping with mocked transport, not real
+provider credentials, billing, audio recognition quality, or live provider latency.
+Manual end-to-end verification passed in Chrome with a real spoken answer and
+ElevenLabs Scribe v2: the transcript appeared in the textarea, could be reviewed/edited,
+and did not advance the question until Submit Answer was clicked. Existing-text
+protection also worked. An earlier 401 authentication failure was resolved by rotating
+the API key; it was not an application-code defect.
+
+For local development diagnostics only, set `REHEARSE_TRANSCRIPTION_DEBUG=1` in the
+backend terminal before starting/restarting Uvicorn. It defaults to off; only the exact
+value `1` enables it. During a failed transcription, one flushed line is written directly to backend stderr
+(independent of Python/Uvicorn logger handlers). Look for `transcription_failure`
+with `stage=provider_request` or `stage=result_mapping`, `provider_status` (numeric or
+`unavailable`), and a fixed error category. No exception text, headers, body, audio,
+transcript, or key is logged by this diagnostic. Client errors remain generic.
+Use `unset REHEARSE_TRANSCRIPTION_DEBUG` and restart the backend to disable it.
