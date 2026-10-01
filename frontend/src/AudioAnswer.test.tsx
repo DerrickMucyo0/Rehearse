@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { act, cleanup, fireEvent, render, screen } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, beforeEach, expect, test, vi } from 'vitest'
 import AudioAnswer from './AudioAnswer'
 import Interview from './Interview'
@@ -220,10 +220,15 @@ test('typed answer advances and releases a recording for the old question', asyn
   fireEvent.click(screen.getByRole('button', { name: 'Start Interview' }))
   await screen.findByRole('button', { name: 'Record Answer' })
   await record()
+  const oldRecorder = Recorder.instances[0]
+  expect(oldRecorder.state).toBe('recording')
+  expect(stopTrack).not.toHaveBeenCalled()
   fireEvent.change(screen.getByRole('textbox'), { target: { value: 'Typed' } })
   fireEvent.click(screen.getByRole('button', { name: 'Submit Answer' }))
   await screen.findByText('Question 2 of 2')
-  expect(stopTrack).toHaveBeenCalledTimes(1)
+  // The new DOM can appear before the old recorder's passive unmount cleanup.
+  await waitFor(() => expect(stopTrack).toHaveBeenCalledTimes(1))
+  expect(oldRecorder.state).toBe('inactive')
   expect(screen.queryByRole('button', { name: 'Stop Recording' })).toBeNull()
   expect(screen.queryByRole('button', { name: 'Send Recording' })).toBeNull()
 })
