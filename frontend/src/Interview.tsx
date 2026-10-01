@@ -1,4 +1,5 @@
 import { useState } from 'react'
+import AudioAnswer from './AudioAnswer'
 import type { FormEvent } from 'react'
 import { startInterview, submitAnswer } from './interviewApi'
 import type { InterviewSession } from './interviewApi'
@@ -48,6 +49,7 @@ export default function Interview() {
         <form onSubmit={(event) => void submit(event)}>
           <p aria-live="polite">Question {session.current_question_index + 1} of {session.questions.length}</p>
           <h2 id="current-question" aria-live="polite">{session.current_question}</h2>
+          <AudioAnswer key={`${session.id}:${session.current_question_index}`} session={session} disabled={busy} />
           <label htmlFor="answer">Your answer</label>
           <textarea
             id="answer"
