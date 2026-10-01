@@ -65,15 +65,23 @@ class InterviewSessionService:
     def submit_answer(self, session_id: UUID, answer: AnswerRequest) -> InterviewSession:
         with self._lock:
             session = self._find(session_id)
-            if session.status == "completed":
-                raise SessionConflict("Session is already completed.")
-            if answer.question_index != session.current_question_index:
-                raise SessionConflict("Answer does not match the current question.")
+            self._check_question(session, answer.question_index)
             session.answers.append(answer.answer)
             session.current_question_index += 1
             if session.current_question_index == len(session.questions):
                 session.status = "completed"
             return session.model_copy(deep=True)
+
+    def validate_current_question(self, session_id: UUID, question_index: int) -> None:
+        with self._lock:
+            self._check_question(self._find(session_id), question_index)
+
+    @staticmethod
+    def _check_question(session: InterviewSession, question_index: int) -> None:
+        if session.status == "completed":
+            raise SessionConflict("Session is already completed.")
+        if question_index != session.current_question_index:
+            raise SessionConflict("Answer does not match the current question.")
 
     def _find(self, session_id: UUID) -> InterviewSession:
         try:
