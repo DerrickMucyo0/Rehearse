@@ -44,7 +44,7 @@ beforeEach(() => {
 })
 afterEach(() => { cleanup(); vi.unstubAllGlobals(); vi.restoreAllMocks(); vi.useRealTimers() })
 
-function show() { return render(<AudioAnswer session={session} disabled={false} />) }
+function show() { return render(<AudioAnswer session={session} disabled={false} hasAnswer={false} onTranscript={vi.fn()} onTranscribing={vi.fn()} />) }
 async function record() {
   fireEvent.click(screen.getByRole('button', { name: 'Record Answer' }))
   await screen.findByRole('button', { name: 'Stop Recording' })
@@ -234,4 +234,111 @@ test('network failure is shown and allows retry', async () => {
   fireEvent.click(screen.getByRole('button', { name: 'Send Recording' }))
   expect(await screen.findByRole('alert')).toHaveProperty('textContent', expect.stringContaining('Check your connection'))
   expect((screen.getByRole('button', { name: 'Send Recording' }) as HTMLButtonElement).disabled).toBe(false)
+})
+
+function transcriptResponse(text = 'Hello from my recording') {
+  return new Response(JSON.stringify({ session_id: session.id, question_index: 0, text,
+    language: 'eng', words: [{ text: 'Hello', start: 0, end: 0.5 }] }))
+}
+
+async function interviewRecording() {
+  const view = render(<Interview />)
+  fireEvent.click(screen.getByRole('button', { name: 'Start Interview' }))
+  await screen.findByRole('button', { name: 'Record Answer' })
+  await record()
+  await finish()
+  return view
+}
+
+test('transcribes once, fills editable answer, and advances only after explicit submission', async () => {
+  let resolve!: (response: Response) => void
+  const fetchMock = vi.fn()
+    .mockResolvedValueOnce(new Response(JSON.stringify(session)))
+    .mockImplementationOnce(() => new Promise<Response>((done) => { resolve = done }))
+    .mockResolvedValueOnce(new Response(JSON.stringify(session)))
+    .mockResolvedValueOnce(new Response(JSON.stringify({ ...session, status: 'completed',
+      current_question_index: 1, current_question: null, answers: ['Edited answer'] })))
+  vi.stubGlobal('fetch', fetchMock)
+  await interviewRecording()
+  const transcribe = screen.getByRole('button', { name: 'Transcribe Recording' })
+  fireEvent.click(transcribe)
+  fireEvent.click(transcribe)
+  expect(fetchMock).toHaveBeenCalledTimes(2)
+  expect(screen.getByText('Transcribing recording…')).toBeTruthy()
+  expect((screen.getByRole('textbox') as HTMLTextAreaElement).disabled).toBe(true)
+  expect((screen.getByRole('button', { name: 'Submit Answer' }) as HTMLButtonElement).disabled).toBe(true)
+  const [url, options] = fetchMock.mock.calls[1]
+  expect(url).toBe('/api/sessions/session-1/transcriptions')
+  expect(options.headers).toBeUndefined()
+  expect(options.body.get('question_index')).toBe('0')
+  expect(options.body.get('audio').type).toBe('audio/webm;codecs=opus')
+  await act(async () => resolve(transcriptResponse()))
+  const answer = screen.getByRole('textbox') as HTMLTextAreaElement
+  expect(answer.value).toBe('Hello from my recording')
+  expect(answer.disabled).toBe(false)
+  expect(screen.getByText('Question 1 of 1')).toBeTruthy()
+  expect(fetchMock).toHaveBeenCalledTimes(2)
+  expect(screen.getByText(/Transcript ready/)).toBeTruthy()
+  fireEvent.change(answer, { target: { value: 'Edited answer' } })
+  fireEvent.click(screen.getByRole('button', { name: 'Submit Answer' }))
+  await screen.findByRole('heading', { name: 'Interview Complete' })
+  expect(JSON.parse(fetchMock.mock.calls[3][1].body)).toEqual({ question_index: 0, answer: 'Edited answer' })
+  expect(stopTrack).toHaveBeenCalledTimes(1)
+})
+
+test.each(['My draft', ' '])('protects existing answer %j from replacement', async (text) => {
+  const fetchMock = vi.fn().mockResolvedValueOnce(new Response(JSON.stringify(session)))
+  vi.stubGlobal('fetch', fetchMock)
+  await interviewRecording()
+  fireEvent.change(screen.getByRole('textbox'), { target: { value: text } })
+  const transcribe = screen.getByRole('button', { name: 'Transcribe Recording' }) as HTMLButtonElement
+  expect(transcribe.disabled).toBe(true)
+  fireEvent.click(transcribe)
+  expect(fetchMock).toHaveBeenCalledTimes(1)
+  expect((screen.getByRole('textbox') as HTMLTextAreaElement).value).toBe(text)
+  expect(screen.getByText(/Clear your answer before transcribing/)).toBeTruthy()
+  fireEvent.change(screen.getByRole('textbox'), { target: { value: '' } })
+  expect(transcribe.disabled).toBe(false)
+})
+
+test.each([502, 503, 504])('transcription failure %s unlocks typing and permits retry', async (status) => {
+  const fetchMock = vi.fn()
+    .mockResolvedValueOnce(new Response(JSON.stringify(session)))
+    .mockResolvedValueOnce(new Response('{}', { status }))
+    .mockResolvedValueOnce(transcriptResponse())
+  vi.stubGlobal('fetch', fetchMock)
+  await interviewRecording()
+  fireEvent.click(screen.getByRole('button', { name: 'Transcribe Recording' }))
+  await screen.findByRole('alert')
+  expect((screen.getByRole('textbox') as HTMLTextAreaElement).disabled).toBe(false)
+  expect((screen.getByRole('textbox') as HTMLTextAreaElement).value).toBe('')
+  fireEvent.click(screen.getByRole('button', { name: 'Transcribe Recording' }))
+  await screen.findByText(/Transcript ready/)
+  expect((screen.getByRole('textbox') as HTMLTextAreaElement).value).toBe('Hello from my recording')
+  expect(getUserMedia).toHaveBeenCalledTimes(1)
+})
+
+test('unmount cancels transcription and ignores a late result', async () => {
+  let resolve!: (response: Response) => void
+  const fetchMock = vi.fn().mockImplementation(() => new Promise<Response>((done) => { resolve = done }))
+  const onTranscript = vi.fn()
+  vi.stubGlobal('fetch', fetchMock)
+  const view = render(<AudioAnswer session={session} disabled={false} hasAnswer={false}
+    onTranscript={onTranscript} onTranscribing={vi.fn()} />)
+  await record(); await finish()
+  fireEvent.click(screen.getByRole('button', { name: 'Transcribe Recording' }))
+  const signal = fetchMock.mock.calls[0][1].signal as AbortSignal
+  view.unmount()
+  expect(signal.aborted).toBe(true)
+  await act(async () => resolve(transcriptResponse()))
+  expect(onTranscript).not.toHaveBeenCalled()
+})
+
+test.each(['', '   ', 'x'.repeat(10001)])('unusable transcript does not populate answer (case %#)', async (text) => {
+  vi.stubGlobal('fetch', vi.fn().mockResolvedValueOnce(new Response(JSON.stringify(session)))
+    .mockResolvedValueOnce(transcriptResponse(text)))
+  await interviewRecording()
+  fireEvent.click(screen.getByRole('button', { name: 'Transcribe Recording' }))
+  await screen.findByRole('alert')
+  expect((screen.getByRole('textbox') as HTMLTextAreaElement).value).toBe('')
 })

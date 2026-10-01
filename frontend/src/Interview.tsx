@@ -8,6 +8,7 @@ export default function Interview() {
   const [session, setSession] = useState<InterviewSession | null>(null)
   const [answer, setAnswer] = useState('')
   const [busy, setBusy] = useState(false)
+  const [transcribing, setTranscribing] = useState(false)
   const [error, setError] = useState('')
 
   async function start() {
@@ -25,7 +26,7 @@ export default function Interview() {
 
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
-    if (!session || busy || !answer.trim()) return
+    if (!session || busy || transcribing || !answer.trim()) return
     setBusy(true)
     setError('')
     try {
@@ -41,7 +42,7 @@ export default function Interview() {
   return (
     <section className="interview" aria-label="Interview practice" aria-busy={busy}>
       {!session && (
-        <button type="button" onClick={() => void start()} disabled={busy}>
+        <button type="button" onClick={() => void start()} disabled={busy || transcribing}>
           {busy ? 'Starting…' : 'Start Interview'}
         </button>
       )}
@@ -49,7 +50,9 @@ export default function Interview() {
         <form onSubmit={(event) => void submit(event)}>
           <p aria-live="polite">Question {session.current_question_index + 1} of {session.questions.length}</p>
           <h2 id="current-question" aria-live="polite">{session.current_question}</h2>
-          <AudioAnswer key={`${session.id}:${session.current_question_index}`} session={session} disabled={busy} />
+          <AudioAnswer key={`${session.id}:${session.current_question_index}`} session={session} disabled={busy || transcribing}
+            hasAnswer={answer.length > 0} onTranscribing={setTranscribing}
+            onTranscript={(text) => setAnswer((current) => current === '' ? text : current)} />
           <label htmlFor="answer">Your answer</label>
           <textarea
             id="answer"
@@ -59,9 +62,9 @@ export default function Interview() {
             rows={6}
             maxLength={10000}
             required
-            disabled={busy}
+            disabled={busy || transcribing}
           />
-          <button type="submit" disabled={busy || !answer.trim()}>
+          <button type="submit" disabled={busy || transcribing || !answer.trim()}>
             {busy ? 'Submitting…' : 'Submit Answer'}
           </button>
         </form>
@@ -70,14 +73,14 @@ export default function Interview() {
         <div role="status">
           <h2>Interview Complete</h2>
           <p>You completed all {session.questions.length} questions.</p>
-          <button type="button" onClick={() => void start()} disabled={busy}>Start New Interview</button>
+          <button type="button" onClick={() => void start()} disabled={busy || transcribing}>Start New Interview</button>
         </div>
       )}
       {error && (
         <div>
           <p role="alert">{error}</p>
           {session?.status === 'active' && (
-            <button type="button" onClick={() => void start()} disabled={busy}>Start New Interview</button>
+            <button type="button" onClick={() => void start()} disabled={busy || transcribing}>Start New Interview</button>
           )}
         </div>
       )}
