@@ -138,3 +138,35 @@ Current limitations:
 - Final pre-commit verification: backend 24 passed with warnings treated as errors;
   frontend component tests 2 passed; Playwright Chrome E2E 1 passed; strict
   TypeScript/build, lint, and `git diff --check` passed.
+
+## Milestone 3 — GitHub Actions CI
+
+- Added `.github/workflows/ci.yml` for pushes to `main` and pull requests targeting
+  `main`, with independent backend and frontend jobs on GitHub-hosted Ubuntu.
+- Backend uses Python 3.13, installs `backend/requirements-dev.txt` (which includes
+  runtime requirements), and runs the full `python -m pytest -W error` suite.
+- Frontend uses Node.js 24 LTS and runs `npm ci`, `npm test`, `npm run build`
+  (TypeScript plus Vite), and `npm run lint` from `frontend/`.
+- Uses official checkout/setup actions pinned to stable `v7` majors, pip/npm
+  download caches, read-only contents permission, and no persisted Git credentials.
+- Excluded Playwright: its existing configuration expects manually started Vite
+  and FastAPI servers and an installed browser; CI orchestration is outside this
+  minimal milestone. Application code and dependency files are unchanged.
+- README documents the triggers, checks, and matching local commands.
+
+Verification:
+- Local Python 3.13.0: requirements installation succeeded; 24 backend tests passed
+  with warnings treated as errors.
+- Local Node.js 24.21.0: clean `npm ci` succeeded; 2 component tests, strict
+  TypeScript/production build, and lint passed.
+- Ruby YAML parsing and workflow structure checks passed (triggers, permissions,
+  jobs, runners, and step structure); `git diff --check` passed.
+- Reviewed the final diff and status: only the workflow and documentation changed;
+  no secrets or generated artifacts included. No commit made.
+- Sandbox DNS restrictions required a network-enabled npm retry; a checksum-verified
+  Node.js 24 runtime was downloaded into a temporary directory for validation.
+  pip reported an unwritable local cache; npm reported an optional macOS `fsevents`
+  install-script notice. Both installations and all checks completed successfully.
+- GitHub-hosted execution remains to be verified on a PR/push. Backend requirements
+  retain their existing version ranges, so fresh CI installs can resolve newer
+  compatible dependencies than the local environment.

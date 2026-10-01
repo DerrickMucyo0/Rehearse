@@ -48,7 +48,7 @@ Anyone with a session ID can access that session. This is a local development pr
 
 ## Local frontend setup
 
-Use Node.js 20.19+ or 22.12+ with npm. From the project root:
+Use Node.js 24 LTS with npm (also used by CI). From the project root:
 
 ```sh
 cd frontend
@@ -93,4 +93,31 @@ From the project root with the backend virtual environment activated:
 
 ```sh
 python -m pytest -W error
+```
+
+## Continuous integration
+
+GitHub Actions runs `.github/workflows/ci.yml` on pushes to `main` and pull
+requests targeting `main`, with separate backend and frontend jobs on Ubuntu:
+
+- Python 3.13: install runtime and test requirements, then run the complete pytest
+  suite with warnings treated as errors.
+- Node.js 24 LTS: install locked npm dependencies, run Vitest component tests,
+  type-check and build with TypeScript/Vite, and lint with Oxlint.
+
+The workflow caches pip and npm downloads and uses read-only repository permissions.
+Playwright remains a local check: its current configuration requires separately
+started Vite and FastAPI servers plus a browser installation.
+
+Run the same checks locally from the project root, with the backend virtual
+environment activated as described above:
+
+```sh
+python -m pip install -r backend/requirements-dev.txt
+python -m pytest -W error
+cd frontend
+npm ci
+npm test
+npm run build
+npm run lint
 ```
