@@ -36,3 +36,43 @@ export async function submitAnswer(session: InterviewSession, answer: string): P
     body: JSON.stringify({ question_index: session.current_question_index, answer }),
   })
 }
+
+export interface AudioAccepted {
+  session_id: string
+  question_index: number
+  filename: string
+  content_type: string
+  size_bytes: number
+  status: 'accepted'
+}
+
+export async function uploadAudio(session: InterviewSession, audio: Blob, signal: AbortSignal): Promise<AudioAccepted> {
+  const extensions: Record<string, string> = { 'audio/webm': 'webm', 'audio/ogg': 'ogg', 'audio/mp4': 'm4a', 'audio/mpeg': 'mp3', 'audio/wav': 'wav', 'audio/x-wav': 'wav' }
+  const extension = extensions[audio.type.split(';')[0]] || 'audio'
+  const body = new FormData()
+  body.append('question_index', String(session.current_question_index))
+  body.append('audio', audio, `answer-${session.current_question_index + 1}.${extension}`)
+  let response: Response
+  try {
+    response = await fetch(`/api/sessions/${session.id}/audio`, {
+      method: 'POST', body, signal: AbortSignal.any([signal, AbortSignal.timeout(30000)]),
+    })
+  } catch {
+    throw new Error('Audio upload failed or timed out. Check your connection and try again.')
+  }
+  if (!response.ok) {
+    const messages: Record<number, string> = {
+      404: 'Session not found. Start a new interview.',
+      409: 'This question is no longer current. Record an answer for the current question.',
+      413: 'Recording is too large. Record a shorter answer (maximum 10 MiB).',
+      415: 'This audio format is not supported. Try another browser or type your answer.',
+      422: 'The recording was empty or invalid. Please record again.',
+    }
+    throw new Error(messages[response.status] || 'Audio upload failed. Please try again.')
+  }
+  const result: AudioAccepted = await response.json()
+  if (result.status !== 'accepted' || result.session_id !== session.id || result.question_index !== session.current_question_index) {
+    throw new Error('Unexpected upload confirmation. Please try again.')
+  }
+  return result
+}

@@ -170,3 +170,61 @@ Verification:
 - GitHub-hosted execution remains to be verified on a PR/push. Backend requirements
   retain their existing version ranges, so fresh CI installs can resolve newer
   compatible dependencies than the local environment.
+
+## Milestone 4 — Voice Recording Foundation
+
+- Confirmed `feat/voice-recording` and inspected session services/routes, React
+  components/API helpers, all existing tests, dependency files, and CI commands.
+- Added browser-native MediaRecorder support through `useAudioRecorder` and an
+  `AudioAnswer` control keyed by session/question. Permission is requested only on
+  Record Answer; the UI handles recording, stopping, upload, acceptance, and failures.
+- Typed answers retain their existing behavior. Audio acceptance confirms validation
+  only: it neither advances the question nor adds an answer/transcription.
+- Added `POST /api/sessions/{session_id}/audio` with multipart `audio` and
+  `question_index`, a structured Pydantic metadata response, and shared session
+  validation under the existing service lock. Rechecks the question after transfer.
+- Added only `python-multipart` for multipart parsing. No new frontend dependencies.
+- Audio handling is separate from routes. Enforces a 10 MiB audio limit and a total
+  request limit of 10 MiB plus 64 KiB, including requests without Content-Length;
+  permits one file/one field, rejects empty uploads and unsupported MIME types, and
+  generates a safe response filename rather than reflecting user-supplied paths.
+- Browser MIME selection checks WebM/Opus, Ogg/Opus, and MP4 support, falls back to
+  the browser's default, and preserves the resulting MIME type and codec parameters.
+- Releases microphone tracks on stop, failures, unmount, and question changes;
+  releases streams received after a pending permission request outlives the component.
+  Guards duplicate starts/uploads, limits recording to five minutes, and cancels
+  uploads on unmount with a 30-second upload timeout.
+- No permanent storage or raw-audio logging. Multipart parsing can use temporary
+  spooled files, which close after validation; browser blobs remain only temporarily.
+- README includes API behavior, privacy/format limitations, microphone permissions,
+  and exact Chrome verification steps. No transcription, AI, synthesis, database,
+  authentication, deployment, or unrelated application behavior added.
+
+Verification:
+- Installed updated backend requirements (network-enabled retry required after
+  sandbox DNS failure).
+- `backend/.venv/bin/python -m pytest -W error`: 49 passed, including 25 new audio
+  cases for acceptance, unchanged session state, unknown/completed sessions, wrong
+  indices, empty/unsupported/oversized uploads, boundary sizes, MIME parameters,
+  malformed input, request/parser limits, temporary-file closure, and concurrent
+  question advancement during transfer.
+- `npm test`: 20 passed, including 18 new recording/UI cases for permissions,
+  unavailable APIs, duplicate starts, state transitions, MIME fallback, successful
+  upload/retry/network failure, recorder failures, empty/oversized recordings,
+  duration limit, cleanup, delayed permission resolution, cancelled uploads, and
+  typed-answer advancement while recording. Existing completion regressions pass.
+- `npm run build` (strict TypeScript and Vite) and `npm run lint`: passed under
+  Node.js 24.21.0. Initial type checking found an unused test import; fixed and reran.
+- `git diff --check`: passed. Reviewed diff/status and new files; no secrets,
+  generated audio, dependency directories, environments, caches, or build outputs
+  are included. Existing CI scripts/workflow remain compatible and unchanged.
+- User manual verification passed in Chrome on Mac: backend health, interview
+  startup, real microphone permission, recording start/stop, upload to FastAPI,
+  accepted UI confirmation, and typed-answer submission/question advancement.
+  The user also confirmed audio is not saved or transcribed. Automated browser-media
+  tests use mocks; the Playwright E2E suite was not run in this milestone.
+- Validation checks declared MIME type and size, not decoded audio/speech. The
+  bounded request is buffered in memory before parsing; this remains a local
+  prototype with no global concurrency/rate limits or authentication.
+- Prepared as three commits: backend audio API/tests, frontend recording flow/tests,
+  and milestone documentation. No push or merge; work stops at this milestone.
