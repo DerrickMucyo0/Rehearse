@@ -1,4 +1,5 @@
 """Bounded, temporary audio validation; no recordings are retained."""
+from contextlib import asynccontextmanager
 from typing import Literal
 from uuid import UUID
 
@@ -54,3 +55,17 @@ def validate_audio(upload: UploadFile, session_id: UUID, question_index: int) ->
         filename=f"answer-{question_index + 1}.{AUDIO_EXTENSIONS[base_type]}",
         content_type=content_type, size_bytes=size,
     )
+
+
+@asynccontextmanager
+async def validated_audio(bounded: Request, session_id: UUID):
+    """Share multipart shape/audio validation and file lifetime across audio operations."""
+    async with bounded.form(max_files=1, max_fields=1, max_part_size=1024) as form:
+        upload = form.get("audio")
+        index = form.get("question_index")
+        if (set(form) != {"audio", "question_index"} or
+                not isinstance(upload, UploadFile) or not isinstance(index, str) or
+                not index.isascii() or not index.isdecimal() or len(index) > 9):
+            raise HTTPException(422, "Provide an audio file and a non-negative question_index.")
+        metadata = validate_audio(upload, session_id, int(index))
+        yield upload, metadata

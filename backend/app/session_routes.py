@@ -1,17 +1,21 @@
+from contextlib import asynccontextmanager
 from typing import Annotated
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 
-from starlette.datastructures import UploadFile
-
-from app.audio import AudioAccepted, bounded_multipart_request, validate_audio
+from app.audio import AudioAccepted, bounded_multipart_request, validated_audio
 from app.sessions import (
     AnswerRequest,
     InterviewSession,
     InterviewSessionService,
     SessionConflict,
     SessionNotFound,
+)
+
+from app.transcription import (
+    TranscriptionFailed, TranscriptionResult, TranscriptionService,
+    TranscriptionTimeout, TranscriptionUnavailable, get_transcription_service,
 )
 
 router = APIRouter(prefix="/api/sessions", tags=["sessions"])
@@ -52,25 +56,47 @@ def submit_answer(
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
-@router.post("/{session_id}/audio", response_model=AudioAccepted)
-async def accept_audio(session_id: UUID, request: Request, sessions: SessionService) -> AudioAccepted:
+@asynccontextmanager
+async def current_audio(session_id: UUID, request: Request, sessions: InterviewSessionService):
     try:
         sessions.get(session_id)
         bounded = await bounded_multipart_request(request)
-        # The context closes temporary spooled files on success and validation errors.
-        async with bounded.form(max_files=1, max_fields=1, max_part_size=1024) as form:
-            upload = form.get("audio")
-            index = form.get("question_index")
-            if (set(form) != {"audio", "question_index"} or
-                    not isinstance(upload, UploadFile) or not isinstance(index, str) or
-                    not index.isascii() or not index.isdecimal() or len(index) > 9):
-                raise HTTPException(422, "Provide an audio file and a non-negative question_index.")
-            question_index = int(index)
-            metadata = validate_audio(upload, session_id, question_index)
-            # Check after upload parsing so an answer submitted during transfer is rejected.
-            sessions.validate_current_question(session_id, question_index)
-            return metadata
+        async with validated_audio(bounded, session_id) as (upload, metadata):
+            sessions.validate_current_question(session_id, metadata.question_index)
+            yield upload, metadata
     except SessionNotFound as exc:
         raise HTTPException(404, str(exc)) from exc
     except SessionConflict as exc:
         raise HTTPException(409, str(exc)) from exc
+
+
+@router.post("/{session_id}/audio", response_model=AudioAccepted)
+async def accept_audio(session_id: UUID, request: Request, sessions: SessionService) -> AudioAccepted:
+    async with current_audio(session_id, request, sessions) as (_, metadata):
+        return metadata
+
+
+class SessionTranscription(TranscriptionResult):
+    session_id: UUID
+    question_index: int
+
+
+@router.post("/{session_id}/transcriptions", response_model=SessionTranscription)
+async def transcribe_audio(
+    session_id: UUID, request: Request, sessions: SessionService,
+    transcriber: Annotated[TranscriptionService, Depends(get_transcription_service)],
+) -> SessionTranscription:
+    async with current_audio(session_id, request, sessions) as (upload, metadata):
+        try:
+            result = await transcriber.transcribe(upload, metadata.filename)
+        except TranscriptionUnavailable:
+            raise HTTPException(503, "Transcription is not configured on the server.") from None
+        except TranscriptionTimeout:
+            raise HTTPException(504, "Transcription timed out. Please try again.") from None
+        except TranscriptionFailed:
+            raise HTTPException(502, "Unable to transcribe this recording. Try again or type your answer.") from None
+        # Reject results for a question answered in another tab while the provider ran.
+        sessions.validate_current_question(session_id, metadata.question_index)
+        return SessionTranscription(
+            session_id=session_id, question_index=metadata.question_index, **result.model_dump(),
+        )
