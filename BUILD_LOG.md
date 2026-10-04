@@ -291,3 +291,101 @@ Verification:
   provider status if available. No exception text, headers, body, transcript, audio,
   or credentials are emitted. HTTP 503/504/502 behavior is unchanged.
 - No new product features, frontend key exposure, commit, or push.
+
+## Milestone 5 — Issue #9: Structured Nemotron interviewer reasoning
+
+- Implemented on `feat/nemotron-interviewer`, starting with the labeling rubric and
+  strict application contract. No new dependency, provider SDK or CI workflow.
+- Added an immutable reasoning context/protocol, strict Decision model, a hosted
+  NVIDIA/httpx adapter, and a small answer orchestrator. Validates exact actions,
+  required fields, strict types, trimmed lengths, action/prompt consistency and JSON
+  structure including duplicate keys. No prose extraction or repair of model output.
+- The deterministic session engine remains the only state writer. Explicit submission
+  reserves a turn and snapshots context under its lock; provider work runs outside
+  the lock. Revalidation and answer/transition commit happen atomically afterward.
+  Pending concurrent submissions receive 409. Failed, invalid, timed-out or cancelled
+  reasoning leaves session state unchanged and releases the reservation.
+- Added monotonic turn_revision, current_prompt, probe_count and separate turn records.
+  Original planned-question answers remain in answers; follow-up/clarification/challenge
+  answers remain separate in turns. Reasons and provider reasoning traces are discarded.
+  The engine allows at most two extra prompts per planned question. After those, it
+  advances on the next submitted answer without a provider call, records probe_limit
+  as the source and no fabricated model action. Planned questions remain code-owned.
+- Added submission UUIDs: committed identical retries return current authoritative
+  state without re-running reasoning; changed payloads for committed UUIDs conflict.
+  Stale/future question/turn checks, pending reservations, cancellation, concurrent
+  sessions, replay after completion and late-result rejection have automated coverage.
+- Audio upload and transcription require turn_revision and validate it after transfer;
+  transcription revalidates after the provider call too. This rejects stale recordings
+  from earlier prompts of the same planned question. ElevenLabs adapter unchanged.
+- Frontend renders current_prompt and planned-question progress, remounts AudioAnswer
+  on revision changes, guards duplicate submission, preserves drafts after errors,
+  and reconciles lost responses by submission UUID/turn rather than question index.
+  Existing Record/Stop/Transcribe/Review/Edit/Submit flow and microphone release remain.
+- NVIDIA endpoint/model are fixed to the approved hosted Chat Completions service and
+  nvidia/nemotron-3-super-120b-a12b. Configuration nemotron-super-v1 uses temperature 1.0,
+  top_p 0.95 (model-card guidance), low reasoning effort, budget 256, max_tokens 1024,
+  stream=false, no retries, 30-second provider/orchestration deadlines, bounded request
+  and response bytes. Low/256 is a provisional baseline, not validated adequate quality.
+  No assumption of hosted guided_json support and no model determinism claim.
+- Error mapping: missing config 503, timeout 504, provider rejection/invalid output 502,
+  state conflicts 409 and invalid client input 422. No silent MOVE_ON fallback. No
+  NVIDIA logging was added. Errors contain no provider strings, bodies, headers, keys,
+  candidate text, prompts, reasons or reasoning traces. Empty NVIDIA_API_KEY placeholder
+  added to .env.example; credentials remain backend-only, with no automatic dotenv load.
+- Added 80 synthetic human-reviewable evaluation cases: 48 development, 32 held-out.
+  Labels: FOLLOW_UP 28, CLARIFY 17, CHALLENGE 16, MOVE_ON 19. Ten core categories have
+  six cases each, plus ten multi-turn and ten injection cases. Labels remain drafts
+  awaiting human review; no passing quality threshold is established.
+- Evaluation reports all-attempt action match, per-action support/precision/recall/F1,
+  macro-F1, confusion matrix (including errors), category results, invalid-output/
+  provider-error/timeout rates, median/p95 latency and optional repeat agreement.
+  Reports carry dataset hash/version, prompt/config versions and full inference settings,
+  but no answer/prompt/reason text. Live requests require --live; normal CI only checks
+  fixtures, dataset integrity and metric arithmetic. No live NVIDIA request was made.
+- Updated README for turn-aware API contracts, privacy, configuration, limits, evaluation
+  and pending manual verification. Added an offline Playwright server fixture so the
+  pre-existing real-API completion regression can retain deterministic fake reasoning
+  without paid requests or a production fallback mode. Browser test request assertions
+  now include revision and submission UUID. Playwright remains outside normal CI.
+
+Automated verification:
+- Backend: 223 passed with `backend/.venv/bin/python -m pytest -W error`.
+- Frontend: 40 component tests passed; lint and production TypeScript/Vite build
+  passed with Node.js 24. Playwright discovery found the existing one completion test;
+  the browser E2E itself was not run.
+- All provider integration tests use mocked transport; NVIDIA credentials are removed
+  and real async HTTP provider transport is blocked in pytest. No live quality scores
+  are claimed. Existing recording/transcription/completion regressions remain covered.
+- Manual Chrome adaptive-turn verification, real hosted configuration acceptance,
+  prompt quality review and live development/held-out evaluation remain outstanding.
+- `git diff --check` passed. Reviewed status/diff and new files. A scan of tracked,
+  untracked non-ignored project files and local .env candidates found no credential
+  patterns/private keys or populated credential assignments. Both .env.example values
+  are empty. Exact comparison to real keys was unavailable: neither credential was
+  present in the agent environment. No generated media/build/dependency artifacts are
+  included. The ElevenLabs provider implementation is unchanged.
+- No commits or push. Implementation stops after local verification and review.
+
+## 2026-10-03 — Issue #9 research-freeze checkpoint
+
+The entries above remain historical implementation checkpoints. The subsequent
+research trajectory covered direct classification, assessment decomposition,
+assessment-only, blocking-context, conditional two-stage, challenge_warranted,
+Ultra compatibility diagnosis and matched Stage 2 model selection.
+
+- Automatic CHALLENGE remains unresolved; no production interviewer is approved.
+- Final matched classification: MODEL-SELECTION NOT SUPPORTED. Ultra was not
+  selected; Super remains only the research baseline/comparator.
+- Conditional two-stage architecture is retained as frozen research tooling.
+- Issue #9 remains open with the original four-action contract unchanged.
+- Further full-48 development evaluation is blocked for the frozen candidate;
+  historical full-development results are preserved separately.
+- Held-out remains sealed / not authorized. Provider experimentation is stopped.
+- Existing route wiring remains unapproved feature-branch work. This preservation
+  checkpoint does not change runtime behavior or authorize merge/deployment.
+- Known official, diagnostic and compatibility observations are recorded in
+  [the experiment ledger](evals/interviewer/EXPERIMENT_LEDGER.md). Missing historical
+  reports, prompt snapshots and dependency locks remain explicitly unavailable.
+- See [the freeze note](evals/interviewer/RESEARCH_FREEZE.md) and
+  [provenance manifest](evals/interviewer/research_provenance.json).

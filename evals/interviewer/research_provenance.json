@@ -1,0 +1,256 @@
+{
+  "annotation_artifacts": [
+    {
+      "path": "evals/interviewer/blocking_context_annotations_development.json",
+      "sha256": "4882d3d139889e21f7b80d99e723cc7a00ca70a70b7c662d844a54cb4d2fdac5"
+    },
+    {
+      "path": "evals/interviewer/blocking_context_boundary_cases_development.json",
+      "sha256": "70a9bf3e23991a02843f5075aaaf94a4332ac09daede1841e6790e11958c7956"
+    },
+    {
+      "path": "evals/interviewer/independent_annotations_development_draft.json",
+      "sha256": "24723e8e24ab6d025709b9e59a09e122c7fc390af20d8ff250487960f8ed350f"
+    },
+    {
+      "path": "evals/interviewer/two_stage_challenge_annotations_development.json",
+      "sha256": "4f0348c3cf0b422745668f15a28fd3e88943439c2b29452d020e5faabd1867f3"
+    },
+    {
+      "path": "evals/interviewer/two_stage_challenge_contrastive_review_development.json",
+      "sha256": "ad1a78e1b9e35f36350d9231cddce025f9c16176f95a6d18a8da62cdb63c519c"
+    }
+  ],
+  "authorized_documentation_updates": [
+    "BUILD_LOG.md",
+    "README.md",
+    "evals/interviewer/ASSESSMENT_ONLY.md",
+    "evals/interviewer/BLOCKING_CONTEXT.md",
+    "evals/interviewer/README.md",
+    "evals/interviewer/STAGE2_MODEL_MATCH.md",
+    "evals/interviewer/TWO_STAGE.md",
+    "evals/interviewer/TWO_STAGE_CHALLENGE.md",
+    "evals/interviewer/TWO_STAGE_CHALLENGE_ULTRA.md"
+  ],
+  "baseline_model": "nvidia/nemotron-3-super-120b-a12b",
+  "branch": "feat/nemotron-interviewer",
+  "dataset_path": "evals/interviewer/cases.jsonl",
+  "dataset_sha256": "d496391a3f25ac8173e504794497c4aa4120526a0c7238f94164b3bd234dfc35",
+  "dataset_version": "interviewer-cases-v2",
+  "experiment_document_paths": [
+    "evals/interviewer/ASSESSMENT.md",
+    "evals/interviewer/ASSESSMENT_ONLY.md",
+    "evals/interviewer/ASSESSMENT_V2.md",
+    "evals/interviewer/BLOCKING_CONTEXT.md",
+    "evals/interviewer/README.md",
+    "evals/interviewer/STAGE2_MODEL_MATCH.md",
+    "evals/interviewer/TWO_STAGE.md",
+    "evals/interviewer/TWO_STAGE_CHALLENGE.md",
+    "evals/interviewer/TWO_STAGE_CHALLENGE_ULTRA.md"
+  ],
+  "four_action_contract": [
+    "FOLLOW_UP",
+    "CLARIFY",
+    "CHALLENGE",
+    "MOVE_ON"
+  ],
+  "freeze_note_path": "evals/interviewer/RESEARCH_FREEZE.md",
+  "full_development_status": "blocked_for_frozen_candidate",
+  "held_out_status": "sealed",
+  "historical_file_sha256": {
+    ".env.example": "f4cd6dbf381dc82ebc32b2ad7f8d91085fad4820112ce113582982f9266fe564",
+    "backend/app/audio.py": "d7d1ef90dd893a80131e2bd9a9e2a5c2df72085f72ce140d63cc99e4e62aa3fa",
+    "backend/app/interview_orchestration.py": "996f6a538c61bd2dcec544866727512b71a809f7f31a05b0b88751bf1ef99d71",
+    "backend/app/nemotron.py": "3a5157713ad94650b83d86d0b18f37c48c57f93b04f7ebcfa72843d121d4c604",
+    "backend/app/reasoning.py": "04df966e60ff9b815b2154e88de55ecda74c6967ac8df831374ec614371c14bc",
+    "backend/app/session_routes.py": "b3c2ae058e0ac4db9583923b9ab02e94041334ba61bc4205604001bebbf8e376",
+    "backend/app/sessions.py": "a833b66a1191171a5ae335e1227f7ca871e616eabc106949adee190286218739",
+    "evals/interviewer/ASSESSMENT.md": "2b551bc8f49463e47509730bcaca64c38e383f970b610ff225db7ed3d819120c",
+    "evals/interviewer/ASSESSMENT_V2.md": "3c2accddb5fc01a3d65b20bbd3639fc07ed405e925c93657a85123bb4045e077",
+    "evals/interviewer/assessment_independent.py": "e0bed7d6e1d85ae462e6ce2fd622897481236366bc56700a7ac17ce1a3e96f4f",
+    "evals/interviewer/assessment_live.py": "8673c8548cfe10a9b167ce7b8d2dd4327dbb1c9686bdbf7e88e3bdfe772bcf6e",
+    "evals/interviewer/assessment_live_v2.py": "5075fb91e646e0179a761560200eaa5a698c532da29f159d670d2fe52166123c",
+    "evals/interviewer/assessment_live_v3.py": "4af0dddf5b3f18863d188df2cccce3e9ef93e71cdaa2626bd5b48e845777daf2",
+    "evals/interviewer/assessment_only.py": "2a938d23f44ad180fc8c5c09d47aadd99822916de1f17848510ed95668f9ef90",
+    "evals/interviewer/assessment_only_live.py": "a7b4717717784e1bd2e0889ff70105968e3c713741c40a8758bf1e48aba6538f",
+    "evals/interviewer/assessment_prototype.py": "1c8aadb9915ff968086b8c107cd909b6d2a367cec64db2399ad8ca51e729cf9e",
+    "evals/interviewer/blocking_context.py": "5a2ac6d06547cf70d85bb48c70c09126ff6d834c93d03ce1c6b2557f695a5129",
+    "evals/interviewer/blocking_context_annotations_development.json": "4882d3d139889e21f7b80d99e723cc7a00ca70a70b7c662d844a54cb4d2fdac5",
+    "evals/interviewer/blocking_context_boundary_cases_development.json": "70a9bf3e23991a02843f5075aaaf94a4332ac09daede1841e6790e11958c7956",
+    "evals/interviewer/blocking_context_live.py": "45f184326f0fa2aad37f95869d73d8bfa89f47a8fe070d0da8c9389b40bdc942",
+    "evals/interviewer/cases.jsonl": "d496391a3f25ac8173e504794497c4aa4120526a0c7238f94164b3bd234dfc35",
+    "evals/interviewer/evaluate.py": "3c6f4db841cd8df3e72b5211f430bb807a208c22221efbc14c0fba9557975309",
+    "evals/interviewer/independent_annotations_development_draft.json": "24723e8e24ab6d025709b9e59a09e122c7fc390af20d8ff250487960f8ed350f",
+    "evals/interviewer/stage2_model_match.py": "f353e8670e3e5d83186e5c528df01a9409dabc0c54b7184208a199ad79ce6114",
+    "evals/interviewer/stage2_model_match_provider.py": "eb1b4fc12d152892cd4230c26b1d159a17c1743e28d247e1670b89d5cacac1ae",
+    "evals/interviewer/two_stage_challenge_annotations_development.json": "4f0348c3cf0b422745668f15a28fd3e88943439c2b29452d020e5faabd1867f3",
+    "evals/interviewer/two_stage_challenge_contract.py": "6a8e1f9a3d967d35b9f67a85f0d256c894cee9bd9c7c40ee07eddc76c268caa0",
+    "evals/interviewer/two_stage_challenge_contrastive_review_development.json": "ad1a78e1b9e35f36350d9231cddce025f9c16176f95a6d18a8da62cdb63c519c",
+    "evals/interviewer/two_stage_challenge_live.py": "6c9fcc7b4b7b0d37f28095570e4994736c8976c41d5821394f6987c034898602",
+    "evals/interviewer/two_stage_challenge_orchestration.py": "ea0d863cf7d725c7e4824d82e1f646910a7c56921ff315418003746ece15fb06",
+    "evals/interviewer/two_stage_challenge_provider.py": "b73f5f02649bc23a9be7a01f0d011bb57eb74a9ee6f623539636c490253ce4bf",
+    "evals/interviewer/two_stage_challenge_ultra_live.py": "470136138e3fa9a3977c74e88bb1d821594985f78e0a282ed98be31bf8930584",
+    "evals/interviewer/two_stage_challenge_ultra_orchestration.py": "afae12d7c4176f03980e1da705903cfd7ed490976d1423179f9e4bf98f855b05",
+    "evals/interviewer/two_stage_challenge_ultra_provider.py": "865628d1cb1dd4c899b26c8133064f1dd906cc9707cf6b45607c5e0385559094",
+    "evals/interviewer/two_stage_contract.py": "ff60814b0d69d0410a9c3cc25595fa8971d146cbe8776f4d15b92fc81c2cab84",
+    "evals/interviewer/two_stage_live.py": "6862bb3d31ccacf6c8275a0f51fc0ad029a3d76bba718047bcfdab69d19614ea",
+    "evals/interviewer/two_stage_orchestration.py": "a356ee9fbd54482868c023a1b59e461224b7207952db241098e6481d8de8d820",
+    "evals/interviewer/two_stage_provider.py": "1fe7f8f69675139ab3f54961d60e8d10bd449a523a468dbe75139c238c87a55c",
+    "frontend/e2e/interview-completion.pw.ts": "c35bc3e10d054c8fad393685fc8a3a8dd3196be95d51ab1fd08de9f62eb6fbb7",
+    "frontend/playwright.config.ts": "e9318d21bd6a0b5a4bc1da172faa177e87798238dc4e5a95a235a4c1a5c4f202",
+    "frontend/src/AudioAnswer.test.tsx": "13ebd059b7a72646d2af88c91acb6b009f72ec00726cf8e265e2e0d6e3f3c7ba",
+    "frontend/src/Interview.test.tsx": "f3189eb1a60ed5dfd4e5baadd6353da73997e439d36bd320f23d4c6aa88fa069",
+    "frontend/src/Interview.tsx": "f37b3ddd573f18292f854656e33b0f80f4928746b6583bd2fdd2f0adad13ab9e",
+    "frontend/src/interviewApi.ts": "062330dfcb56dd8024d483641621ebbf791e93d1c5dda38bc70b99cbc42c8329",
+    "tests/conftest.py": "6b8737a30d1fb1a2f53338b47fa26678271222fc946e442009092040e33bd914",
+    "tests/e2e_app.py": "bf35e40ca5c000092eb72ff145e5e154c4fd8b5e09ff37bab514f56016b3ecdb",
+    "tests/test_assessment_live.py": "3276b6bf97d268066c71431f3c6274bb55274bac7dfed15ccd123f1ed60bac5b",
+    "tests/test_assessment_only.py": "4243a4de35da347afd3ad1d830be587f91b991b406d41cb548318d232a1ad7c9",
+    "tests/test_assessment_prototype.py": "a3779e0a823365f1de7dee05886a613e92f580867af28b094401876e4e6d7c51",
+    "tests/test_assessment_v2.py": "c8a6f5c738e8720ad81a7c98f5a5c881b45f1604db323f2cc46064bbb83469e1",
+    "tests/test_assessment_v3.py": "fa12679da19332bd61e5c17f9a2e75b0e6de3ae354b942dea2a919021d8a5168",
+    "tests/test_audio.py": "e11d41e8219406d7412a6fa707fdb1613f93d4aec7edb617287f9f7b66ca0391",
+    "tests/test_blocking_context.py": "c8415441466ab09dcb0f3729a8708b8e6f229cc7ab4b02afb502752fb1c5fc3a",
+    "tests/test_interview_reasoning.py": "2d310c2ab21440f2ac93a7f70d2a721b2ed057db73ce73bd24a62bc3191a0532",
+    "tests/test_nemotron.py": "bb8ca529d5d44e98d5f0e5a8ab1a7112360bbb89c1af6663216fffbb47f53523",
+    "tests/test_reasoning.py": "73893cf3a8b854bb47d3808898987c4f0ebdfe4644a257fb8261a366da3b20db",
+    "tests/test_reasoning_evaluation.py": "5727dd05038bf6653cc329aba1bfc8c595665f09f46a7e30d1a275fbbf53a5ce",
+    "tests/test_representation_diagnostics.py": "42c4d5b86a61089ad743ba61c11ffbf143fd0740ee45cca0973b179da1bc2b08",
+    "tests/test_sessions.py": "711ef6bcf46606924ec64263ff871172f53b3f4d1348c3bae3907cd3467332aa",
+    "tests/test_stage2_model_match.py": "0f3a6f390169dcdee95afbe7e2c63be25450f0d486d9de8e04fe35c04c279681",
+    "tests/test_transcription.py": "707b0a19cc3e55ac00f5678146895f15bb4e36839e247db372f0917e21c03ce4",
+    "tests/test_two_stage.py": "e521f7d186551e53927259b9aee0be8210a6094ff5f305ddf7f7f7c6787da019",
+    "tests/test_two_stage_challenge.py": "bf00eeefb824584ba10fa85918b3dc72c99dad02c7932b5889ba58852872fd09",
+    "tests/test_two_stage_challenge_ultra.py": "926292088ed5614ebb38e41554f5d6c47334c90a1a063499ca427ad0430c14a3"
+  },
+  "historical_preservation_gaps": {
+    "dataset_history": "current_snapshot_only",
+    "direct_classifier_v1_v4_independent_snapshots": "not_all_available",
+    "historical_dependency_manifests": "unavailable",
+    "historical_live_result_reports": "not_previously_stored_as_repository_artifacts",
+    "official_observation_source": "execution_and_conversation_history",
+    "raw_provider_output_and_hidden_reasoning": "not_archived_or_reconstructed",
+    "unavailable_result_json": "not_reconstructed"
+  },
+  "issue": 9,
+  "manifest_version": 1,
+  "preferred_stage2_model": null,
+  "production_approval": false,
+  "prompt_schema_artifacts": [
+    {
+      "path": "backend/app/nemotron.py",
+      "sha256": "3a5157713ad94650b83d86d0b18f37c48c57f93b04f7ebcfa72843d121d4c604"
+    },
+    {
+      "path": "backend/app/reasoning.py",
+      "sha256": "04df966e60ff9b815b2154e88de55ecda74c6967ac8df831374ec614371c14bc"
+    },
+    {
+      "path": "evals/interviewer/assessment_independent.py",
+      "sha256": "e0bed7d6e1d85ae462e6ce2fd622897481236366bc56700a7ac17ce1a3e96f4f"
+    },
+    {
+      "path": "evals/interviewer/assessment_live.py",
+      "sha256": "8673c8548cfe10a9b167ce7b8d2dd4327dbb1c9686bdbf7e88e3bdfe772bcf6e"
+    },
+    {
+      "path": "evals/interviewer/assessment_live_v2.py",
+      "sha256": "5075fb91e646e0179a761560200eaa5a698c532da29f159d670d2fe52166123c"
+    },
+    {
+      "path": "evals/interviewer/assessment_live_v3.py",
+      "sha256": "4af0dddf5b3f18863d188df2cccce3e9ef93e71cdaa2626bd5b48e845777daf2"
+    },
+    {
+      "path": "evals/interviewer/assessment_only.py",
+      "sha256": "2a938d23f44ad180fc8c5c09d47aadd99822916de1f17848510ed95668f9ef90"
+    },
+    {
+      "path": "evals/interviewer/assessment_only_live.py",
+      "sha256": "a7b4717717784e1bd2e0889ff70105968e3c713741c40a8758bf1e48aba6538f"
+    },
+    {
+      "path": "evals/interviewer/assessment_prototype.py",
+      "sha256": "1c8aadb9915ff968086b8c107cd909b6d2a367cec64db2399ad8ca51e729cf9e"
+    },
+    {
+      "path": "evals/interviewer/blocking_context.py",
+      "sha256": "5a2ac6d06547cf70d85bb48c70c09126ff6d834c93d03ce1c6b2557f695a5129"
+    },
+    {
+      "path": "evals/interviewer/blocking_context_live.py",
+      "sha256": "45f184326f0fa2aad37f95869d73d8bfa89f47a8fe070d0da8c9389b40bdc942"
+    },
+    {
+      "path": "evals/interviewer/evaluate.py",
+      "sha256": "3c6f4db841cd8df3e72b5211f430bb807a208c22221efbc14c0fba9557975309"
+    },
+    {
+      "path": "evals/interviewer/stage2_model_match.py",
+      "sha256": "f353e8670e3e5d83186e5c528df01a9409dabc0c54b7184208a199ad79ce6114"
+    },
+    {
+      "path": "evals/interviewer/stage2_model_match_provider.py",
+      "sha256": "eb1b4fc12d152892cd4230c26b1d159a17c1743e28d247e1670b89d5cacac1ae"
+    },
+    {
+      "path": "evals/interviewer/two_stage_challenge_contract.py",
+      "sha256": "6a8e1f9a3d967d35b9f67a85f0d256c894cee9bd9c7c40ee07eddc76c268caa0"
+    },
+    {
+      "path": "evals/interviewer/two_stage_challenge_live.py",
+      "sha256": "6c9fcc7b4b7b0d37f28095570e4994736c8976c41d5821394f6987c034898602"
+    },
+    {
+      "path": "evals/interviewer/two_stage_challenge_orchestration.py",
+      "sha256": "ea0d863cf7d725c7e4824d82e1f646910a7c56921ff315418003746ece15fb06"
+    },
+    {
+      "path": "evals/interviewer/two_stage_challenge_provider.py",
+      "sha256": "b73f5f02649bc23a9be7a01f0d011bb57eb74a9ee6f623539636c490253ce4bf"
+    },
+    {
+      "path": "evals/interviewer/two_stage_challenge_ultra_live.py",
+      "sha256": "470136138e3fa9a3977c74e88bb1d821594985f78e0a282ed98be31bf8930584"
+    },
+    {
+      "path": "evals/interviewer/two_stage_challenge_ultra_orchestration.py",
+      "sha256": "afae12d7c4176f03980e1da705903cfd7ed490976d1423179f9e4bf98f855b05"
+    },
+    {
+      "path": "evals/interviewer/two_stage_challenge_ultra_provider.py",
+      "sha256": "865628d1cb1dd4c899b26c8133064f1dd906cc9707cf6b45607c5e0385559094"
+    },
+    {
+      "path": "evals/interviewer/two_stage_contract.py",
+      "sha256": "ff60814b0d69d0410a9c3cc25595fa8971d146cbe8776f4d15b92fc81c2cab84"
+    },
+    {
+      "path": "evals/interviewer/two_stage_live.py",
+      "sha256": "6862bb3d31ccacf6c8275a0f51fc0ad029a3d76bba718047bcfdab69d19614ea"
+    },
+    {
+      "path": "evals/interviewer/two_stage_orchestration.py",
+      "sha256": "a356ee9fbd54482868c023a1b59e461224b7207952db241098e6481d8de8d820"
+    },
+    {
+      "path": "evals/interviewer/two_stage_provider.py",
+      "sha256": "1fe7f8f69675139ab3f54961d60e8d10bd449a523a468dbe75139c238c87a55c"
+    }
+  ],
+  "recorded_on": "2026-10-03",
+  "research_status": "frozen",
+  "result_ledger_path": "evals/interviewer/EXPERIMENT_LEDGER.md",
+  "runtime_metadata": {
+    "fastapi": "0.142.1",
+    "httpx": "0.28.1",
+    "httpx2": "2.13.1",
+    "pydantic": "2.13.5",
+    "pytest": "9.1.1",
+    "python": "3.13.0",
+    "starlette": "1.7.0"
+  },
+  "runtime_metadata_scope": "preservation_checkpoint_only_not_historical_dependency_lock",
+  "selected_production_candidate": null,
+  "ultra_model": "nvidia/nemotron-3-ultra-550b-a55b"
+}
