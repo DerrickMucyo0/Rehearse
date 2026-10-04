@@ -82,12 +82,45 @@ function audioForm(session: InterviewSession, audio: Blob): FormData {
   return body
 }
 
+export interface SpeakingMetrics {
+  source: 'original_transcription'
+  recognized_word_count: number
+  um_count: number | null
+  uh_count: number | null
+  filler_unavailable_reason: 'unsupported_language' | null
+  timed_utterance_span_seconds: number | null
+  estimated_words_per_minute: number | null
+  timing_unavailable_reason:
+    | 'missing_timings'
+    | 'timing_coverage_mismatch'
+    | 'invalid_timing'
+    | 'invalid_timing_order'
+    | 'unusable_span'
+    | null
+}
+
 export interface TranscriptionResult {
   session_id: string
   question_index: number
   text: string
   language: string | null
   words: { text: string; start: number; end: number }[]
+  metrics: SpeakingMetrics
+}
+
+function validSpeakingMetrics(value: unknown): value is SpeakingMetrics {
+  if (typeof value !== 'object' || value === null) return false
+  const metrics = value as Record<string, unknown>
+  const count = (number: unknown) => typeof number === 'number' && Number.isSafeInteger(number) && number >= 0
+  const positive = (number: unknown) => typeof number === 'number' && Number.isFinite(number) && number > 0
+  const timingReasons: unknown[] = ['missing_timings', 'timing_coverage_mismatch', 'invalid_timing', 'invalid_timing_order', 'unusable_span']
+  return metrics.source === 'original_transcription' && count(metrics.recognized_word_count) &&
+    (metrics.filler_unavailable_reason === null
+      ? count(metrics.um_count) && count(metrics.uh_count)
+      : metrics.filler_unavailable_reason === 'unsupported_language' && metrics.um_count === null && metrics.uh_count === null) &&
+    (metrics.timing_unavailable_reason === null
+      ? positive(metrics.timed_utterance_span_seconds) && positive(metrics.estimated_words_per_minute)
+      : timingReasons.includes(metrics.timing_unavailable_reason) && metrics.timed_utterance_span_seconds === null && metrics.estimated_words_per_minute === null)
 }
 
 export async function transcribeAudio(session: InterviewSession, audio: Blob, signal: AbortSignal): Promise<TranscriptionResult> {
@@ -117,6 +150,9 @@ export async function transcribeAudio(session: InterviewSession, audio: Blob, si
   if (typeof result?.text !== 'string' || !result.text.trim() || result.text.length > 10000 ||
       result.session_id !== session.id || result.question_index !== session.current_question_index) {
     throw new Error('No usable transcript was returned. Please try again or type your answer.')
+  }
+  if (!validSpeakingMetrics(result.metrics)) {
+    throw new Error('No usable speaking measurements were returned. Please try again or type your answer.')
   }
   return result
 }

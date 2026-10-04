@@ -32,6 +32,9 @@ class FakeTranscriber:
         self.calls = []
         self.error = None
         self.after = None
+        self.result = TranscriptionResult(text='Hello there', language='eng', words=[
+            {'text': 'Hello', 'start': 0.0, 'end': 0.5},
+        ])
 
     async def transcribe(self, audio, filename):
         self.calls.append((audio, filename, await audio.read()))
@@ -39,9 +42,7 @@ class FakeTranscriber:
             raise self.error
         if self.after:
             self.after()
-        return TranscriptionResult(text='Hello there', language='eng', words=[
-            {'text': 'Hello', 'start': 0.0, 'end': 0.5},
-        ])
+        return self.result
 
 
 @pytest.fixture
@@ -69,13 +70,92 @@ def test_success_does_not_advance_and_closes_file(setup):
     assert result.status_code == 200
     assert result.json() == {'session_id': str(session.id), 'question_index': 0,
                              'text': 'Hello there', 'language': 'eng',
-                             'words': [{'text': 'Hello', 'start': 0.0, 'end': 0.5}]}
+                             'words': [{'text': 'Hello', 'start': 0.0, 'end': 0.5}],
+                             'metrics': {
+                                 'source': 'original_transcription', 'recognized_word_count': 2,
+                                 'um_count': 0, 'uh_count': 0, 'filler_unavailable_reason': None,
+                                 'timed_utterance_span_seconds': None, 'estimated_words_per_minute': None,
+                                 'timing_unavailable_reason': 'timing_coverage_mismatch',
+                             }}
     assert service.get(session.id) == session
     assert fake.calls[0][1:] == ('answer-1.webm', b'fake audio')
     assert fake.calls[0][0].file.closed
     assert client.post(f'/api/sessions/{session.id}/answers', json={
         'question_index': 0, 'answer': 'Edited transcript',
     }).json()['current_question_index'] == 1
+
+
+def test_complete_metrics_belong_to_original_transcription_not_edited_answer(setup):
+    client, service, fake = setup
+    fake.result = TranscriptionResult(text='Um, hello', language='eng', words=[
+        {'text': 'Um,', 'start': 3.0, 'end': 3.5},
+        {'text': 'hello', 'start': 3.5, 'end': 5.0},
+    ])
+    original = fake.result.model_dump()
+    session = service.start()
+    response = post(client, session.id)
+    assert response.status_code == 200
+    body = response.json()
+    assert {key: body[key] for key in original} == original
+    assert body['metrics'] == {
+        'source': 'original_transcription', 'recognized_word_count': 2,
+        'um_count': 1, 'uh_count': 0, 'filler_unavailable_reason': None,
+        'timed_utterance_span_seconds': 2.0, 'estimated_words_per_minute': 60.0,
+        'timing_unavailable_reason': None,
+    }
+    edited = 'A different longer answer without any filler words'
+    submitted = client.post(f'/api/sessions/{session.id}/answers', json={
+        'question_index': 0, 'answer': edited,
+    })
+    assert submitted.status_code == 200
+    assert submitted.json()['answers'] == [edited]
+    assert 'metrics' not in submitted.json()
+    assert fake.result.model_dump() == original
+    assert body['metrics']['recognized_word_count'] == 2
+    assert len(fake.calls) == 1
+
+
+def test_response_metrics_explicitly_unavailable_without_language_or_timings(setup):
+    client, service, fake = setup
+    fake.result = TranscriptionResult(text='um uh')
+    response = post(client, service.start().id)
+    assert response.status_code == 200
+    body = response.json()
+    assert body['text'] == 'um uh'
+    assert body['language'] is None
+    assert body['words'] == []
+    assert body['metrics'] == {
+        'source': 'original_transcription', 'recognized_word_count': 2,
+        'um_count': None, 'uh_count': None, 'filler_unavailable_reason': 'unsupported_language',
+        'timed_utterance_span_seconds': None, 'estimated_words_per_minute': None,
+        'timing_unavailable_reason': 'missing_timings',
+    }
+
+
+def test_metrics_after_adapter_filters_spacing_events_and_untimed_words(setup, monkeypatch):
+    client, service, _ = setup
+    calls = []
+
+    def handler(request):
+        calls.append(request)
+        return httpx.Response(200, json=provider_response(text='Hello there', words=[
+            {'text': 'Hello', 'start': 2.0, 'end': 3.0, 'type': 'word'},
+            {'text': ' ', 'start': 0.0, 'end': 4.0, 'type': 'spacing'},
+            {'text': 'there', 'start': None, 'end': None, 'type': 'word'},
+            {'text': '(laugh)', 'start': 0.0, 'end': 9.0, 'type': 'audio_event'},
+        ]))
+
+    monkeypatch.setenv('ELEVENLABS_API_KEY', 'test-only-not-a-real-key')
+    app.dependency_overrides[get_transcription_service] = lambda: ElevenLabsTranscriptionService(
+        httpx.MockTransport(handler))
+    response = post(client, service.start().id)
+    assert response.status_code == 200
+    assert len(calls) == 1
+    body = response.json()
+    assert body['words'] == [{'text': 'Hello', 'start': 2.0, 'end': 3.0}]
+    assert body['metrics']['recognized_word_count'] == 2
+    assert body['metrics']['estimated_words_per_minute'] is None
+    assert body['metrics']['timing_unavailable_reason'] == 'timing_coverage_mismatch'
 
 
 def test_unknown_session(setup):

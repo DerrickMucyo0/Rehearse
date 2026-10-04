@@ -78,3 +78,20 @@ button:disabled {
 [role='alert'] {
   color: #a02020;
 }
+
+.speaking-measurements {
+  margin: 1rem 0;
+  padding: 1rem;
+  border: 1px solid #526174;
+  border-radius: 0.3rem;
+}
+
+.speaking-measurements dl {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 0.4rem 1rem;
+}
+
+.speaking-measurements dd {
+  margin: 0;
+}
