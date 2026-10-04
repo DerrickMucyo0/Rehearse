@@ -222,8 +222,8 @@ audio upload and acceptance, and typed-answer submission/question advancement.
 **Record Answer → Stop Recording → Transcribe Recording → review/edit → Submit Answer**.
 ElevenLabs Scribe v2 currently transcribes recordings through the official Python SDK.
 The backend adapter maps results to application-owned text, optional language, and
-word timestamps (`text`, `start`, `end`, in seconds). Word timings are preserved for
-future deterministic pause/pacing/filler analysis; no such analysis is implemented.
+word timestamps (`text`, `start`, `end`, in seconds). The original transcript and
+valid word timings now support deterministic speaking measurements described below.
 Spacing/audio-event entries and words without timing are omitted from the timing list.
 
 Transcription never submits an answer or advances the interview. The existing textarea
@@ -236,6 +236,40 @@ component aborts the browser request and ignores late results.
 
 Send Recording remains the upload-only validation action and needs no provider key.
 Transcribe Recording is a separate operation; sending first is not required.
+
+### Deterministic Speaking Metrics v1
+
+After successful transcription, the review screen shows **Words**, **Um**, **Uh**,
+**Timed speech span**, and **Estimated WPM**. These are deterministic measurements,
+not scores, quality judgments, coaching, readiness or confidence assessments, or
+semantic feedback.
+
+Word count uses the same deterministic lexical tokenization for every language:
+alphanumeric runs count as words, with internal straight/curly apostrophes and ASCII
+hyphens keeping contractions and hyphenated words together; punctuation alone does not count.
+Only standalone `um` and `uh` tokens are counted as fillers, ignoring letter case,
+and only when the transcription language is exactly `eng` (the supported English
+representation). Missing or unsupported language makes filler counts unavailable,
+rather than zero. Contextual fillers such as `like` are not detected.
+
+Timing measurements require complete word timing coverage matching the transcript,
+valid ordered non-overlapping intervals, and a usable positive span. Missing,
+incomplete, or unusable timing makes both timing measurements unavailable; Rehearse
+does not interpolate missing data. Timed speech span runs from the first timed
+lexical word's start to the last one's end. It includes intervening time but excludes
+leading/trailing recording silence and is not full recording duration. Estimated
+WPM is recognized word count × 60 / timed speech span, calculated only when that
+timing evidence is valid. The UI rounds span to one decimal place and WPM to a whole
+number for display; response values retain their precision. No pause diagnosis is
+implemented.
+
+The panel states: “Based on your original recording. Editing the transcript won’t
+change these measurements.” Measurements describe the original transcribed recording;
+editing the draft does not recalculate them. They exist only in the transcription
+response and temporary frontend state, without persistent metrics history. A
+replacement recording clears them immediately, a new successful transcription
+replaces them, and leaving the question/session clears them. Typed-only answers
+show no measurements panel.
 
 ### Server configuration
 
@@ -277,9 +311,32 @@ HTTP 200 returns only application metadata, for example:
   "question_index": 0,
   "text": "Hello there.",
   "language": "eng",
-  "words": [{"text": "Hello", "start": 0.0, "end": 0.5}]
+  "words": [
+    {"text": "Hello", "start": 0.0, "end": 0.5},
+    {"text": "there.", "start": 0.5, "end": 1.0}
+  ],
+  "metrics": {
+    "source": "original_transcription",
+    "recognized_word_count": 2,
+    "um_count": 0,
+    "uh_count": 0,
+    "filler_unavailable_reason": null,
+    "timed_utterance_span_seconds": 1.0,
+    "estimated_words_per_minute": 120.0,
+    "timing_unavailable_reason": null
+  }
 }
 ```
+
+The `metrics` object is required. Unavailable numeric measurements use `null`;
+zero remains a real word/filler count when applicable. Available measurements have
+a `null` unavailable reason. `filler_unavailable_reason` is `unsupported_language`
+when both filler counts are unavailable. `timing_unavailable_reason` identifies
+`missing_timings`, `timing_coverage_mismatch`, `invalid_timing`,
+`invalid_timing_order`, or `unusable_span` when both timing values are unavailable.
+A successful transcription can still return HTTP 200 with unavailable measurements;
+the UI shows “Unavailable” with an explanation. Existing transcription errors below
+remain unchanged.
 
 Existing validation statuses remain: 400 malformed multipart/parser limits, 404 unknown
 session, 409 completed/stale question, 413 oversized upload, 415 unsupported media,
@@ -306,8 +363,11 @@ Aborting a browser request does not guarantee cancellation of provider work alre
 started. The backend deadline bounds how long Rehearse waits.
 
 This remains a local prototype without authentication or rate limits. Keep the
-key-enabled backend local. No realtime transcription, Nemotron, AI follow-ups, TTS,
-database, authentication, or additional scoring/measurements were added.
+key-enabled backend local. Speaking Metrics v1 adds no semantic scoring, coaching
+judgments, adaptive interviewing, pause diagnosis, longitudinal progress tracking,
+or persistent metrics history. Timing metrics remain unavailable when evidence is
+insufficient. Realtime transcription, Nemotron, AI follow-ups, TTS, a database,
+and authentication remain absent.
 
 ### Manual verification with a real key
 

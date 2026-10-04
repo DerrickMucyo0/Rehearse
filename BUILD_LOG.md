@@ -291,3 +291,37 @@ Verification:
   provider status if available. No exception text, headers, body, transcript, audio,
   or credentials are emitted. HTTP 503/504/502 behavior is unchanged.
 - No new product features, frontend key exposure, commit, or push.
+
+## Deterministic Speaking Metrics v1
+
+- Branch: `feat/speaking-metrics`, independent of Issue #9 and its frozen research.
+- Backend slice (`9b06301`): adds deterministic measurements to the transcription
+  response while preserving existing fields and session behavior. Measures recognized
+  words, conservative standalone English `um`/`uh` counts, timed lexical utterance
+  span, and estimated WPM. Complete valid timing coverage is required; missing data
+  is not interpolated. Unavailable values use `null`, never substitute zero.
+- Frontend slice (`1b889a4`): shows Words, Um, Uh, Timed speech span, and Estimated WPM
+  during transcript review. Provenance explicitly identifies the original recording;
+  editing the transcript does not recalculate measurements. Replacement recording,
+  question advancement, and session lifecycle clear stale measurements; typed-only
+  answers show no panel. Unavailable measurements have an explanation.
+- Measurements are ephemeral response/frontend state, with no metrics persistence,
+  semantic scoring, judgments, coaching, readiness/confidence assessment, or adaptive
+  interviewing. Timed span is not full recording duration; pause diagnosis and
+  contextual filler detection are not implemented. No provider configuration,
+  dependency, CI, or Issue #9 research changes were introduced.
+- Final documentation slice updates the current transcription contract, measurement
+  rules, original-recording provenance, unavailable states, and limitations in README.
+  Earlier build-log entries retain their historical scope and results.
+
+Previously completed milestone-wide verification from committed implementation:
+- Full backend suite with warnings as errors: 169 passed.
+- Frontend suite: 49 passed.
+- TypeScript/Vite build: passed.
+- Oxlint: passed.
+- Existing local Playwright interview completion/restart flow: 1 passed against
+  local FastAPI/Vite with provider credentials unset.
+- `git diff --check main...HEAD`: passed.
+- Zero live NVIDIA calls and zero live ElevenLabs calls during this verification;
+  provider integration was not exercised live. Tests used mocks/local services.
+- Issue #9 and held-out data remained untouched. No push or PR created.
