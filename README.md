@@ -44,7 +44,8 @@ After completion, the index equals the question count and `current_question` is 
 
 Sessions live only in the backend process and disappear on restart/reload. Run one
 Uvicorn worker: sessions are not shared between workers. Browser refresh resets
-the UI; there is no session restoration, authentication, database, expiry, or scoring.
+the UI; there is no session restoration, authentication, database-backed runtime,
+expiry, or scoring. A separate PostgreSQL schema foundation is described below.
 Anyone with a session ID can access that session. This is a local development prototype.
 
 ## Local frontend setup
@@ -96,13 +97,152 @@ From the project root with the backend virtual environment activated:
 python -m pytest -W error
 ```
 
+## PostgreSQL foundation (Issue #11, first slice)
+
+PostgreSQL is the persistence-engine foundation, using synchronous SQLAlchemy 2.x,
+psycopg 3 and Alembic. **Session persistence is not active yet:** HTTP routes still
+use `InterviewSessionService` in memory. Importing the database modules creates no
+engine or connection. `create_database_engine()` creates a lazy engine;
+`create_session_factory()` returns a factory, not a shared session. Future callers
+own their sessions and transactions. There is no startup `create_all()`, automatic
+migration, storage fallback, or additional provider integration.
+
+`DATABASE_URL` is required only when explicitly using the application database
+foundation or running migrations. `TEST_DATABASE_URL` is exclusively for destructive
+PostgreSQL tests and never falls back to `DATABASE_URL`. Standard PostgreSQL URLs
+are normalized to `postgresql+psycopg`. Destructive tests require both database and
+role to be named `rehearse_test`, reject connection-query overrides and any configured
+application database of the same name, and verify the actual connected database/role
+before DDL. The test target must contain only this test schema. Configuration errors
+omit URL values; engine SQL echo is disabled and bound parameters are hidden in
+SQLAlchemy errors. Do not enable SQL logging or log database exceptions/URLs containing
+submitted text or credentials. No automatic `.env` loading is added.
+
+### Local PostgreSQL and explicit migrations
+
+Install Docker separately if needed. Development and CI use
+`postgres:18.6-bookworm`. Compose binds only `127.0.0.1:5432`, uses the named
+`postgres_development` volume and a `pg_isready` healthcheck. Credentials are required
+environment inputs for local development only; never reuse production credentials.
+For macOS zsh, from the repository root:
+
+```zsh
+export POSTGRES_USER=rehearse_dev
+read -rs "POSTGRES_PASSWORD?Local PostgreSQL password: "
+echo
+export POSTGRES_PASSWORD
+docker compose up -d postgres
+docker compose ps
+```
+
+Once healthy, enter an application URL privately. Its shape is
+`postgresql+psycopg://rehearse_dev:<URL-encoded-password>@127.0.0.1:5432/rehearse_dev`.
+Use percent encoding for special characters in credentials. These commands put
+neither the entered value nor password into shell history:
+
+```zsh
+read -rs "DATABASE_URL?Local application database URL: "
+echo
+export DATABASE_URL
+PYTHONDONTWRITEBYTECODE=1 backend/.venv/bin/python -m alembic upgrade head
+PYTHONDONTWRITEBYTECODE=1 backend/.venv/bin/python -m alembic current
+```
+
+Migration `0001_database_foundation` creates the three tables below, their constraints,
+the measurement creation-time index and two immutability triggers. Its DDL is
+self-contained. Downgrade removes attempts, measurements, sessions, then trigger
+functions; it destroys stored data and must only be run intentionally on an appropriate
+database. Changing initial Compose credentials does not change an existing volume's
+database roles/passwords. `docker compose down` retains the named volume.
+
+### Schema and enforcement boundary
+
+All IDs are application-generated UUID primary keys. Required timestamps are
+`TIMESTAMPTZ` with server `now()` defaults. There is no `user_id` or account schema.
+
+| Table | Columns |
+| --- | --- |
+| `interview_sessions` | `id UUID`, `questions JSONB NOT NULL`, `current_question_index INTEGER NOT NULL` (default 0), `status TEXT NOT NULL` (default active), `created_at TIMESTAMPTZ NOT NULL`, `completed_at TIMESTAMPTZ NULL` |
+| `question_attempts` | `id UUID`, `session_id UUID NOT NULL`, `question_index INTEGER NOT NULL`, `attempt_number INTEGER NOT NULL` (ORM default 1), `answer_text TEXT NOT NULL`, `submitted_at TIMESTAMPTZ NOT NULL`, `measurement_id UUID NULL` |
+| `transcription_measurements` | `id UUID`, `session_id UUID NOT NULL`, `question_index INTEGER NOT NULL`, `created_at TIMESTAMPTZ NOT NULL`, `measurement_version TEXT NOT NULL`, `measurement_source TEXT NOT NULL`, `recognized_word_count INTEGER NOT NULL`, `um_count INTEGER NULL`, `uh_count INTEGER NULL`, `filler_unavailable_reason TEXT NULL`, `timed_utterance_span_seconds DOUBLE PRECISION NULL`, `estimated_words_per_minute DOUBLE PRECISION NULL`, `timing_unavailable_reason TEXT NULL` |
+
+PostgreSQL enforces:
+
+- Exactly five nonempty text questions; snapshot changes are rejected by a trigger.
+  Active sessions have index 0–4 and no completion timestamp. Completed sessions have
+  index 5 and a completion timestamp no earlier than creation. Only `active` and
+  `completed` statuses are allowed.
+- Nonnegative question indices and positive attempt numbers. Attempts 2, 3 and beyond
+  are permitted by the schema, with a unique `(session_id, question_index, attempt_number)`.
+  Answer text length is 1–10,000 characters.
+- Measurement source exactly `original_transcription`, nonblank version and
+  nonnegative word/filler counts. Available filler counts are both non-null with no
+  reason; unavailable counts are both null with `unsupported_language`.
+- Available timing values are both positive and finite, including rejection of NaN
+  and infinity, with no unavailable reason. Unavailable values are both null with one
+  of `missing_timings`, `timing_coverage_mismatch`, `invalid_timing`,
+  `invalid_timing_order`, or `unusable_span`. Double-precision values are not rounded.
+  A trigger rejects updates to persisted measurement snapshots.
+- Foreign keys from attempts/measurements to their session. A composite foreign key
+  makes a linked measurement match the attempt's session and question. Unique
+  `measurement_id` permits only one attachment; null permits typed-only attempts.
+  Session deletion cascades to both child tables; deleting a linked measurement alone
+  is rejected. No deletion endpoint is introduced.
+
+The new persistence-model validator trims submitted answers and rejects embedded
+U+0000 before insertion; it does not strip/replace NUL. This slice leaves current
+HTTP validation unchanged. A later runtime slice must map rejection to HTTP 422.
+Service transactions must also enforce question bounds against the owning snapshot,
+current-question state, attempt allocation, measurement eligibility, and atomic
+attachment. The database constraints do not implement those workflows.
+
+Unlinked measurements become deletion-eligible after 24 hours; linked measurements
+remain associated with their attempt. A pure timestamp/linkage helper models this
+policy. It introduces neither automatic expiry of attachment rights nor a cleanup
+worker; future cleanup must recheck linkage transactionally. Measurement IDs will
+eventually be explicit client associations, never inferred from edited answers or
+the latest recording/measurement. That API/frontend association is not implemented.
+
+Only the final trimmed submitted answer will be durable text. No audio, second
+original-transcription text copy or word timings are stored. There are no user
+accounts, semantic scoring, retry UI or history UI. Hosting remains provider-neutral;
+no Supabase-specific APIs are used. Issue #9 remains open and frozen.
+
+### Real PostgreSQL verification
+
+Create a dedicated disposable test database and role once, on the local Compose
+server. The interactive password command does not expose its value:
+
+```zsh
+docker compose exec postgres psql -U "$POSTGRES_USER" -d rehearse_dev -c 'CREATE ROLE rehearse_test LOGIN'
+docker compose exec postgres psql -U "$POSTGRES_USER" -d rehearse_dev -c '\password rehearse_test'
+docker compose exec postgres createdb -U "$POSTGRES_USER" -O rehearse_test rehearse_test
+read -rs "TEST_DATABASE_URL?Isolated rehearse_test database URL: "
+echo
+export TEST_DATABASE_URL
+REHEARSE_REQUIRE_POSTGRES_TESTS=1 PYTHONDONTWRITEBYTECODE=1 backend/.venv/bin/python -m pytest -W error tests/test_postgres_schema.py
+REHEARSE_REQUIRE_POSTGRES_TESTS=1 PYTHONDONTWRITEBYTECODE=1 backend/.venv/bin/python -m pytest -W error
+git diff --check
+```
+
+The test URL must use `rehearse_test` for both username and database, with the privately
+entered password and local host/port. Integration tests downgrade/upgrade this schema,
+including an upgrade from an empty schema; **never use a database containing valuable
+data**. They verify schema/ORM parity, UUID/JSONB/timestamp persistence, constraints,
+immutability, foreign keys, delete policy and persistence across engine reconstruction.
+They use real PostgreSQL, never SQLite. Without explicit local configuration they skip
+as `BLOCKED_BY_LOCAL_DB_ENV`; this is not PostgreSQL acceptance. Setting
+`REHEARSE_REQUIRE_POSTGRES_TESTS=1` makes missing configuration fail. Database-independent
+configuration/domain/offline migration tests and existing API regressions remain runnable.
+
 ## Continuous integration
 
 GitHub Actions runs `.github/workflows/ci.yml` on pushes to `main` and pull
 requests targeting `main`, with separate backend and frontend jobs on Ubuntu:
 
 - Python 3.13: install runtime and test requirements, then run the complete pytest
-  suite with warnings treated as errors.
+  suite with warnings treated as errors against an isolated PostgreSQL 18.6 service.
+  Its runner-only test credentials are disposable; PostgreSQL tests are required.
 - Node.js 24 LTS: install locked npm dependencies, run Vitest component tests,
   type-check and build with TypeScript/Vite, and lint with Oxlint.
 
@@ -290,7 +430,7 @@ export ELEVENLABS_API_KEY
 python -m uvicorn app.main:app --app-dir backend --reload --host 127.0.0.1 --port 8000
 ```
 
-`.env.example` contains only the empty variable name. `.env` files are ignored, but the
+`.env.example` contains empty provider/database configuration placeholders. `.env` files are ignored, but the
 application does **not** automatically load them; no dotenv dependency is needed.
 Never use a `VITE_` variable for this key, include it in frontend configuration, or
 commit a real value. The application and all non-transcription endpoints work without
@@ -366,7 +506,7 @@ This remains a local prototype without authentication or rate limits. Keep the
 key-enabled backend local. Speaking Metrics v1 adds no semantic scoring, coaching
 judgments, adaptive interviewing, pause diagnosis, longitudinal progress tracking,
 or persistent metrics history. Timing metrics remain unavailable when evidence is
-insufficient. Realtime transcription, Nemotron, AI follow-ups, TTS, a database,
+insufficient. Realtime transcription, Nemotron, AI follow-ups, TTS, database-backed sessions,
 and authentication remain absent.
 
 ### Manual verification with a real key

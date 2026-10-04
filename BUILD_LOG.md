@@ -325,3 +325,44 @@ Previously completed milestone-wide verification from committed implementation:
 - Zero live NVIDIA calls and zero live ElevenLabs calls during this verification;
   provider integration was not exercised live. Tests used mocks/local services.
 - Issue #9 and held-out data remained untouched. No push or PR created.
+
+## Issue #11 — PostgreSQL foundation, first slice
+
+- Branch: `feat/postgres-persistence`, starting from the merged Speaking Metrics v1
+  baseline. Adds synchronous SQLAlchemy 2.x, psycopg 3 and Alembic within the existing
+  ranged requirements style. Hosting remains provider-neutral.
+- Adds opt-in environment configuration, lazy engines and caller-owned ORM sessions.
+  Application `DATABASE_URL` and destructive `TEST_DATABASE_URL` are separate; tests
+  require the dedicated `rehearse_test` database/role and verify the connected target
+  before DDL. No automatic dotenv loading, migrations, SQL echo or storage fallback.
+- Adds the three-table schema: immutable five-question session snapshots, numbered
+  submitted-answer attempts and immutable original-transcription measurements.
+  Named checks cover status/completion, counts, finite timing values and unavailable
+  states. Unique/composite foreign keys enforce one attachment and matching context.
+  Parent session deletion cascades; a linked measurement cannot be deleted alone.
+- Initial revision `0001_database_foundation` contains self-contained reviewed DDL,
+  immutability triggers and a child-first downgrade. No startup `create_all()`.
+  Domain validation trims answers and rejects NUL without repair. A pure helper
+  models 24-hour unlinked deletion eligibility; no cleanup worker is introduced.
+- Adds development Compose PostgreSQL `18.6-bookworm`, a loopback port, named volume,
+  healthcheck and environment-supplied local credentials. Backend CI uses the same
+  image with isolated disposable test credentials and requires integration tests;
+  frontend CI is unchanged. README documents setup, migrations, destructive-test
+  isolation, security and the future transactional service enforcement boundary.
+- Runtime session/API/transcription behavior remains in memory. Measurement-ID
+  association, atomic submission, HTTP 422 NUL handling and cleanup integration are
+  deferred. No audio, original-transcript copy or word timing persistence, accounts,
+  history/retry UI, semantic scoring, or production hosting integration.
+
+Verification:
+- Configuration/domain/offline migration tests with warnings as errors: 44 passed.
+  PostgreSQL DDL renders for upgrade and downgrade; one initial revision is present.
+- Targeted real PostgreSQL tests: 57 skipped, classified **BLOCKED_BY_LOCAL_DB_ENV**.
+  Docker and `psql` are unavailable and `TEST_DATABASE_URL` is absent. No SQLite
+  substitution was used. Migration execution and constraint acceptance on a real
+  server remain unverified locally; this slice is not production-verified.
+- Full backend suite with warnings as errors: 213 passed, 57 skipped. All 169 existing
+  API/audio/transcription/speaking-metrics regressions passed.
+- `git diff --check` passed. Fingerprints of all pre-existing runtime, frontend and
+  test files remained unchanged. No Issue #9 research or held-out inspection, no live
+  provider calls, commit, push or PR.

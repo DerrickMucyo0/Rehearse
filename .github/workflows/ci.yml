@@ -13,6 +13,24 @@ jobs:
   backend:
     name: Backend tests
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:18.6-bookworm
+        env:
+          POSTGRES_DB: rehearse_test
+          POSTGRES_USER: rehearse_test
+          # Disposable runner-only credential, not an application secret.
+          POSTGRES_PASSWORD: ${{ github.run_id }}-${{ github.run_attempt }}-ci-only
+        ports:
+          - 127.0.0.1:5432:5432
+        options: >-
+          --health-cmd "pg_isready -U rehearse_test -d rehearse_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      TEST_DATABASE_URL: postgresql+psycopg://rehearse_test:${{ github.run_id }}-${{ github.run_attempt }}-ci-only@127.0.0.1:5432/rehearse_test
+      REHEARSE_REQUIRE_POSTGRES_TESTS: '1'
     steps:
       - name: Check out repository
         uses: actions/checkout@v7
