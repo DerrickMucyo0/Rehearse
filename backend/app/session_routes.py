@@ -3,8 +3,10 @@ from typing import Annotated
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
+from pydantic import Field
 
 from app.audio import AudioAccepted, bounded_multipart_request, validated_audio
+from app.speaking_metrics import SpeakingMetrics, measure_transcription
 from app.sessions import (
     AnswerRequest,
     InterviewSession,
@@ -79,6 +81,10 @@ async def accept_audio(session_id: UUID, request: Request, sessions: SessionServ
 class SessionTranscription(TranscriptionResult):
     session_id: UUID
     question_index: int
+    metrics: SpeakingMetrics = Field(
+        description="Measurements of the original recognized transcription, not later edited answers. "
+                    "Timing estimates exclude leading/trailing recording silence; null means unavailable.",
+    )
 
 
 @router.post("/{session_id}/transcriptions", response_model=SessionTranscription)
@@ -99,4 +105,5 @@ async def transcribe_audio(
         sessions.validate_current_question(session_id, metadata.question_index)
         return SessionTranscription(
             session_id=session_id, question_index=metadata.question_index, **result.model_dump(),
+            metrics=measure_transcription(result.text, result.language, result.words),
         )
