@@ -1,5 +1,7 @@
 import { expect, test } from '@playwright/test'
 
+// Run with tests/e2e_app.py: real session API, offline fake reasoning.
+
 test('App retains the completed interview until an explicit restart', async ({ page }) => {
   const errors: string[] = []
   const navigations: string[] = []
@@ -30,7 +32,7 @@ test('App retains the completed interview until an explicit restart', async ({ p
     const response = await responsePromise
     expect(response.status()).toBe(200)
     expect(response.request().postDataJSON()).toEqual({
-      question_index: index, answer: `Integration answer ${index + 1}`,
+      question_index: index, turn_revision: index, submission_id: expect.any(String), answer: `Integration answer ${index + 1}`,
     })
     const session = await response.json()
     expect(session.status).toBe(index === 4 ? 'completed' : 'active')

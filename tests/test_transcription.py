@@ -10,7 +10,8 @@ from starlette.datastructures import Headers, UploadFile
 from app.audio import MAX_AUDIO_BYTES, MAX_BODY_BYTES
 from app.main import app
 from app.session_routes import get_session_service
-from app.sessions import AnswerRequest, InterviewSessionService
+from app.sessions import InterviewSessionService
+from conftest import advance, answer_payload
 from app.transcription import (
     ElevenLabsTranscriptionService, TranscriptionFailed, TranscriptionResult,
     TranscriptionTimeout, TranscriptionUnavailable, get_transcription_service,
@@ -58,7 +59,7 @@ def setup():
 
 
 def post(client, session_id, index='0', audio=b'fake audio', mime='audio/webm;codecs=opus'):
-    return client.post(f'/api/sessions/{session_id}/transcriptions', data={'question_index': index},
+    return client.post(f'/api/sessions/{session_id}/transcriptions', data={'question_index': index, 'turn_revision': index},
                        files={'audio': ('../../private.webm', audio, mime)})
 
 
@@ -67,15 +68,13 @@ def test_success_does_not_advance_and_closes_file(setup):
     session = service.start()
     result = post(client, session.id)
     assert result.status_code == 200
-    assert result.json() == {'session_id': str(session.id), 'question_index': 0,
+    assert result.json() == {'session_id': str(session.id), 'question_index': 0, 'turn_revision': 0,
                              'text': 'Hello there', 'language': 'eng',
                              'words': [{'text': 'Hello', 'start': 0.0, 'end': 0.5}]}
     assert service.get(session.id) == session
     assert fake.calls[0][1:] == ('answer-1.webm', b'fake audio')
     assert fake.calls[0][0].file.closed
-    assert client.post(f'/api/sessions/{session.id}/answers', json={
-        'question_index': 0, 'answer': 'Edited transcript',
-    }).json()['current_question_index'] == 1
+    assert client.post(f'/api/sessions/{session.id}/answers', json=answer_payload(0, 'Edited transcript')).json()['current_question_index'] == 1
 
 
 def test_unknown_session(setup):
@@ -88,7 +87,7 @@ def test_unknown_session(setup):
 def test_wrong_question(setup, index):
     client, service, fake = setup
     session = service.start()
-    service.submit_answer(session.id, AnswerRequest(question_index=0, answer='First'))
+    advance(service, session.id, 0, 'First')
     assert post(client, session.id, index=index).status_code == 409
     assert fake.calls == []
 
@@ -97,7 +96,7 @@ def test_completed_session(setup):
     client, service, fake = setup
     session = service.start()
     for index in range(5):
-        service.submit_answer(session.id, AnswerRequest(question_index=index, answer='Answer'))
+        advance(service, session.id, index, 'Answer')
     assert post(client, session.id, index='5').status_code == 409
     assert fake.calls == []
 
@@ -155,7 +154,7 @@ def test_missing_configuration_uses_real_adapter_without_network(setup):
 def test_question_advanced_during_provider_call(setup):
     client, service, fake = setup
     session = service.start()
-    fake.after = lambda: service.submit_answer(session.id, AnswerRequest(question_index=0, answer='Other tab'))
+    fake.after = lambda: advance(service, session.id, 0, 'Other tab')
     assert post(client, session.id).status_code == 409
     assert fake.calls[0][0].file.closed
     assert service.get(session.id).answers == ['Other tab']
@@ -455,3 +454,45 @@ def test_actual_route_default_dependency(setup, monkeypatch, capsys, outcome):
         assert 'stage=provider_request provider_status=403 category=authorization' in output
     if outcome == 'mapping_failure':
         assert 'stage=result_mapping provider_status=unavailable category=validation' in output
+
+
+def test_same_question_turn_changes_during_transcription(setup):
+    from app.reasoning import Decision
+    from app.sessions import AnswerRequest
+    client, service, fake = setup
+    session = service.start()
+
+    def follow_up():
+        answer = AnswerRequest(**answer_payload(0, 'Concurrent typed answer'))
+        service.begin_submission(session.id, answer)
+        service.submit_answer(session.id, answer, Decision(
+            action='FOLLOW_UP', reason='Missing result.', next_prompt='What was the result?'))
+
+    fake.after = follow_up
+    assert post(client, session.id).status_code == 409
+    assert service.get(session.id).current_question_index == 0
+    assert service.get(session.id).turn_revision == 1
+    assert fake.calls[0][0].file.closed
+
+
+def test_successful_transcription_for_follow_up_does_not_invoke_reasoning(setup):
+    from app.reasoning import Decision
+    from app.sessions import AnswerRequest
+    from app.nemotron import get_reasoning_service
+    client, service, fake = setup
+    session = service.start()
+    answer = AnswerRequest(**answer_payload(0, 'Typed answer'))
+    service.begin_submission(session.id, answer)
+    current = service.submit_answer(session.id, answer, Decision(
+        action='CLARIFY', reason='Unclear.', next_prompt='Which project?'))
+
+    class Forbidden:
+        async def decide(self, context):
+            raise AssertionError('Transcription must not invoke reasoning')
+    app.dependency_overrides[get_reasoning_service] = lambda: Forbidden()
+    response = client.post(f'/api/sessions/{session.id}/transcriptions',
+        data={'question_index': '0', 'turn_revision': '1'},
+        files={'audio': ('answer.webm', b'fake audio', 'audio/webm')})
+    assert response.status_code == 200
+    assert response.json()['turn_revision'] == 1
+    assert service.get(session.id) == current

@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useRef, useState } from 'react'
 import AudioAnswer from './AudioAnswer'
 import type { FormEvent } from 'react'
 import { startInterview, submitAnswer } from './interviewApi'
@@ -10,12 +10,15 @@ export default function Interview() {
   const [busy, setBusy] = useState(false)
   const [transcribing, setTranscribing] = useState(false)
   const [error, setError] = useState('')
+  const submitting = useRef(false)
+  const attempt = useRef<{ sessionId: string; revision: number; answer: string; id: string } | null>(null)
 
   async function start() {
     setBusy(true)
     setError('')
     try {
       setSession(await startInterview())
+      attempt.current = null
       setAnswer('')
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : 'Unable to start interview.')
@@ -26,15 +29,23 @@ export default function Interview() {
 
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
-    if (!session || busy || transcribing || !answer.trim()) return
+    if (!session || submitting.current || busy || transcribing || !answer.trim()) return
+    submitting.current = true
+    const text = answer.trim()
+    if (!attempt.current || attempt.current.sessionId !== session.id ||
+        attempt.current.revision !== session.turn_revision || attempt.current.answer !== text) {
+      attempt.current = { sessionId: session.id, revision: session.turn_revision, answer: text, id: crypto.randomUUID() }
+    }
     setBusy(true)
     setError('')
     try {
-      setSession(await submitAnswer(session, answer.trim()))
+      setSession(await submitAnswer(session, text, attempt.current.id))
+      attempt.current = null
       setAnswer('')
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : 'Unable to submit answer.')
     } finally {
+      submitting.current = false
       setBusy(false)
     }
   }
@@ -49,10 +60,12 @@ export default function Interview() {
       {session?.status === 'active' && (
         <form onSubmit={(event) => void submit(event)}>
           <p aria-live="polite">Question {session.current_question_index + 1} of {session.questions.length}</p>
-          <h2 id="current-question" aria-live="polite">{session.current_question}</h2>
-          <AudioAnswer key={`${session.id}:${session.current_question_index}`} session={session} disabled={busy || transcribing}
+          <h2 id="current-question" aria-live="polite">{session.current_prompt}</h2>
+          <AudioAnswer key={`${session.id}:${session.turn_revision}`} session={session} disabled={busy || transcribing}
             hasAnswer={answer.length > 0} onTranscribing={setTranscribing}
             onTranscript={(text) => setAnswer((current) => current === '' ? text : current)} />
+          <p>Submit Answer sends your text to NVIDIA for interviewer reasoning.</p>
+          {busy && <p role="status">Waiting for the interviewer…</p>}
           <label htmlFor="answer">Your answer</label>
           <textarea
             id="answer"
@@ -65,7 +78,7 @@ export default function Interview() {
             disabled={busy || transcribing}
           />
           <button type="submit" disabled={busy || transcribing || !answer.trim()}>
-            {busy ? 'Submitting…' : 'Submit Answer'}
+            {busy ? 'Reviewing answer…' : 'Submit Answer'}
           </button>
         </form>
       )}

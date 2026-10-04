@@ -1,6 +1,6 @@
 import { defineConfig } from '@playwright/test'
 
-// Run against the same local Vite/FastAPI pair used for manual testing.
+// Run against Vite and the offline FastAPI fixture in tests/e2e_app.py.
 export default defineConfig({
   testDir: './e2e',
   testMatch: '**/*.pw.ts',

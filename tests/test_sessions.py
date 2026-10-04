@@ -7,6 +7,7 @@ from fastapi.testclient import TestClient
 from app.main import app
 from app.session_routes import get_session_service
 from app.sessions import InterviewSessionService
+from conftest import answer_payload
 
 
 @pytest.fixture
@@ -39,7 +40,7 @@ def test_sessions_have_unique_ids_and_independent_answers(client: TestClient) ->
     first = client.post("/api/sessions").json()
     second = client.post("/api/sessions").json()
     assert first["id"] != second["id"]
-    client.post(f"/api/sessions/{first['id']}/answers", json={"question_index": 0, "answer": "One"})
+    client.post(f"/api/sessions/{first['id']}/answers", json=answer_payload(0, "One"))
     assert client.get(f"/api/sessions/{second['id']}").json() == second
 
 
@@ -47,7 +48,7 @@ def test_answer_advances_question(client: TestClient) -> None:
     session = client.post("/api/sessions").json()
     response = client.post(
         f"/api/sessions/{session['id']}/answers",
-        json={"question_index": 0, "answer": "  My answer.  "},
+        json=answer_payload(0, "  My answer.  "),
     )
     assert response.status_code == 200
     updated = response.json()
@@ -64,7 +65,7 @@ def test_complete_session_and_reject_extra_answer(client: TestClient) -> None:
     answers = []
     for index, _question in enumerate(session["questions"]):
         answers.append(f"Answer {index}")
-        response = client.post(f"{url}/answers", json={"question_index": index, "answer": answers[-1]})
+        response = client.post(f"{url}/answers", json=answer_payload(index, answers[-1]))
         assert response.status_code == 200
         updated = response.json()
         assert updated["answers"] == answers
@@ -75,7 +76,7 @@ def test_complete_session_and_reject_extra_answer(client: TestClient) -> None:
     assert updated["status"] == "completed"
     assert updated["current_question"] is None
     assert client.get(url).json() == updated
-    assert client.post(f"{url}/answers", json={"question_index": 5, "answer": "Extra"}).status_code == 409
+    assert client.post(f"{url}/answers", json=answer_payload(5, "Extra")).status_code == 409
     assert client.get(url).json() == updated
 
 
@@ -83,22 +84,22 @@ def test_complete_session_and_reject_extra_answer(client: TestClient) -> None:
 def test_reject_stale_or_future_answer(client: TestClient, index: int) -> None:
     session = client.post("/api/sessions").json()
     url = f"/api/sessions/{session['id']}"
-    updated = client.post(f"{url}/answers", json={"question_index": 0, "answer": "First"}).json()
-    assert client.post(f"{url}/answers", json={"question_index": index, "answer": "Retry"}).status_code == 409
+    updated = client.post(f"{url}/answers", json=answer_payload(0, "First")).json()
+    assert client.post(f"{url}/answers", json=answer_payload(index, "Retry")).status_code == 409
     assert client.get(url).json() == updated
 
 
 def test_nonexistent_session(client: TestClient) -> None:
     url = f"/api/sessions/{uuid4()}"
     assert client.get(url).status_code == 404
-    assert client.post(f"{url}/answers", json={"question_index": 0, "answer": "Answer"}).status_code == 404
+    assert client.post(f"{url}/answers", json=answer_payload()).status_code == 404
 
 
 @pytest.mark.parametrize("answer", ["", " \n\t ", None, 123, True, [], {}, "x" * 10001])
 def test_reject_invalid_answer(client: TestClient, answer: object) -> None:
     session = client.post("/api/sessions").json()
     url = f"/api/sessions/{session['id']}"
-    assert client.post(f"{url}/answers", json={"question_index": 0, "answer": answer}).status_code == 422
+    assert client.post(f"{url}/answers", json=answer_payload(0, answer)).status_code == 422
     assert client.get(url).json() == session
 
 
@@ -108,7 +109,8 @@ def test_reject_invalid_answer(client: TestClient, answer: object) -> None:
 def test_reject_invalid_request(client: TestClient, payload: dict[str, object]) -> None:
     session = client.post("/api/sessions").json()
     url = f"/api/sessions/{session['id']}"
-    assert client.post(f"{url}/answers", json=payload).status_code == 422
+    identity = {k: v for k, v in answer_payload().items() if k not in ("answer", "question_index")}
+    assert client.post(f"{url}/answers", json={**identity, **payload}).status_code == 422
     assert client.get(url).json() == session
 
 

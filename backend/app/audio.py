@@ -18,6 +18,7 @@ AUDIO_EXTENSIONS = {
 class AudioAccepted(BaseModel):
     session_id: UUID
     question_index: int
+    turn_revision: int
     filename: str
     content_type: str
     size_bytes: int
@@ -40,7 +41,7 @@ async def bounded_multipart_request(request: Request) -> Request:
     return Request(request.scope, receive)
 
 
-def validate_audio(upload: UploadFile, session_id: UUID, question_index: int) -> AudioAccepted:
+def validate_audio(upload: UploadFile, session_id: UUID, question_index: int, turn_revision: int) -> AudioAccepted:
     content_type = upload.content_type or ""
     base_type = content_type.split(";", 1)[0].strip().lower()
     if base_type not in AUDIO_EXTENSIONS:
@@ -51,7 +52,7 @@ def validate_audio(upload: UploadFile, session_id: UUID, question_index: int) ->
     if size > MAX_AUDIO_BYTES:
         raise HTTPException(413, "Recording exceeds the 10 MiB limit.")
     return AudioAccepted(
-        session_id=session_id, question_index=question_index,
+        session_id=session_id, question_index=question_index, turn_revision=turn_revision,
         filename=f"answer-{question_index + 1}.{AUDIO_EXTENSIONS[base_type]}",
         content_type=content_type, size_bytes=size,
     )
@@ -60,12 +61,15 @@ def validate_audio(upload: UploadFile, session_id: UUID, question_index: int) ->
 @asynccontextmanager
 async def validated_audio(bounded: Request, session_id: UUID):
     """Share multipart shape/audio validation and file lifetime across audio operations."""
-    async with bounded.form(max_files=1, max_fields=1, max_part_size=1024) as form:
+    async with bounded.form(max_files=1, max_fields=2, max_part_size=1024) as form:
         upload = form.get("audio")
         index = form.get("question_index")
-        if (set(form) != {"audio", "question_index"} or
+        revision = form.get("turn_revision")
+        if (len(form.multi_items()) != 3 or set(form) != {"audio", "question_index", "turn_revision"} or
                 not isinstance(upload, UploadFile) or not isinstance(index, str) or
-                not index.isascii() or not index.isdecimal() or len(index) > 9):
-            raise HTTPException(422, "Provide an audio file and a non-negative question_index.")
-        metadata = validate_audio(upload, session_id, int(index))
+                not index.isascii() or not index.isdecimal() or len(index) > 9 or
+                not isinstance(revision, str) or not revision.isascii() or
+                not revision.isdecimal() or len(revision) > 9):
+            raise HTTPException(422, "Provide audio, question_index and turn_revision.")
+        metadata = validate_audio(upload, session_id, int(index), int(revision))
         yield upload, metadata

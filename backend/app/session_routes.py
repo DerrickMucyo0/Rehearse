@@ -5,6 +5,9 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 
 from app.audio import AudioAccepted, bounded_multipart_request, validated_audio
+from app.interview_orchestration import submit_with_reasoning
+from app.nemotron import get_reasoning_service
+from app.reasoning import InterviewerReasoningService, ReasoningFailed, ReasoningTimeout, ReasoningUnavailable
 from app.sessions import (
     AnswerRequest,
     InterviewSession,
@@ -45,15 +48,22 @@ def get_session(session_id: UUID, sessions: SessionService) -> InterviewSession:
 
 
 @router.post("/{session_id}/answers", response_model=InterviewSession)
-def submit_answer(
-    session_id: UUID, answer: AnswerRequest, sessions: SessionService
+async def submit_answer(
+    session_id: UUID, answer: AnswerRequest, sessions: SessionService,
+    reasoner: Annotated[InterviewerReasoningService, Depends(get_reasoning_service)],
 ) -> InterviewSession:
     try:
-        return sessions.submit_answer(session_id, answer)
+        return await submit_with_reasoning(sessions, session_id, answer, reasoner)
     except SessionNotFound as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except SessionConflict as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ReasoningUnavailable:
+        raise HTTPException(503, "Interviewer reasoning is not configured on the server.") from None
+    except ReasoningTimeout:
+        raise HTTPException(504, "Interviewer reasoning timed out. Please retry your answer.") from None
+    except ReasoningFailed:
+        raise HTTPException(502, "Unable to evaluate this answer. Please retry.") from None
 
 
 @asynccontextmanager
@@ -62,7 +72,7 @@ async def current_audio(session_id: UUID, request: Request, sessions: InterviewS
         sessions.get(session_id)
         bounded = await bounded_multipart_request(request)
         async with validated_audio(bounded, session_id) as (upload, metadata):
-            sessions.validate_current_question(session_id, metadata.question_index)
+            sessions.validate_current_turn(session_id, metadata.question_index, metadata.turn_revision)
             yield upload, metadata
     except SessionNotFound as exc:
         raise HTTPException(404, str(exc)) from exc
@@ -79,6 +89,7 @@ async def accept_audio(session_id: UUID, request: Request, sessions: SessionServ
 class SessionTranscription(TranscriptionResult):
     session_id: UUID
     question_index: int
+    turn_revision: int
 
 
 @router.post("/{session_id}/transcriptions", response_model=SessionTranscription)
@@ -95,8 +106,9 @@ async def transcribe_audio(
             raise HTTPException(504, "Transcription timed out. Please try again.") from None
         except TranscriptionFailed:
             raise HTTPException(502, "Unable to transcribe this recording. Try again or type your answer.") from None
-        # Reject results for a question answered in another tab while the provider ran.
-        sessions.validate_current_question(session_id, metadata.question_index)
+        # Reject results for a turn answered in another tab while the provider ran.
+        sessions.validate_current_turn(session_id, metadata.question_index, metadata.turn_revision)
         return SessionTranscription(
-            session_id=session_id, question_index=metadata.question_index, **result.model_dump(),
+            session_id=session_id, question_index=metadata.question_index,
+            turn_revision=metadata.turn_revision, **result.model_dump(),
         )
