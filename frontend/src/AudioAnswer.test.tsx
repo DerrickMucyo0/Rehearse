@@ -1,9 +1,9 @@
 // @vitest-environment jsdom
-import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { afterEach, beforeEach, expect, test, vi } from 'vitest'
 import AudioAnswer from './AudioAnswer'
 import Interview from './Interview'
-import type { InterviewSession } from './interviewApi'
+import type { InterviewSession, SpeakingMetrics } from './interviewApi'
 
 const session: InterviewSession = { id: 'session-1', status: 'active', current_question_index: 0, current_question: 'Question', questions: ['Question'], answers: [] }
 let stopTrack: ReturnType<typeof vi.fn>
@@ -41,6 +41,7 @@ beforeEach(() => {
   getUserMedia = vi.fn().mockResolvedValue(media)
   vi.stubGlobal('navigator', { mediaDevices: { getUserMedia } })
   vi.stubGlobal('MediaRecorder', Recorder)
+  vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new Error('Unmocked network is forbidden in tests')))
 })
 afterEach(() => { cleanup(); vi.unstubAllGlobals(); vi.restoreAllMocks(); vi.useRealTimers() })
 
@@ -241,9 +242,24 @@ test('network failure is shown and allows retry', async () => {
   expect((screen.getByRole('button', { name: 'Send Recording' }) as HTMLButtonElement).disabled).toBe(false)
 })
 
-function transcriptResponse(text = 'Hello from my recording') {
+const originalMetrics: SpeakingMetrics = {
+  source: 'original_transcription', recognized_word_count: 4, um_count: 0, uh_count: 0,
+  filler_unavailable_reason: null, timed_utterance_span_seconds: 2.46,
+  estimated_words_per_minute: 97.5609756097561, timing_unavailable_reason: null,
+}
+const provenance = 'Based on your original recording. Editing the transcript won’t change these measurements.'
+
+function transcriptResponse(text = 'Hello from my recording', metrics: SpeakingMetrics = originalMetrics) {
   return new Response(JSON.stringify({ session_id: session.id, question_index: 0, text,
-    language: 'eng', words: [{ text: 'Hello', start: 0, end: 0.5 }] }))
+    language: 'eng', words: [
+      { text: 'Hello', start: 10, end: 10.5 }, { text: 'from', start: 10.5, end: 11 },
+      { text: 'my', start: 11, end: 11.5 }, { text: 'recording', start: 11.5, end: 12.46 },
+    ], metrics }))
+}
+
+function measurement(label: string) {
+  const panel = screen.getByRole('region', { name: 'Speaking measurements' })
+  return within(panel).getByText(label, { selector: 'dt', exact: true }).nextElementSibling?.textContent
 }
 
 async function interviewRecording() {
@@ -284,11 +300,23 @@ test('transcribes once, fills editable answer, and advances only after explicit 
   expect(screen.getByText('Question 1 of 1')).toBeTruthy()
   expect(fetchMock).toHaveBeenCalledTimes(2)
   expect(screen.getByText(/Transcript ready/)).toBeTruthy()
+  expect(screen.getByRole('heading', { name: 'Speaking measurements' })).toBeTruthy()
+  expect(measurement('Words')).toBe('4')
+  expect(measurement('Um')).toBe('0')
+  expect(measurement('Uh')).toBe('0')
+  expect(measurement('Timed speech span')).toBe('2.5 sec')
+  expect(measurement('Estimated WPM')).toBe('98 WPM')
+  expect(screen.getByText(provenance)).toBeTruthy()
   fireEvent.change(answer, { target: { value: 'Edited answer' } })
+  expect(measurement('Words')).toBe('4')
+  expect(measurement('Timed speech span')).toBe('2.5 sec')
+  expect(measurement('Estimated WPM')).toBe('98 WPM')
+  expect(screen.getByText(provenance)).toBeTruthy()
   fireEvent.click(screen.getByRole('button', { name: 'Submit Answer' }))
   await screen.findByRole('heading', { name: 'Interview Complete' })
   expect(JSON.parse(fetchMock.mock.calls[3][1].body)).toEqual({ question_index: 0, answer: 'Edited answer' })
   expect(stopTrack).toHaveBeenCalledTimes(1)
+  expect(screen.queryByRole('region', { name: 'Speaking measurements' })).toBeNull()
 })
 
 test.each(['My draft', ' '])('protects existing answer %j from replacement', async (text) => {
@@ -301,6 +329,7 @@ test.each(['My draft', ' '])('protects existing answer %j from replacement', asy
   fireEvent.click(transcribe)
   expect(fetchMock).toHaveBeenCalledTimes(1)
   expect((screen.getByRole('textbox') as HTMLTextAreaElement).value).toBe(text)
+  expect(screen.queryByRole('region', { name: 'Speaking measurements' })).toBeNull()
   expect(screen.getByText(/Clear your answer before transcribing/)).toBeTruthy()
   fireEvent.change(screen.getByRole('textbox'), { target: { value: '' } })
   expect(transcribe.disabled).toBe(false)
@@ -317,6 +346,7 @@ test.each([502, 503, 504])('transcription failure %s unlocks typing and permits 
   await screen.findByRole('alert')
   expect((screen.getByRole('textbox') as HTMLTextAreaElement).disabled).toBe(false)
   expect((screen.getByRole('textbox') as HTMLTextAreaElement).value).toBe('')
+  expect(screen.queryByRole('region', { name: 'Speaking measurements' })).toBeNull()
   fireEvent.click(screen.getByRole('button', { name: 'Transcribe Recording' }))
   await screen.findByText(/Transcript ready/)
   expect((screen.getByRole('textbox') as HTMLTextAreaElement).value).toBe('Hello from my recording')
@@ -346,4 +376,199 @@ test.each(['', '   ', 'x'.repeat(10001)])('unusable transcript does not populate
   fireEvent.click(screen.getByRole('button', { name: 'Transcribe Recording' }))
   await screen.findByRole('alert')
   expect((screen.getByRole('textbox') as HTMLTextAreaElement).value).toBe('')
+})
+
+test('displays returned filler counts and formats numbers without mutating API values', async () => {
+  const metrics = { ...originalMetrics, um_count: 1, uh_count: 1 }
+  const result = {
+    session_id: session.id, question_index: 0, text: 'Um, UH my recording', language: 'eng',
+    words: [
+      { text: 'Um,', start: 10, end: 10.5 }, { text: 'UH', start: 10.5, end: 11 },
+      { text: 'my', start: 11, end: 11.5 }, { text: 'recording', start: 11.5, end: 12.46 },
+    ], metrics,
+  }
+  const response = new Response()
+  vi.spyOn(response, 'json').mockResolvedValue(result)
+  vi.stubGlobal('fetch', vi.fn().mockResolvedValueOnce(new Response(JSON.stringify(session)))
+    .mockResolvedValueOnce(response))
+  await interviewRecording()
+  fireEvent.click(screen.getByRole('button', { name: 'Transcribe Recording' }))
+  await screen.findByRole('region', { name: 'Speaking measurements' })
+  expect(measurement('Um')).toBe('1')
+  expect(measurement('Uh')).toBe('1')
+  expect(measurement('Timed speech span')).toBe('2.5 sec')
+  expect(measurement('Estimated WPM')).toBe('98 WPM')
+  fireEvent.change(screen.getByRole('textbox'), { target: { value: 'Edited without fillers' } })
+  expect(measurement('Um')).toBe('1')
+  expect(measurement('Uh')).toBe('1')
+  expect(metrics).toEqual({ ...originalMetrics, um_count: 1, uh_count: 1 })
+})
+
+test('unsupported filler language is unavailable with an explanation, while timing remains visible', async () => {
+  const response = transcriptResponse('Hello from my recording', {
+    ...originalMetrics, um_count: null, uh_count: null, filler_unavailable_reason: 'unsupported_language',
+  })
+  const body = await response.json()
+  body.language = null
+  vi.stubGlobal('fetch', vi.fn().mockResolvedValueOnce(new Response(JSON.stringify(session)))
+    .mockResolvedValueOnce(new Response(JSON.stringify(body))))
+  await interviewRecording()
+  fireEvent.click(screen.getByRole('button', { name: 'Transcribe Recording' }))
+  await screen.findByRole('region', { name: 'Speaking measurements' })
+  expect(measurement('Um')).toBe('Unavailable')
+  expect(measurement('Uh')).toBe('Unavailable')
+  expect(screen.getByText('Um/uh counts unavailable for this language.')).toBeTruthy()
+  expect(measurement('Estimated WPM')).toBe('98 WPM')
+})
+
+test.each(['missing_timings', 'timing_coverage_mismatch', 'invalid_timing', 'invalid_timing_order', 'unusable_span'] as const)(
+  'explains unavailable timing (%s) without fake numeric values or internal codes', async (reason) => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValueOnce(new Response(JSON.stringify(session)))
+      .mockResolvedValueOnce(transcriptResponse('Hello from my recording', {
+        ...originalMetrics, timed_utterance_span_seconds: null, estimated_words_per_minute: null,
+        timing_unavailable_reason: reason,
+      })))
+    await interviewRecording()
+    fireEvent.click(screen.getByRole('button', { name: 'Transcribe Recording' }))
+    const panel = await screen.findByRole('region', { name: 'Speaking measurements' })
+    expect(measurement('Timed speech span')).toBe('Unavailable')
+    expect(measurement('Estimated WPM')).toBe('Unavailable')
+    expect(within(panel).getByText(reason === 'timing_coverage_mismatch'
+      ? 'Timing measurements aren’t available because complete word timing wasn’t available.'
+      : 'Timing measurements aren’t available for this transcription.')).toBeTruthy()
+    expect(panel.textContent).not.toMatch(/NaN|undefined|0 sec|0 WPM/)
+    expect(panel.textContent).not.toContain(reason)
+    expect(measurement('Um')).toBe('0')
+    expect(measurement('Uh')).toBe('0')
+  },
+)
+
+test('replacement clears original metrics immediately, and its new transcription replaces them', async () => {
+  const replacement: SpeakingMetrics = { ...originalMetrics, recognized_word_count: 1,
+    timed_utterance_span_seconds: 2, estimated_words_per_minute: 30 }
+  const nextResponse = new Response(JSON.stringify({ session_id: session.id, question_index: 0,
+    text: 'Replacement', language: 'eng', words: [{ text: 'Replacement', start: 0, end: 2 }],
+    metrics: replacement }))
+  vi.stubGlobal('fetch', vi.fn().mockResolvedValueOnce(new Response(JSON.stringify(session)))
+    .mockResolvedValueOnce(transcriptResponse()).mockResolvedValueOnce(nextResponse))
+  await interviewRecording()
+  fireEvent.click(screen.getByRole('button', { name: 'Transcribe Recording' }))
+  await screen.findByRole('region', { name: 'Speaking measurements' })
+  fireEvent.change(screen.getByRole('textbox'), { target: { value: '' } })
+  expect(measurement('Words')).toBe('4')
+  let grant!: (stream: MediaStream) => void
+  getUserMedia.mockImplementationOnce(() => new Promise<MediaStream>((done) => { grant = done }))
+  fireEvent.click(screen.getByRole('button', { name: 'Record Answer' }))
+  expect(screen.queryByRole('region', { name: 'Speaking measurements' })).toBeNull()
+  await act(async () => grant(media))
+  await finish()
+  fireEvent.click(screen.getByRole('button', { name: 'Transcribe Recording' }))
+  await screen.findByRole('region', { name: 'Speaking measurements' })
+  expect((screen.getByRole('textbox') as HTMLTextAreaElement).value).toBe('Replacement')
+  expect(measurement('Words')).toBe('1')
+  expect(measurement('Timed speech span')).toBe('2 sec')
+  expect(measurement('Estimated WPM')).toBe('30 WPM')
+})
+
+test('failed same-recording transcription retains metrics; failed replacement creates none', async () => {
+  vi.stubGlobal('fetch', vi.fn().mockResolvedValueOnce(new Response(JSON.stringify(session)))
+    .mockResolvedValueOnce(transcriptResponse()).mockResolvedValueOnce(new Response('{}', { status: 502 }))
+    .mockResolvedValueOnce(new Response('{}', { status: 504 })))
+  await interviewRecording()
+  fireEvent.click(screen.getByRole('button', { name: 'Transcribe Recording' }))
+  await screen.findByRole('region', { name: 'Speaking measurements' })
+  fireEvent.change(screen.getByRole('textbox'), { target: { value: '' } })
+  fireEvent.click(screen.getByRole('button', { name: 'Transcribe Recording' }))
+  await screen.findByRole('alert')
+  expect(measurement('Words')).toBe('4')
+  expect(screen.getByText(provenance)).toBeTruthy()
+  await record(); await finish()
+  expect(screen.queryByRole('region', { name: 'Speaking measurements' })).toBeNull()
+  fireEvent.click(screen.getByRole('button', { name: 'Transcribe Recording' }))
+  await screen.findByRole('alert')
+  expect(screen.queryByRole('region', { name: 'Speaking measurements' })).toBeNull()
+})
+
+test('replacement microphone failure cannot leave old metrics visible', async () => {
+  vi.stubGlobal('fetch', vi.fn().mockResolvedValueOnce(new Response(JSON.stringify(session)))
+    .mockResolvedValueOnce(transcriptResponse()))
+  await interviewRecording()
+  fireEvent.click(screen.getByRole('button', { name: 'Transcribe Recording' }))
+  await screen.findByRole('region', { name: 'Speaking measurements' })
+  getUserMedia.mockRejectedValueOnce(new DOMException('Denied', 'NotAllowedError'))
+  fireEvent.click(screen.getByRole('button', { name: 'Record Answer' }))
+  await screen.findByRole('alert')
+  expect(screen.queryByRole('region', { name: 'Speaking measurements' })).toBeNull()
+})
+
+test('question advancement clears measurements rather than carrying them to the next question', async () => {
+  const active = { ...session, questions: ['First', 'Second'] }
+  const next = { ...active, current_question_index: 1, current_question: 'Second', answers: ['Hello from my recording'] }
+  vi.stubGlobal('fetch', vi.fn().mockResolvedValueOnce(new Response(JSON.stringify(active)))
+    .mockResolvedValueOnce(transcriptResponse()).mockResolvedValueOnce(new Response(JSON.stringify(active)))
+    .mockResolvedValueOnce(new Response(JSON.stringify(next))))
+  await interviewRecording()
+  fireEvent.click(screen.getByRole('button', { name: 'Transcribe Recording' }))
+  await screen.findByRole('region', { name: 'Speaking measurements' })
+  fireEvent.click(screen.getByRole('button', { name: 'Submit Answer' }))
+  await screen.findByText('Question 2 of 2')
+  expect(screen.queryByRole('region', { name: 'Speaking measurements' })).toBeNull()
+})
+
+test('failed submission preserves metrics and explicit session restart clears them', async () => {
+  const restarted = { ...session, id: 'session-2' }
+  vi.stubGlobal('fetch', vi.fn().mockResolvedValueOnce(new Response(JSON.stringify(session)))
+    .mockResolvedValueOnce(transcriptResponse()).mockResolvedValueOnce(new Response(JSON.stringify(session)))
+    .mockResolvedValueOnce(new Response('{}', { status: 500 }))
+    .mockResolvedValueOnce(new Response(JSON.stringify(restarted))))
+  await interviewRecording()
+  fireEvent.click(screen.getByRole('button', { name: 'Transcribe Recording' }))
+  await screen.findByRole('region', { name: 'Speaking measurements' })
+  fireEvent.click(screen.getByRole('button', { name: 'Submit Answer' }))
+  await screen.findByRole('alert')
+  expect(measurement('Words')).toBe('4')
+  fireEvent.click(screen.getByRole('button', { name: 'Start New Interview' }))
+  await waitFor(() => expect(screen.queryByRole('region', { name: 'Speaking measurements' })).toBeNull())
+  expect((screen.getByRole('textbox') as HTMLTextAreaElement).value).toBe('')
+})
+
+test('a typed-only answer never creates speaking measurements or requests the microphone', async () => {
+  const completed = { ...session, status: 'completed', current_question_index: 1,
+    current_question: null, answers: ['Typed answer'] }
+  const fetchMock = vi.fn().mockResolvedValueOnce(new Response(JSON.stringify(session)))
+    .mockResolvedValueOnce(new Response(JSON.stringify(session)))
+    .mockResolvedValueOnce(new Response(JSON.stringify(completed)))
+  vi.stubGlobal('fetch', fetchMock)
+  render(<Interview />)
+  fireEvent.click(screen.getByRole('button', { name: 'Start Interview' }))
+  await screen.findByRole('textbox')
+  fireEvent.change(screen.getByRole('textbox'), { target: { value: 'Typed answer' } })
+  expect(screen.queryByRole('region', { name: 'Speaking measurements' })).toBeNull()
+  fireEvent.click(screen.getByRole('button', { name: 'Submit Answer' }))
+  await screen.findByRole('heading', { name: 'Interview Complete' })
+  expect(screen.queryByRole('region', { name: 'Speaking measurements' })).toBeNull()
+  expect(getUserMedia).not.toHaveBeenCalled()
+  expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([
+    '/api/sessions', '/api/sessions/session-1', '/api/sessions/session-1/answers',
+  ])
+})
+
+test.each([
+  undefined, { ...originalMetrics, source: 'edited_answer' },
+  { ...originalMetrics, recognized_word_count: '4' },
+  { ...originalMetrics, um_count: null },
+  { ...originalMetrics, estimated_words_per_minute: null },
+  { ...originalMetrics, timing_unavailable_reason: 'private-provider-message' },
+])('rejects missing or malformed required measurements without displaying fake values (case %#)', async (metrics) => {
+  const response = new Response(JSON.stringify({ session_id: session.id, question_index: 0,
+    text: 'Hello', language: 'eng', words: [], metrics }))
+  vi.stubGlobal('fetch', vi.fn().mockResolvedValueOnce(new Response(JSON.stringify(session)))
+    .mockResolvedValueOnce(response))
+  await interviewRecording()
+  fireEvent.click(screen.getByRole('button', { name: 'Transcribe Recording' }))
+  const alert = await screen.findByRole('alert')
+  expect(alert.textContent).toBe('No usable speaking measurements were returned. Please try again or type your answer.')
+  expect(alert.textContent).not.toContain('private-provider-message')
+  expect((screen.getByRole('textbox') as HTMLTextAreaElement).value).toBe('')
+  expect(screen.queryByRole('region', { name: 'Speaking measurements' })).toBeNull()
 })
