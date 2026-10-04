@@ -1,0 +1,91 @@
+{
+  "annotation_status": "project_owner_human_reviewed_approved",
+  "reviewer": "project_owner",
+  "split": "development",
+  "prompt_version": "interviewer-two-stage-challenge-v1",
+  "purpose": "design_and_offline_test_material_only",
+  "main_dataset_member": false,
+  "pairs": [
+    {
+      "boundary": "conclusion_scope",
+      "current_prompt": "Describe your verification approach and what you concluded.",
+      "prior_turns": [],
+      "stage_1": {
+        "understandable_relevant": true,
+        "blocking_context_gap": false
+      },
+      "examples": [
+        {
+          "example": "A",
+          "answer": "I ran the supported browsers through the main purchase flow and all checks passed. That establishes that every browser workflow is defect-free.",
+          "challenge_warranted": true,
+          "mapped_action": "CHALLENGE",
+          "review_outcome": "APPROVE",
+          "review_reason": "The conclusion extends beyond the checked flows."
+        },
+        {
+          "example": "B",
+          "answer": "I ran the supported browsers through the main purchase flow and all checks passed. That establishes that those checked flows worked under the tested conditions.",
+          "challenge_warranted": false,
+          "mapped_action": "MOVE_ON",
+          "review_outcome": "APPROVE",
+          "review_reason": "The conclusion is explicitly limited to the checked flows and tested conditions."
+        }
+      ]
+    },
+    {
+      "boundary": "tradeoff_justification",
+      "current_prompt": "Explain your storage decision and its tradeoff.",
+      "prior_turns": [],
+      "stage_1": {
+        "understandable_relevant": true,
+        "blocking_context_gap": false
+      },
+      "examples": [
+        {
+          "example": "A",
+          "answer": "I chose synchronous replication. It reduced the risk of losing acknowledged writes but added write latency. I accepted the latency because durability matters.",
+          "challenge_warranted": true,
+          "mapped_action": "CHALLENGE",
+          "review_outcome": "APPROVE",
+          "review_reason": "The consequential prioritization is asserted without examining the balance."
+        },
+        {
+          "example": "B",
+          "answer": "I chose synchronous replication. It reduced the risk of losing acknowledged writes but added write latency. I accepted it because measured latency remained within our agreed limit and losing acknowledged writes would breach our recovery requirement.",
+          "challenge_warranted": false,
+          "mapped_action": "MOVE_ON",
+          "review_outcome": "APPROVE",
+          "review_reason": "The benefit and cost are balanced against relevant requirements."
+        }
+      ]
+    },
+    {
+      "boundary": "causal_scope",
+      "current_prompt": "Describe your change and the result you observed.",
+      "prior_turns": [],
+      "stage_1": {
+        "understandable_relevant": true,
+        "blocking_context_gap": false
+      },
+      "examples": [
+        {
+          "example": "A",
+          "answer": "I introduced a deployment checklist. Rollbacks decreased in the following month. That proves the checklist was the sole cause of the decrease.",
+          "challenge_warranted": true,
+          "mapped_action": "CHALLENGE",
+          "review_outcome": "APPROVE",
+          "review_reason": "The observation is used to make an exclusive causal claim."
+        },
+        {
+          "example": "B",
+          "answer": "I introduced a deployment checklist. Rollbacks decreased in the following month. That is the result we observed; I have not isolated the checklist's contribution.",
+          "challenge_warranted": false,
+          "mapped_action": "MOVE_ON",
+          "review_outcome": "APPROVE",
+          "review_reason": "The descriptive observation is reported without an unsupported causal guarantee."
+        }
+      ]
+    }
+  ]
+}

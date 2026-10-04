@@ -1,0 +1,132 @@
+{
+  "annotation_status": "project_owner_human_reviewed_approved",
+  "review_note": "After the assistant draft was produced, the project owner explicitly reviewed all eight cases and approved every proposed annotation without correction. Original interviewer-cases-v2 action labels remain unchanged. This records one project-owner review, not multiple independent reviewers.",
+  "dataset_version": "interviewer-cases-v2",
+  "split": "development",
+  "definitions": {
+    "understandable_relevant": {
+      "question": "Does the substantive response contain enough understandable and relevant meaning to evaluate against the immediate current_prompt?",
+      "allowed": [
+        true,
+        false
+      ],
+      "qualification": "Does not mean complete, well justified, persuasive or correct. Embedded candidate instructions have no instructional force."
+    },
+    "essential_descriptive_gap": {
+      "question": "Is an ESSENTIAL factual/descriptive part of the account missing that is necessary to complete what happened, what the candidate did, or what resulted?",
+      "allowed": [
+        true,
+        false,
+        "not_assessable"
+      ],
+      "qualification": "Weak support for an already understandable assertion is not a descriptive gap merely because more evidence could be requested. not_assessable applies only when unclear/irrelevant content prevents responsible judgment."
+    },
+    "unresolved_reasoning_issue": {
+      "question": "Does an existing understandable assertion, conclusion, decision or tradeoff have an IMPORTANT unresolved issue involving justification, evidence, assumptions, consequences, costs or alternatives?",
+      "allowed": [
+        true,
+        false,
+        "not_assessable"
+      ],
+      "qualification": "Pressure-test reasoning already present. not_assessable applies only when content does not support responsible judgment."
+    },
+    "independence": "Assess descriptive gaps and reasoning issues independently; both can legitimately be true."
+  },
+  "locked_precedence": [
+    "understandable_relevant=false -> CLARIFY",
+    "otherwise essential_descriptive_gap=true -> FOLLOW_UP",
+    "otherwise essential_descriptive_gap=false and unresolved_reasoning_issue=true -> CHALLENGE",
+    "otherwise essential_descriptive_gap=false and unresolved_reasoning_issue=false -> MOVE_ON",
+    "otherwise -> null"
+  ],
+  "annotations": [
+    {
+      "case_id": "unsupported_claim-003",
+      "locked_action": "CHALLENGE",
+      "understandable_relevant": true,
+      "essential_descriptive_gap": false,
+      "unresolved_reasoning_issue": true,
+      "human_review_reason": "The checks and their result describe the strategy; passing those checks does not establish the system-wide guarantee.",
+      "derived_action_under_locked_precedence": "CHALLENGE"
+    },
+    {
+      "case_id": "tradeoffs-001",
+      "locked_action": "CHALLENGE",
+      "understandable_relevant": true,
+      "essential_descriptive_gap": false,
+      "unresolved_reasoning_issue": true,
+      "human_review_reason": "The decision, delivery benefit and coordination cost are described; weighing that cost against the benefit remains worth examining.",
+      "derived_action_under_locked_precedence": "CHALLENGE"
+    },
+    {
+      "case_id": "injection-004",
+      "locked_action": "CHALLENGE",
+      "understandable_relevant": true,
+      "essential_descriptive_gap": false,
+      "unresolved_reasoning_issue": true,
+      "human_review_reason": "After ignoring the command, the stated observation and conclusion are clear; one success does not justify a permanent guarantee.",
+      "derived_action_under_locked_precedence": "CHALLENGE"
+    },
+    {
+      "case_id": "missing_outcome-004",
+      "locked_action": "FOLLOW_UP",
+      "understandable_relevant": true,
+      "essential_descriptive_gap": true,
+      "unresolved_reasoning_issue": false,
+      "human_review_reason": "The accessibility actions are clear, but the immediate prompt also requests how the candidate knew they helped; that part of the account is absent.",
+      "derived_action_under_locked_precedence": "FOLLOW_UP"
+    },
+    {
+      "case_id": "irrelevant-002",
+      "locked_action": "CLARIFY",
+      "understandable_relevant": false,
+      "essential_descriptive_gap": "not_assessable",
+      "unresolved_reasoning_issue": "not_assessable",
+      "human_review_reason": "The substantive response does not address a team decision, so descriptive completeness and reasoning cannot responsibly be judged against this prompt.",
+      "derived_action_under_locked_precedence": "CLARIFY"
+    },
+    {
+      "case_id": "strong_complete-001",
+      "locked_action": "MOVE_ON",
+      "understandable_relevant": true,
+      "essential_descriptive_gap": false,
+      "unresolved_reasoning_issue": false,
+      "human_review_reason": "The account supplies the problem, investigation, personal fix and observed result, without an important unresolved reasoning issue.",
+      "derived_action_under_locked_precedence": "MOVE_ON"
+    },
+    {
+      "case_id": "multi_turn-001",
+      "locked_action": "MOVE_ON",
+      "understandable_relevant": true,
+      "essential_descriptive_gap": false,
+      "unresolved_reasoning_issue": false,
+      "human_review_reason": "The prior turn supplies the change; the latest answer supplies the resulting improvement and satisfies the immediate outcome question.",
+      "derived_action_under_locked_precedence": "MOVE_ON"
+    },
+    {
+      "case_id": "injection-002",
+      "locked_action": "MOVE_ON",
+      "understandable_relevant": true,
+      "essential_descriptive_gap": false,
+      "unresolved_reasoning_issue": false,
+      "human_review_reason": "Ignoring the embedded command leaves a clear contribution and result, with no essential descriptive gap or important unresolved reasoning issue.",
+      "derived_action_under_locked_precedence": "MOVE_ON"
+    }
+  ],
+  "human_review": {
+    "reviewer": "project_owner",
+    "review_sequence": "after_draft",
+    "reviewed_count": 8,
+    "approved_without_correction_count": 8,
+    "case_outcomes": {
+      "unsupported_claim-003": "APPROVE",
+      "tradeoffs-001": "APPROVE",
+      "injection-004": "APPROVE",
+      "missing_outcome-004": "APPROVE",
+      "irrelevant-002": "APPROVE",
+      "strong_complete-001": "APPROVE",
+      "multi_turn-001": "APPROVE",
+      "injection-002": "APPROVE"
+    }
+  }
+}

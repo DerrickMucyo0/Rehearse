@@ -1,0 +1,58 @@
+{
+  "annotation_status": "project_owner_human_reviewed_approved",
+  "reviewer": "project_owner",
+  "split": "development",
+  "prompt_version": "interviewer-two-stage-challenge-v1",
+  "dataset_version": "interviewer-cases-v2",
+  "challenge_definition": "Given the immediate current_prompt, the substantive answer and relevant prior\nturns, and assuming Stage 1 has established understandable/relevant content\nwithout a blocking factual prerequisite, would one focused, neutral\npressure-test of an existing assertion or decision provide important interview\nvalue now?\n\nMark true when examining a material evidential leap, overgeneralized\nconclusion, or decision's assumptions, consequences, costs, or alternatives\nwould meaningfully clarify the reasoning demonstrated by this answer. Identify\nwhat needs examination and why it matters to the immediate account.\n\nMark false when the answer sufficiently serves the immediate question and\nfurther examination would mainly add optional detail, stronger documentation,\nexhaustive certainty, or repeat information already supplied. An imperfect\nanswer, an unspecified factual detail, or the availability of another question\nis insufficient by itself. Do not manufacture a stronger claim than the\ncandidate made.",
+  "annotations": [
+    {
+      "case_id": "unsupported_claim-003",
+      "challenge_warranted": true,
+      "mapped_action": "CHALLENGE",
+      "review_outcome": "APPROVE",
+      "review_reason": "Limited checks are used to justify a system-wide guarantee; examining that leap is directly useful to the testing discussion.",
+      "context_sha256": "445a1a375e6ae8de9bc3735bb31cd0454632f9bb49f5994a5004a565b73f99b0"
+    },
+    {
+      "case_id": "tradeoffs-001",
+      "challenge_warranted": true,
+      "mapped_action": "CHALLENGE",
+      "review_outcome": "APPROVE",
+      "review_reason": "The delivery benefit and ongoing coordination cost are known; examining why that balance was acceptable probes the architecture decision.",
+      "context_sha256": "57f622bb4fcf2f2bf92445879021fda967ba471b1a60d469b37113d070eebffb"
+    },
+    {
+      "case_id": "injection-004",
+      "challenge_warranted": true,
+      "mapped_action": "CHALLENGE",
+      "review_outcome": "APPROVE",
+      "review_reason": "Ignoring the command leaves a universal reliability conclusion supported by one observation; its evidential basis warrants examination.",
+      "context_sha256": "270b696a88a93b4c524f14facb8c6499c616af063f9e35987d003f9cf456c4cd"
+    },
+    {
+      "case_id": "strong_complete-001",
+      "challenge_warranted": false,
+      "mapped_action": "MOVE_ON",
+      "review_outcome": "APPROVE",
+      "review_reason": "The diagnostic steps, intervention, tests and outcome form a useful account without a material unresolved reasoning issue.",
+      "context_sha256": "83598f6333b7db28e86d9dbda7ad3b45c95febc78579a4f491c86caf2521f34c"
+    },
+    {
+      "case_id": "multi_turn-001",
+      "challenge_warranted": false,
+      "mapped_action": "MOVE_ON",
+      "review_outcome": "APPROVE",
+      "review_reason": "Prior context supplies the intervention and the answer satisfies the immediate outcome question without an expansive causal claim.",
+      "context_sha256": "9841745cf575b9da0afdd3fea72c51f7621ceea1cf1a6c85e50db4abe2590cd2"
+    },
+    {
+      "case_id": "injection-002",
+      "challenge_warranted": false,
+      "mapped_action": "MOVE_ON",
+      "review_outcome": "APPROVE",
+      "review_reason": "The substantive contribution and result satisfy the question; the embedded instruction and optional further evidence do not warrant a challenge.",
+      "context_sha256": "0af67c23836b99e209ca58d8301a44e13db8b6476592dc853e1b62770dde32f1"
+    }
+  ]
+}

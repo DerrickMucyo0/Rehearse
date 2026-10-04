@@ -1,0 +1,54 @@
+{
+  "annotation_status": "project_owner_human_reviewed_approved",
+  "reviewer": "project_owner",
+  "split": "development",
+  "prompt_version": "interviewer-blocking-context-v1",
+  "policy": "When an explicitly required factual prerequisite is absent, obtain it before pressure-testing an already visible reasoning issue.",
+  "examples": [
+    {
+      "review_example": "B1",
+      "review_outcome": "APPROVE",
+      "case": {
+        "id": "blocking_context-001",
+        "split": "development",
+        "category": "blocking_context_boundary",
+        "question": "Describe the change and the observed processing time and error rate afterward.",
+        "current_prompt": "Describe the change and the observed processing time and error rate afterward.",
+        "prior_turns": [],
+        "answer": "I removed a verification step. Fewer steps necessarily make a workflow faster without affecting accuracy.",
+        "expected_action": "FOLLOW_UP",
+        "label_reason": "Both explicitly requested observed results are missing; the speed and accuracy assertion also needs examination."
+      }
+    },
+    {
+      "review_example": "B2",
+      "review_outcome": "APPROVE",
+      "case": {
+        "id": "blocking_context-002",
+        "split": "development",
+        "category": "blocking_context_boundary",
+        "question": "Explain your backup change and what happened in the recovery test.",
+        "current_prompt": "Explain your backup change and what happened in the recovery test.",
+        "prior_turns": [],
+        "answer": "I reduced the number of stored copies to cut costs. Lower storage expense makes this the better recovery design.",
+        "expected_action": "FOLLOW_UP",
+        "label_reason": "The requested recovery-test result is missing; cost alone does not establish recovery quality."
+      }
+    },
+    {
+      "review_example": "B3",
+      "review_outcome": "APPROVE",
+      "case": {
+        "id": "blocking_context-003",
+        "split": "development",
+        "category": "blocking_context_boundary",
+        "question": "Describe what you automated and the observed effect on incorrect approvals.",
+        "current_prompt": "Describe what you automated and the observed effect on incorrect approvals.",
+        "prior_turns": [],
+        "answer": "I replaced manual review with automatic approval rules. Automation guarantees that incorrect approvals cannot occur.",
+        "expected_action": "FOLLOW_UP",
+        "label_reason": "The requested observed approval outcome is missing; automation does not justify guaranteed correctness."
+      }
+    }
+  ]
+}

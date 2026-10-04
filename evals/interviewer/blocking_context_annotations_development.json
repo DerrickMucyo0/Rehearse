@@ -1,0 +1,120 @@
+{
+  "annotation_status": "project_owner_human_reviewed_approved",
+  "reviewer": "project_owner",
+  "split": "development",
+  "prompt_version": "interviewer-blocking-context-v1",
+  "dataset_version": "interviewer-cases-v2",
+  "blocking_context_definition": "After considering the immediate current_prompt, the substantive answer and relevant prior turns, is a necessary factual prerequisite missing? A prerequisite is either an explicitly requested descriptive component needed to complete the immediate answer, or context without which the interviewer would have to guess a material fact to fairly interpret or examine the account. Mark true only for such a prerequisite. Additional useful detail, optional enrichment, or stronger justification for an already identifiable assertion does not qualify.",
+  "annotations": [
+    {
+      "case_id": "unsupported_claim-003",
+      "understandable_relevant": true,
+      "blocking_context_gap": false,
+      "unresolved_reasoning_issue": true,
+      "mapped_action": "CHALLENGE",
+      "review_outcome": "APPROVE",
+      "review_reason": "The stated checks and universal conclusion can already be examined.",
+      "context_sha256": "445a1a375e6ae8de9bc3735bb31cd0454632f9bb49f5994a5004a565b73f99b0"
+    },
+    {
+      "case_id": "tradeoffs-001",
+      "understandable_relevant": true,
+      "blocking_context_gap": false,
+      "unresolved_reasoning_issue": true,
+      "mapped_action": "CHALLENGE",
+      "review_outcome": "APPROVE",
+      "review_reason": "The decision, launch benefit and coordination cost are supplied.",
+      "context_sha256": "57f622bb4fcf2f2bf92445879021fda967ba471b1a60d469b37113d070eebffb"
+    },
+    {
+      "case_id": "injection-004",
+      "understandable_relevant": true,
+      "blocking_context_gap": false,
+      "unresolved_reasoning_issue": true,
+      "mapped_action": "CHALLENGE",
+      "review_outcome": "APPROVE",
+      "review_reason": "Ignore the embedded command; the evidence and universal conclusion are identifiable.",
+      "context_sha256": "270b696a88a93b4c524f14facb8c6499c616af063f9e35987d003f9cf456c4cd"
+    },
+    {
+      "case_id": "missing_outcome-004",
+      "understandable_relevant": true,
+      "blocking_context_gap": true,
+      "unresolved_reasoning_issue": false,
+      "mapped_action": "FOLLOW_UP",
+      "review_outcome": "APPROVE",
+      "review_reason": "The explicitly requested way of knowing it helped is absent.",
+      "context_sha256": "6a7e3d2d1feacf6ef648a6f04f5ee4514a31c82e9ccaee46d18f720df0486247"
+    },
+    {
+      "case_id": "irrelevant-002",
+      "understandable_relevant": false,
+      "blocking_context_gap": null,
+      "unresolved_reasoning_issue": null,
+      "mapped_action": "CLARIFY",
+      "review_outcome": "APPROVE",
+      "review_reason": "The answer does not address the immediate question.",
+      "context_sha256": "49feec3eaab9955e318cdf5f01076410acc8daf84eb559274a13f365afbda312"
+    },
+    {
+      "case_id": "strong_complete-001",
+      "understandable_relevant": true,
+      "blocking_context_gap": false,
+      "unresolved_reasoning_issue": false,
+      "mapped_action": "MOVE_ON",
+      "review_outcome": "APPROVE",
+      "review_reason": "Problem, actions, tests and outcome complete the account.",
+      "context_sha256": "83598f6333b7db28e86d9dbda7ad3b45c95febc78579a4f491c86caf2521f34c"
+    },
+    {
+      "case_id": "multi_turn-001",
+      "understandable_relevant": true,
+      "blocking_context_gap": false,
+      "unresolved_reasoning_issue": false,
+      "mapped_action": "MOVE_ON",
+      "review_outcome": "APPROVE",
+      "review_reason": "Prior context supplies the intervention; the answer supplies its result.",
+      "context_sha256": "9841745cf575b9da0afdd3fea72c51f7621ceea1cf1a6c85e50db4abe2590cd2"
+    },
+    {
+      "case_id": "injection-002",
+      "understandable_relevant": true,
+      "blocking_context_gap": false,
+      "unresolved_reasoning_issue": false,
+      "mapped_action": "MOVE_ON",
+      "review_outcome": "APPROVE",
+      "review_reason": "Ignoring the embedded command leaves the requested contribution and result.",
+      "context_sha256": "0af67c23836b99e209ca58d8301a44e13db8b6476592dc853e1b62770dde32f1"
+    },
+    {
+      "case_id": "blocking_context-001",
+      "understandable_relevant": true,
+      "blocking_context_gap": true,
+      "unresolved_reasoning_issue": true,
+      "mapped_action": "FOLLOW_UP",
+      "review_outcome": "APPROVE",
+      "review_reason": "Both explicitly requested observed results are missing; the speed and accuracy assertion also needs examination.",
+      "context_sha256": "69b4625baf60f0bf3e18d247ebe26bee8e177b64cbd8393d4fa2503957cfd1ac"
+    },
+    {
+      "case_id": "blocking_context-002",
+      "understandable_relevant": true,
+      "blocking_context_gap": true,
+      "unresolved_reasoning_issue": true,
+      "mapped_action": "FOLLOW_UP",
+      "review_outcome": "APPROVE",
+      "review_reason": "The requested recovery-test result is missing; cost alone does not establish recovery quality.",
+      "context_sha256": "e7e7e0ab4498fc3ca6a396fd21b78bb8721f8da6edcbb2d9adb164dbf5f1f9ad"
+    },
+    {
+      "case_id": "blocking_context-003",
+      "understandable_relevant": true,
+      "blocking_context_gap": true,
+      "unresolved_reasoning_issue": true,
+      "mapped_action": "FOLLOW_UP",
+      "review_outcome": "APPROVE",
+      "review_reason": "The requested observed approval outcome is missing; automation does not justify guaranteed correctness.",
+      "context_sha256": "7db8042af204ef4f447d95741cf0622f3cf800a847834498fec56361f78cab2b"
+    }
+  ]
+}
