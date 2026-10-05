@@ -6,7 +6,11 @@ from pydantic import BaseModel, ConfigDict, Field, StringConstraints, computed_f
 from sqlalchemy import and_, select
 from sqlalchemy.orm import Session, sessionmaker
 
-from app.database_models import QuestionAttempt, StoredInterviewSession, validate_submitted_answer_text
+from app.database_models import (
+    MEASUREMENT_VERSION, QuestionAttempt, StoredInterviewSession,
+    TranscriptionMeasurement, validate_submitted_answer_text,
+)
+from app.speaking_metrics import SpeakingMetrics
 
 QUESTIONS = (
     "Tell me about yourself.",
@@ -24,6 +28,7 @@ class AnswerRequest(BaseModel):
     answer: Annotated[
         str, StringConstraints(strict=True, strip_whitespace=True, min_length=1, max_length=10000)
     ]
+    measurement_id: UUID | None = None
 
     @field_validator("answer")
     @classmethod
@@ -97,9 +102,26 @@ class InterviewSessionService:
             # Revalidate even for non-HTTP callers that bypass AnswerRequest's
             # validation. NUL is rejected before an INSERT can reach PostgreSQL.
             submitted = validate_submitted_answer_text(answer.answer)
+            if answer.measurement_id is not None:
+                # Lock only an exact measurement in the owning context. Unknown
+                # IDs and context mismatches have the same public error.
+                measurement = database.scalar(
+                    select(TranscriptionMeasurement)
+                    .where(
+                        TranscriptionMeasurement.id == answer.measurement_id,
+                        TranscriptionMeasurement.session_id == stored.id,
+                        TranscriptionMeasurement.question_index == stored.current_question_index,
+                    )
+                    .with_for_update()
+                )
+                if measurement is None or database.scalar(
+                    select(QuestionAttempt.id)
+                    .where(QuestionAttempt.measurement_id == answer.measurement_id)
+                ) is not None:
+                    raise SessionConflict("Measurement cannot be attached to this answer.")
             database.add(QuestionAttempt(
                 session_id=stored.id, question_index=answer.question_index,
-                attempt_number=1, answer_text=submitted,
+                attempt_number=1, answer_text=submitted, measurement_id=answer.measurement_id,
             ))
             stored.current_question_index += 1
             if stored.current_question_index == len(stored.questions):
@@ -114,6 +136,35 @@ class InterviewSessionService:
             # The context manager commits before the caller receives this DTO.
             # Any exception, including flush/commit failure, rolls everything back.
             return self._response(stored, answers)
+
+    def create_measurement(self, session_id: UUID, question_index: int, metrics: SpeakingMetrics) -> UUID:
+        """Persist only original metrics after inference, in a new transaction.
+
+        The session lock closes the revalidation/insert race with answer submission.
+        No provider call, audio, transcript text or word timing array enters here.
+        """
+        with self._session_factory.begin() as database:
+            stored = database.scalar(
+                select(StoredInterviewSession)
+                .where(StoredInterviewSession.id == session_id)
+                .with_for_update()
+            )
+            if stored is None:
+                raise SessionNotFound("Session not found.")
+            self._check_question(stored, question_index)
+            measurement = TranscriptionMeasurement(
+                session_id=stored.id, question_index=stored.current_question_index,
+                created_at=datetime.now(timezone.utc), measurement_version=MEASUREMENT_VERSION,
+                measurement_source=metrics.source, recognized_word_count=metrics.recognized_word_count,
+                um_count=metrics.um_count, uh_count=metrics.uh_count,
+                filler_unavailable_reason=metrics.filler_unavailable_reason,
+                timed_utterance_span_seconds=metrics.timed_utterance_span_seconds,
+                estimated_words_per_minute=metrics.estimated_words_per_minute,
+                timing_unavailable_reason=metrics.timing_unavailable_reason,
+            )
+            database.add(measurement)
+            database.flush()
+            return measurement.id
 
     def validate_current_question(self, session_id: UUID, question_index: int) -> None:
         self._check_question(self.get(session_id), question_index)

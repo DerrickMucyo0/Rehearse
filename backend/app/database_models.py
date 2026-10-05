@@ -2,8 +2,8 @@
 
     Session snapshots and measurements are immutable in PostgreSQL (migration
     triggers). Session progression and current-question checks belong to the
-    transactional session service. Measurement attachment/eligibility and cleanup
-    remain future service responsibilities.
+    transactional session service, as does explicit measurement attachment.
+    Background cleanup remains a future service responsibility.
 """
 from datetime import datetime, timedelta
 from uuid import UUID, uuid4

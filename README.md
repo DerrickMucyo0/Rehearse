@@ -39,6 +39,14 @@ Invalid bodies or malformed UUIDs return
 422; unknown session UUIDs return 404; completed sessions and stale/future question
 indices return 409 without changing state.
 
+For a transcription-derived draft, the body may additionally include
+`"measurement_id":"<UUID returned by transcription>"`. Typed-only answers omit it.
+The backend links only that exact measurement, never a latest recording or inferred
+measurement. Malformed measurement UUIDs return 422. Unknown, mismatched-session,
+mismatched-question and already-linked references all return the same 409 detail:
+`Measurement cannot be attached to this answer.` Rejected links leave the attempt,
+session index/status and completion timestamp unchanged.
+
 Responses contain `id`, `status` (`active` or `completed`),
 `current_question_index`, `current_question`, `questions`, and ordered `answers`.
 After completion, the index equals the question count and `current_question` is null.
@@ -208,15 +216,24 @@ first-attempt answers in one statement for a consistent PostgreSQL read snapshot
 Async audio/transcription routes perform session checks in the thread pool and close
 their database operation before awaiting upload/provider work.
 
-Measurement eligibility and atomic measurement attachment remain future transactional
-service responsibilities. This slice creates no measurement records or associations.
+Successful transcription creates an immutable measurement in its own transaction after
+the provider call and deterministic metric calculation. The service reopens a database
+operation, locks/revalidates the authoritative current session/question and stores only
+the scalar metrics, version, source and context. If the session advanced during inference,
+it rejects the result without creating a stale measurement. No database session/lock is
+held while awaiting provider inference.
+
+Answer submission optionally loads and locks the exact context-matching measurement,
+checks that it is unattached, and writes its ID with the attempt in the same transaction
+as session advancement/completion. The existing foreign keys and unique constraint
+remain a final safety layer. A failed link rolls back all changes; no measurement is
+inferred from answer text. Typed-only attempts retain null `measurement_id`.
 
 Unlinked measurements become deletion-eligible after 24 hours; linked measurements
 remain associated with their attempt. A pure timestamp/linkage helper models this
 policy. It introduces neither automatic expiry of attachment rights nor a cleanup
-worker; future cleanup must recheck linkage transactionally. Measurement IDs will
-eventually be explicit client associations, never inferred from edited answers or
-the latest recording/measurement. That API/frontend association is not implemented.
+worker; future cleanup must recheck linkage transactionally. Replaced/unsubmitted
+measurements remain unlinked; the frontend does not synchronously delete them.
 
 Only the final trimmed submitted answer is durable text. No audio, second
 original-transcription text copy or word timings are stored. There are no user
@@ -235,7 +252,7 @@ docker compose exec postgres createdb -U "$POSTGRES_USER" -O rehearse_test rehea
 read -rs "TEST_DATABASE_URL?Isolated rehearse_test database URL: "
 echo
 export TEST_DATABASE_URL
-REHEARSE_REQUIRE_POSTGRES_TESTS=1 PYTHONDONTWRITEBYTECODE=1 backend/.venv/bin/python -m pytest -W error tests/test_sessions.py tests/test_session_persistence.py tests/test_postgres_schema.py
+REHEARSE_REQUIRE_POSTGRES_TESTS=1 PYTHONDONTWRITEBYTECODE=1 backend/.venv/bin/python -m pytest -W error tests/test_sessions.py tests/test_session_persistence.py tests/test_measurement_persistence.py tests/test_postgres_schema.py
 REHEARSE_REQUIRE_POSTGRES_TESTS=1 PYTHONDONTWRITEBYTECODE=1 backend/.venv/bin/python -m pytest -W error
 git diff --check
 ```
@@ -340,7 +357,8 @@ not returned. Errors: 404 for unknown sessions, 409 for completed sessions or st
 questions, 413 for excessive size, 415 for unsupported media types, and 422 for missing,
 invalid, or empty inputs. Multipart parser limits/malformed form data can return 400.
 The current-question check runs after transfer to reject concurrent typed-answer changes.
-No authentication or persistence is added; existing local-prototype limitations apply.
+This upload-only action persists no audio and creates no measurement; existing
+local-prototype authentication limitations apply.
 
 ### Manual Chrome verification
 
@@ -423,11 +441,15 @@ implemented.
 
 The panel states: “Based on your original recording. Editing the transcript won’t
 change these measurements.” Measurements describe the original transcribed recording;
-editing the draft does not recalculate them. They exist only in the transcription
-response and temporary frontend state, without persistent metrics history. A
+editing the draft does not recalculate them. The backend stores their exact unrounded
+values in an immutable `transcription_measurements` record tagged `speaking-metrics-v1`;
+there is no history/dashboard UI. The response supplies an opaque `measurement_id`
+that the frontend keeps beside the draft and preserves through nonempty edits. A
 replacement recording clears them immediately, a new successful transcription
 replaces them, and leaving the question/session clears them. Typed-only answers
-show no measurements panel.
+show no measurements panel and submit no measurement ID. Clearing the draft clears
+its ID, so later typed text cannot inherit the old association. Explicit submission
+of an edited transcript links the original measurement without recalculation.
 
 ### Server configuration
 
@@ -460,13 +482,15 @@ CI/tests require no real key and use fake transcribers or an SDK mock HTTP trans
 `POST /api/sessions/{session_id}/transcriptions` accepts the same multipart `audio`
 and `question_index` fields and limits as `/audio`. Shared validation rejects invalid
 uploads before contacting the provider. The session/question is checked again after
-transcription to reject an answer that became stale while the provider was running.
+transcription, under a new short database row lock, before storing a measurement.
+This rejects context that became stale while the provider was running.
 HTTP 200 returns only application metadata, for example:
 
 ```json
 {
   "session_id": "<existing session UUID>",
   "question_index": 0,
+  "measurement_id": "<new opaque measurement UUID>",
   "text": "Hello there.",
   "language": "eng",
   "words": [
@@ -486,7 +510,7 @@ HTTP 200 returns only application metadata, for example:
 }
 ```
 
-The `metrics` object is required. Unavailable numeric measurements use `null`;
+The `metrics` object and UUID `measurement_id` are required. Unavailable numeric measurements use `null`;
 zero remains a real word/filler count when applicable. Available measurements have
 a `null` unavailable reason. `filler_unavailable_reason` is `unsupported_language`
 when both filler counts are unavailable. `timing_unavailable_reason` identifies
@@ -514,7 +538,9 @@ have a 75-second timeout to allow for upload and the backend provider deadline.
 Transcribe Recording sends the recording to ElevenLabs. Rehearse does not permanently
 store audio, log raw audio/keys/provider responses, or persist transcripts separately.
 Temporary upload files close after success or failure. Draft transcripts stay in the
-browser; explicitly submitted text uses the existing process-local session storage.
+browser; explicitly submitted text and its optional original measurement association
+are stored in PostgreSQL. No separate original-transcript copy or word timing arrays
+are stored; raw timings are used transiently for deterministic calculations.
 ElevenLabs processing/retention is governed by your provider account and policies;
 Rehearse's lack of permanent audio storage is not a promise of provider-side deletion.
 Aborting a browser request does not guarantee cancellation of provider work already

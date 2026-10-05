@@ -6,7 +6,8 @@ import type { InterviewSession } from './interviewApi'
 
 export default function Interview() {
   const [session, setSession] = useState<InterviewSession | null>(null)
-  const [answer, setAnswer] = useState('')
+  const [draft, setDraft] = useState<{ text: string; measurementId: string | null }>({ text: '', measurementId: null })
+  const answer = draft.text
   const [busy, setBusy] = useState(false)
   const [transcribing, setTranscribing] = useState(false)
   const [error, setError] = useState('')
@@ -16,7 +17,7 @@ export default function Interview() {
     setError('')
     try {
       setSession(await startInterview())
-      setAnswer('')
+      setDraft({ text: '', measurementId: null })
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : 'Unable to start interview.')
     } finally {
@@ -30,8 +31,8 @@ export default function Interview() {
     setBusy(true)
     setError('')
     try {
-      setSession(await submitAnswer(session, answer.trim()))
-      setAnswer('')
+      setSession(await submitAnswer(session, answer.trim(), draft.measurementId))
+      setDraft({ text: '', measurementId: null })
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : 'Unable to submit answer.')
     } finally {
@@ -52,13 +53,18 @@ export default function Interview() {
           <h2 id="current-question" aria-live="polite">{session.current_question}</h2>
           <AudioAnswer key={`${session.id}:${session.current_question_index}`} session={session} disabled={busy || transcribing}
             hasAnswer={answer.length > 0} onTranscribing={setTranscribing}
-            onTranscript={(text) => setAnswer((current) => current === '' ? text : current)} />
+            onTranscript={(text, measurementId) => setDraft((current) => current.text === ''
+              ? { text, measurementId } : current)}
+            onInvalidateMeasurement={() => setDraft((current) => ({ ...current, measurementId: null }))} />
           <label htmlFor="answer">Your answer</label>
           <textarea
             id="answer"
             aria-describedby="current-question"
             value={answer}
-            onChange={(event) => setAnswer(event.target.value)}
+            onChange={(event) => {
+              const text = event.target.value
+              setDraft((current) => ({ text, measurementId: text.trim() ? current.measurementId : null }))
+            }}
             rows={6}
             maxLength={10000}
             required

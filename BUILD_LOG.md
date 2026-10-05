@@ -413,3 +413,47 @@ Verification against local PostgreSQL 18.6 (Postgres.app):
   implementations/configuration and speaking-metrics calculation files remain
   unchanged. Issue #9/held-out data untouched; zero live provider calls. No commit,
   push, PR or merge.
+
+## Issue #11 — Original measurement persistence and explicit association
+
+- Continues `feat/postgres-persistence` from session-runtime commit `da01b77`, with
+  a clean working tree. Uses the existing schema; no migration, dependency, CI,
+  provider configuration or speaking-metrics formula changes.
+- Successful transcription calculates the original deterministic metrics, then
+  starts a separate database operation. The service locks/revalidates the active
+  persisted session/current question, saves immutable scalar metrics with
+  `speaking-metrics-v1`, original-transcription source and UTC creation time, and
+  returns an opaque UUID `measurement_id`. Audio, transcript copies and word timing
+  arrays are not persisted. No database operation remains open during provider work.
+- Answer requests optionally include the exact measurement UUID. In the existing
+  session-row-locked transaction, the service locks a context-matching measurement,
+  verifies it is unattached, and links it with attempt 1, session advancement and
+  completion atomically. Unknown/wrong-context/already-linked IDs share HTTP 409
+  `Measurement cannot be attached to this answer.` Malformed UUIDs return 422.
+  Failures leave attempts, progress and completion unchanged; existing constraints
+  remain a final safety layer. Typed answers omit the ID; no latest lookup or
+  recalculation from edited text is introduced.
+- The frontend pairs the transcript draft with its returned ID. Nonempty edits keep
+  that association. Clearing the draft, replacing the recording, failed replacement
+  transcription, successful advancement and session restart clear stale IDs; a new
+  successful transcription supplies its own ID. Typed-only requests omit the field.
+  Original metrics display/provenance, reconciliation, and visual layout are preserved.
+- Replaced/unsubmitted rows remain unlinked; no synchronous deletion or background
+  cleanup worker is added. The existing 24-hour unlinked deletion-eligibility policy
+  and linked retention remain unchanged. No authentication, retry behavior, history
+  UI or semantic scoring is added.
+
+Verification against local PostgreSQL 18.6 (Postgres.app):
+- Focused measurement/transcription/session suite with warnings as errors and
+  PostgreSQL required: 149 passed, 0 failed, 0 skipped, including 42 new measurement
+  cases. Covers exact unrounded and unavailable values, reconstruction, original-ID
+  rather than latest association, edited text, malformed/invalid references,
+  fifth-answer completion, rollback after flush/before commit, no provider-held DB
+  resources, post-calculation races and actual PostgreSQL row-lock revalidation.
+- Full backend with warnings as errors and PostgreSQL required: 334 passed,
+  0 failed, 0 skipped. Existing session concurrency tests remain passing.
+- Frontend `npm test`: 59 passed (49 existing plus 10 new cases). `npm run build`
+  and `npm run lint` passed. Tests use mocked fetch/media APIs.
+- `git diff --check` passed. Schema definitions and migration bytes remain unchanged;
+  speaking-metrics formulas and provider implementations/configuration are unchanged.
+  Zero live provider calls; Issue #9/held-out data untouched. No commit, push, PR or merge.

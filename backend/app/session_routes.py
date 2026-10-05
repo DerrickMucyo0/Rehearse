@@ -86,6 +86,7 @@ async def accept_audio(session_id: UUID, request: Request, sessions: SessionServ
 class SessionTranscription(TranscriptionResult):
     session_id: UUID
     question_index: int
+    measurement_id: UUID
     metrics: SpeakingMetrics = Field(
         description="Measurements of the original recognized transcription, not later edited answers. "
                     "Timing estimates exclude leading/trailing recording silence; null means unavailable.",
@@ -106,9 +107,13 @@ async def transcribe_audio(
             raise HTTPException(504, "Transcription timed out. Please try again.") from None
         except TranscriptionFailed:
             raise HTTPException(502, "Unable to transcribe this recording. Try again or type your answer.") from None
-        # Reject results for a question answered in another tab while the provider ran.
-        await run_in_threadpool(sessions.validate_current_question, session_id, metadata.question_index)
+        metrics = measure_transcription(result.text, result.language, result.words)
+        # Revalidate and persist in a separate operation after inference/calculation.
+        # Its session lock prevents stale measurement insertion during submission.
+        measurement_id = await run_in_threadpool(
+            sessions.create_measurement, session_id, metadata.question_index, metrics,
+        )
         return SessionTranscription(
             session_id=session_id, question_index=metadata.question_index, **result.model_dump(),
-            metrics=measure_transcription(result.text, result.language, result.words),
+            metrics=metrics, measurement_id=measurement_id,
         )
