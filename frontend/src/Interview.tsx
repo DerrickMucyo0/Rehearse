@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useLayoutEffect, useRef, useState } from 'react'
 import type { FormEvent } from 'react'
 import AudioAnswer from './AudioAnswer'
 import Comparison from './AttemptComparison'
@@ -59,19 +59,32 @@ async function readSavedView(id: string): Promise<SavedView> {
   throw new ApiError('The saved interview changed while loading. Recheck saved state.', 409)
 }
 
-export default function Interview() {
+interface Props {
+  onSessionAccess?: (sessionId: string) => void
+  onNavigationBusyChange?: (busy: boolean) => void
+}
+
+export default function Interview({ onSessionAccess, onNavigationBusyChange }: Props = {}) {
   const [restoreId] = useState(storedSessionId)
   const [view, setView] = useState<SavedView | null>(null)
   const [draft, setDraft] = useState<{ text: string; measurementId: string | null }>({ text: '', measurementId: null })
   const [draftGeneration, setDraftGeneration] = useState(0)
   const [operation, setOperation] = useState<string | null>(restoreId ? 'Restoring interview…' : null)
   const [transcribing, setTranscribing] = useState(false)
+  const [audioBusy, setAudioBusy] = useState(false)
   const [error, setError] = useState('')
   const [recovery, setRecovery] = useState<Recovery | null>(null)
   const locked = useRef(Boolean(restoreId))
   const mounted = useRef(true)
+  const accessCallback = useRef(onSessionAccess)
+  useLayoutEffect(() => { accessCallback.current = onSessionAccess }, [onSessionAccess])
   const session = view?.session
   const blocked = operation !== null || transcribing || recovery !== null
+  const navigationBlocked = blocked || audioBusy
+
+  useLayoutEffect(() => {
+    onNavigationBusyChange?.(navigationBlocked)
+  }, [navigationBlocked, onNavigationBusyChange])
 
   useEffect(() => {
     mounted.current = true
@@ -81,7 +94,10 @@ export default function Interview() {
     if (!restoreId) return
     let active = true
     void readSavedView(restoreId).then((saved) => {
-      if (active) setView(saved)
+      if (active) {
+        setView(saved)
+        accessCallback.current?.(saved.session.id)
+      }
     }).catch((cause: unknown) => {
       if (!active) return
       if (cause instanceof ApiError && cause.status === 404) {
@@ -116,6 +132,7 @@ export default function Interview() {
       const created = await startInterview()
       if (!mounted.current) return
       install({ session: created, attempts: [], comparison: null, mode: 'composing' })
+      accessCallback.current?.(created.id)
       setRecovery(null)
     } catch (cause) {
       if (mounted.current) setError(cause instanceof Error ? cause.message : 'Unable to start interview.')
@@ -205,6 +222,7 @@ export default function Interview() {
         saved.session.current_question_latest_attempt_number === recovery.revision
       if (unchangedDraft) setView({ ...saved, mode: 'composing' })
       else install(saved)
+      if (recovery.kind === 'restore') accessCallback.current?.(saved.session.id)
       setRecovery(null)
       setError('Saved state rechecked. Choose your next action; no request was resubmitted.')
     } catch {
@@ -241,6 +259,7 @@ export default function Interview() {
             <form onSubmit={submit}>
               <AudioAnswer key={`${session.id}:${session.current_question_index}:${draftGeneration}`}
                 session={session} disabled={blocked} hasAnswer={draft.text.length > 0}
+                onBusyChange={setAudioBusy}
                 onTranscribing={setTranscribing} onConflict={() => void audioConflict()}
                 onUncertainTranscription={uncertainTranscription}
                 onTranscript={(text, measurementId) => setDraft((current) => current.text === '' ? { text, measurementId } : current)}

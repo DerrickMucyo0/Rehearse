@@ -131,3 +131,59 @@ button:disabled {
 .comparison-table small {
   display: block;
 }
+
+[hidden] {
+  display: none !important;
+}
+
+.app-nav {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 0.5rem;
+  margin: 1.5rem 0;
+}
+
+.app-nav [aria-current='page'] {
+  text-decoration: underline;
+  text-underline-offset: 0.3rem;
+  outline: 2px solid #526174;
+  outline-offset: 2px;
+}
+
+.history-list,
+.history-detail {
+  text-align: left;
+  margin-top: 2rem;
+}
+
+.history-list {
+  list-style: none;
+  padding: 0;
+}
+
+.history-summary,
+.history-detail article,
+.question-history {
+  margin: 1rem 0;
+  padding: 1rem;
+  border: 1px solid #526174;
+  border-radius: 0.3rem;
+}
+
+.history-summary dl,
+.history-detail dl {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 0.4rem 1rem;
+}
+
+.history-summary dd,
+.history-detail dd {
+  margin: 0;
+}
+
+.history button,
+.history-detail button {
+  margin: 0.25rem 0.5rem 0.25rem 0;
+}

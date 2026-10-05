@@ -1,10 +1,26 @@
-import { useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
+import History from './History'
 import Interview from './Interview'
+import { useHistoryRegistry } from './useHistoryRegistry'
 
 type BackendStatus = 'Checking backend…' | 'Backend connected' | 'Backend unavailable'
+type Section = 'practice' | 'history' | 'progress'
 
 export default function App() {
   const [status, setStatus] = useState<BackendStatus>('Checking backend…')
+  const [section, setSection] = useState<Section>('practice')
+  const [practiceBusy, setPracticeBusy] = useState(false)
+  const navigationLocked = useRef(false)
+  const registry = useHistoryRegistry()
+  const updateNavigationLock = useCallback((busy: boolean) => {
+    navigationLocked.current = busy
+    setPracticeBusy(busy)
+  }, [])
+
+  function navigate(next: Section) {
+    if (navigationLocked.current && next !== 'practice') return
+    setSection(next)
+  }
 
   useEffect(() => {
     const controller = new AbortController()
@@ -41,7 +57,29 @@ export default function App() {
     <main>
       <h1>Rehearse</h1>
       <p>Practice. Diagnose. Drill. Improve.</p>
-      <Interview />
+      <nav className="app-nav" aria-label="Main navigation">
+        {(['practice', 'history', 'progress'] as const).map((target) => (
+          <button key={target} type="button" aria-current={section === target ? 'page' : undefined}
+            aria-controls={`${target}-panel`} disabled={practiceBusy && target !== 'practice'}
+            onClick={() => navigate(target)}>
+            {target[0].toUpperCase() + target.slice(1)}
+          </button>
+        ))}
+      </nav>
+      {practiceBusy && <p role="status">Finish the current Practice operation before navigating.</p>}
+      {/* Preserve safe idle drafts, measured draft identity, and review/retry state. */}
+      <div id="practice-panel" hidden={section !== 'practice'}>
+        {registry.storageError && <p role="status">{registry.storageError}</p>}
+        <Interview onSessionAccess={registry.remember} onNavigationBusyChange={updateNavigationLock} />
+      </div>
+      {section === 'history' && <div id="history-panel">
+        <History key={registry.cacheGeneration} sessionIds={registry.sessionIds} storageError={registry.storageError}
+          onRemove={registry.remove} onClear={registry.clear} onPractice={() => navigate('practice')} />
+      </div>}
+      {section === 'progress' && <section id="progress-panel" aria-label="Progress">
+        <h2>Progress</h2>
+        <p>Progress dashboard coming next.</p>
+      </section>}
       <p className="backend-status" role="status">{status}</p>
     </main>
   )
