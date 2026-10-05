@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
-import { transcribeAudio, uploadAudio } from './interviewApi'
+import { ApiError, isConflictError, transcribeAudio, uploadAudio } from './interviewApi'
 import type { InterviewSession, SpeakingMetrics } from './interviewApi'
 import { useAudioRecorder } from './useAudioRecorder'
 
@@ -10,9 +10,11 @@ interface Props {
   onTranscript: (text: string, measurementId: string) => void
   onInvalidateMeasurement: () => void
   onTranscribing: (busy: boolean) => void
+  onConflict?: () => void
+  onUncertainTranscription?: () => void
 }
 
-export default function AudioAnswer({ session, disabled, hasAnswer, onTranscript, onInvalidateMeasurement, onTranscribing }: Props) {
+export default function AudioAnswer({ session, disabled, hasAnswer, onTranscript, onInvalidateMeasurement, onTranscribing, onConflict, onUncertainTranscription }: Props) {
   const recording = useAudioRecorder()
   const [uploadState, setUploadState] = useState<'idle' | 'uploading' | 'accepted' | 'transcribing' | 'transcribed' | 'error'>('idle')
   const [error, setError] = useState('')
@@ -46,7 +48,14 @@ export default function AudioAnswer({ session, disabled, hasAnswer, onTranscript
       if (!pending.signal.aborted) {
         onInvalidateMeasurement()
         setUploadState('error')
-        setError(cause instanceof Error ? cause.message : 'Transcription failed. Please try again.')
+        setError(cause instanceof ApiError ? cause.message : 'Transcription failed. Please try again.')
+        if (isConflictError(cause)) {
+          setMeasurements(null)
+          onConflict?.()
+        } else if (cause instanceof ApiError && cause.ambiguousWrite) {
+          setMeasurements(null)
+          onUncertainTranscription?.()
+        }
       }
     } finally {
       if (!pending.signal.aborted) onTranscribing(false)
@@ -66,7 +75,12 @@ export default function AudioAnswer({ session, disabled, hasAnswer, onTranscript
     } catch (cause) {
       if (!pending.signal.aborted) {
         setUploadState('error')
-        setError(cause instanceof Error ? cause.message : 'Audio upload failed. Please try again.')
+        setError(cause instanceof ApiError ? cause.message : 'Audio upload failed. Please try again.')
+        if (isConflictError(cause)) {
+          onInvalidateMeasurement()
+          setMeasurements(null)
+          onConflict?.()
+        }
       }
     } finally {
       if (controller.current === pending) controller.current = null
@@ -76,7 +90,7 @@ export default function AudioAnswer({ session, disabled, hasAnswer, onTranscript
   return (
     <section aria-label="Record an audio answer">
       <p>Record an answer (up to 5 minutes / 10 MiB). Transcribe Recording sends audio to ElevenLabs.
-        Review and edit the transcript, then Submit Answer to continue.</p>
+        Review and edit the transcript, then Submit Attempt to save it. Continue advances to the next question.</p>
       <button type="button" disabled={disabled || pendingRequest || ['requesting', 'recording', 'stopping'].includes(recording.state)}
         onClick={() => { onInvalidateMeasurement(); setMeasurements(null); setUploadState('idle'); setError(''); void recording.start() }}>
         Record Answer
@@ -90,7 +104,7 @@ export default function AudioAnswer({ session, disabled, hasAnswer, onTranscript
         {uploadState === 'uploading' && 'Uploading recording…'}
         {uploadState === 'transcribing' && 'Transcribing recording…'}
         {uploadState === 'transcribed' && 'Transcript ready. Review and edit your answer before submitting.'}
-        {uploadState === 'accepted' && 'Recording accepted. It was not saved or transcribed. Submit a typed answer to continue.'}
+        {uploadState === 'accepted' && 'Recording accepted. It was not saved or transcribed. Submit a typed attempt, then Continue.'}
       </p>
       {recording.blob && uploadState !== 'accepted' && (
         <button type="button" disabled={disabled || pendingRequest} onClick={() => void send()}>Send Recording</button>
