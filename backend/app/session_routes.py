@@ -1,11 +1,14 @@
 from contextlib import asynccontextmanager
+from functools import lru_cache
 from typing import Annotated
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from pydantic import Field
+from starlette.concurrency import run_in_threadpool
 
 from app.audio import AudioAccepted, bounded_multipart_request, validated_audio
+from app.database import create_database_engine, create_session_factory
 from app.speaking_metrics import SpeakingMetrics, measure_transcription
 from app.sessions import (
     AnswerRequest,
@@ -21,11 +24,13 @@ from app.transcription import (
 )
 
 router = APIRouter(prefix="/api/sessions", tags=["sessions"])
-service = InterviewSessionService()
 
 
+@lru_cache(maxsize=1)
 def get_session_service() -> InterviewSessionService:
-    return service
+    # Pool the engine, never an ORM Session. Configuration uses DATABASE_URL only
+    # and is resolved on first use, preserving database-free imports and health.
+    return InterviewSessionService(create_session_factory(create_database_engine()))
 
 
 SessionService = Annotated[InterviewSessionService, Depends(get_session_service)]
@@ -61,10 +66,10 @@ def submit_answer(
 @asynccontextmanager
 async def current_audio(session_id: UUID, request: Request, sessions: InterviewSessionService):
     try:
-        sessions.get(session_id)
+        await run_in_threadpool(sessions.get, session_id)
         bounded = await bounded_multipart_request(request)
         async with validated_audio(bounded, session_id) as (upload, metadata):
-            sessions.validate_current_question(session_id, metadata.question_index)
+            await run_in_threadpool(sessions.validate_current_question, session_id, metadata.question_index)
             yield upload, metadata
     except SessionNotFound as exc:
         raise HTTPException(404, str(exc)) from exc
@@ -102,7 +107,7 @@ async def transcribe_audio(
         except TranscriptionFailed:
             raise HTTPException(502, "Unable to transcribe this recording. Try again or type your answer.") from None
         # Reject results for a question answered in another tab while the provider ran.
-        sessions.validate_current_question(session_id, metadata.question_index)
+        await run_in_threadpool(sessions.validate_current_question, session_id, metadata.question_index)
         return SessionTranscription(
             session_id=session_id, question_index=metadata.question_index, **result.model_dump(),
             metrics=measure_transcription(result.text, result.language, result.words),

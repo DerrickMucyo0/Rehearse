@@ -3,7 +3,6 @@
     Missing local configuration skips with BLOCKED_BY_LOCAL_DB_ENV. CI requires
     PostgreSQL and must fail, rather than silently skip, if configuration is absent.
 """
-import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from uuid import UUID, uuid4
@@ -14,7 +13,7 @@ from alembic.autogenerate import compare_metadata
 from alembic.config import Config
 from alembic.migration import MigrationContext
 from sqlalchemy import delete, insert, inspect, select, text, update
-from sqlalchemy.exc import IntegrityError, SQLAlchemyError
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.database import create_database_engine, get_test_database_url
@@ -32,37 +31,6 @@ def migration_config(connection):
     config = Config(str(ROOT / "alembic.ini"))
     config.attributes.update(connection=connection, skip_logging=True)
     return config
-
-
-@pytest.fixture(scope="module")
-def postgres_engine():
-    if not os.environ.get("TEST_DATABASE_URL", "").strip():
-        if os.environ.get("REHEARSE_REQUIRE_POSTGRES_TESTS") == "1":
-            pytest.fail("CI requires explicit TEST_DATABASE_URL; PostgreSQL tests cannot be skipped.", pytrace=False)
-        pytest.skip("BLOCKED_BY_LOCAL_DB_ENV: explicit isolated PostgreSQL TEST_DATABASE_URL is required")
-    target = get_test_database_url()
-    engine = create_database_engine(target)
-    try:
-        # Verify the server's actual database/role before any destructive DDL.
-        try:
-            with engine.connect() as connection:
-                actual = connection.execute(text("SELECT current_database(), current_user")).one()
-                if tuple(actual) != ("rehearse_test", "rehearse_test"):
-                    pytest.fail("Connected target is not the dedicated test database and role; nothing removed.", pytrace=False)
-        except SQLAlchemyError:
-            pytest.fail("Configured PostgreSQL test connection failed; details omitted.", pytrace=False)
-        with engine.begin() as connection:
-            tables = set(inspect(connection).get_table_names())
-            if tables - TABLES - {"alembic_version"}:
-                pytest.fail("Test database contains unexpected tables; nothing removed.", pytrace=False)
-            if "alembic_version" in tables:
-                command.downgrade(migration_config(connection), "base")
-            elif tables:
-                pytest.fail("Test database contains unversioned tables; nothing removed.", pytrace=False)
-            command.upgrade(migration_config(connection), "head")
-        yield engine
-    finally:
-        engine.dispose()
 
 
 @pytest.fixture

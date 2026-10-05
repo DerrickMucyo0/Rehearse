@@ -46,8 +46,8 @@ class FakeTranscriber:
 
 
 @pytest.fixture
-def setup():
-    service = InterviewSessionService()
+def setup(postgres_session_factory):
+    service = InterviewSessionService(postgres_session_factory)
     fake = FakeTranscriber()
     app.dependency_overrides[get_session_service] = lambda: service
     app.dependency_overrides[get_transcription_service] = lambda: fake

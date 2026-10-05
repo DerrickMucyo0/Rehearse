@@ -9,7 +9,7 @@ submission, and a completion state.
 
 - `frontend/`: React, TypeScript (strict mode), and Vite.
 - `backend/app/`: FastAPI application served by Uvicorn; session routes call a
-  separate in-memory session service with Pydantic request/response models.
+  separate PostgreSQL-backed session service with Pydantic request/response models.
 - `tests/`: backend tests using pytest and FastAPI TestClient.
 - `docs/`: reserved for future documentation.
 
@@ -34,7 +34,8 @@ Session endpoints:
 
 Answer body: `{"question_index":0,"answer":"My answer"}`. The index is zero-based
 and must match the current question. Answers must be strings with 1–10,000
-characters after trimming whitespace. Invalid bodies or malformed UUIDs return
+characters after trimming whitespace; embedded U+0000 is rejected before insertion.
+Invalid bodies or malformed UUIDs return
 422; unknown session UUIDs return 404; completed sessions and stale/future question
 indices return 409 without changing state.
 
@@ -42,10 +43,9 @@ Responses contain `id`, `status` (`active` or `completed`),
 `current_question_index`, `current_question`, `questions`, and ordered `answers`.
 After completion, the index equals the question count and `current_question` is null.
 
-Sessions live only in the backend process and disappear on restart/reload. Run one
-Uvicorn worker: sessions are not shared between workers. Browser refresh resets
-the UI; there is no session restoration, authentication, database-backed runtime,
-expiry, or scoring. A separate PostgreSQL schema foundation is described below.
+Sessions and submitted answers survive backend restart/reload in PostgreSQL and
+are shared across backend workers. Browser refresh still resets the UI; there is
+no browser session restoration, authentication, expiry, or scoring.
 Anyone with a session ID can access that session. This is a local development prototype.
 
 ## Local frontend setup
@@ -71,8 +71,8 @@ npm run test:integration
 ```
 
 Alternatively, set `PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH` to an installed Chrome
-executable. This test uses real API requests and creates disposable in-memory
-sessions. It checks all five answers, completion without a remount/navigation,
+executable. This test uses real API requests and creates sessions in the configured
+development database. It checks all five answers, completion without a remount/navigation,
 and an explicit restart. Failure traces are written to ignored `test-results/`.
 
 ## Local backend setup
@@ -88,27 +88,34 @@ python -m uvicorn app.main:app --app-dir backend --reload --host 127.0.0.1 --por
 
 On Windows, activate with `backend\.venv\Scripts\activate` instead.
 The health endpoint is at `http://127.0.0.1:8000/api/health`.
+Before using session endpoints, configure `DATABASE_URL` in the backend process and
+apply the migration as described below. The health endpoint does not require a database.
 
 ## Run backend tests
 
 From the project root with the backend virtual environment activated:
 
 ```sh
-python -m pytest -W error
+REHEARSE_REQUIRE_POSTGRES_TESTS=1 python -m pytest -W error
 ```
 
-## PostgreSQL foundation (Issue #11, first slice)
+Configure the isolated `TEST_DATABASE_URL` first using the instructions below.
+Session, audio and transcription API regression tests use real PostgreSQL; pure
+speaking-metrics and configuration tests remain database-independent.
 
-PostgreSQL is the persistence-engine foundation, using synchronous SQLAlchemy 2.x,
-psycopg 3 and Alembic. **Session persistence is not active yet:** HTTP routes still
-use `InterviewSessionService` in memory. Importing the database modules creates no
-engine or connection. `create_database_engine()` creates a lazy engine;
-`create_session_factory()` returns a factory, not a shared session. Future callers
+## PostgreSQL persistence (Issue #11)
+
+PostgreSQL stores interview sessions and submitted answers, using synchronous
+SQLAlchemy 2.x, psycopg 3 and Alembic. Importing the application creates no engine or
+connection. Session routes resolve `DATABASE_URL` on first use and cache the service's
+engine/session factory. Each service operation creates and closes its own ORM session.
+`create_database_engine()` creates a lazy engine;
+`create_session_factory()` returns a factory, not a shared session. Callers
 own their sessions and transactions. There is no startup `create_all()`, automatic
 migration, storage fallback, or additional provider integration.
 
-`DATABASE_URL` is required only when explicitly using the application database
-foundation or running migrations. `TEST_DATABASE_URL` is exclusively for destructive
+`DATABASE_URL` is required for session endpoints and migrations.
+`TEST_DATABASE_URL` is exclusively for destructive
 PostgreSQL tests and never falls back to `DATABASE_URL`. Standard PostgreSQL URLs
 are normalized to `postgresql+psycopg`. Destructive tests require both database and
 role to be named `rehearse_test`, reject connection-query overrides and any configured
@@ -189,12 +196,20 @@ PostgreSQL enforces:
   Session deletion cascades to both child tables; deleting a linked measurement alone
   is rejected. No deletion endpoint is introduced.
 
-The new persistence-model validator trims submitted answers and rejects embedded
-U+0000 before insertion; it does not strip/replace NUL. This slice leaves current
-HTTP validation unchanged. A later runtime slice must map rejection to HTTP 422.
-Service transactions must also enforce question bounds against the owning snapshot,
-current-question state, attempt allocation, measurement eligibility, and atomic
-attachment. The database constraints do not implement those workflows.
+The request and persistence validators trim submitted answers and reject embedded
+U+0000 before insertion with HTTP 422; they do not strip/replace NUL.
+Answer submission opens a transaction, selects the session row `FOR UPDATE`, validates
+existence/status/current index, inserts attempt 1, advances the index and, on answer 5,
+sets `completed` plus a UTC completion timestamp. All changes commit together; an
+exception rolls back the attempt and session state. Competing submissions to the same
+session serialize on that row; different sessions use independent row locks. There is
+no global Python lock or global ORM session. Retrieval joins session state and ordered
+first-attempt answers in one statement for a consistent PostgreSQL read snapshot.
+Async audio/transcription routes perform session checks in the thread pool and close
+their database operation before awaiting upload/provider work.
+
+Measurement eligibility and atomic measurement attachment remain future transactional
+service responsibilities. This slice creates no measurement records or associations.
 
 Unlinked measurements become deletion-eligible after 24 hours; linked measurements
 remain associated with their attempt. A pure timestamp/linkage helper models this
@@ -203,7 +218,7 @@ worker; future cleanup must recheck linkage transactionally. Measurement IDs wil
 eventually be explicit client associations, never inferred from edited answers or
 the latest recording/measurement. That API/frontend association is not implemented.
 
-Only the final trimmed submitted answer will be durable text. No audio, second
+Only the final trimmed submitted answer is durable text. No audio, second
 original-transcription text copy or word timings are stored. There are no user
 accounts, semantic scoring, retry UI or history UI. Hosting remains provider-neutral;
 no Supabase-specific APIs are used. Issue #9 remains open and frozen.
@@ -220,7 +235,7 @@ docker compose exec postgres createdb -U "$POSTGRES_USER" -O rehearse_test rehea
 read -rs "TEST_DATABASE_URL?Isolated rehearse_test database URL: "
 echo
 export TEST_DATABASE_URL
-REHEARSE_REQUIRE_POSTGRES_TESTS=1 PYTHONDONTWRITEBYTECODE=1 backend/.venv/bin/python -m pytest -W error tests/test_postgres_schema.py
+REHEARSE_REQUIRE_POSTGRES_TESTS=1 PYTHONDONTWRITEBYTECODE=1 backend/.venv/bin/python -m pytest -W error tests/test_sessions.py tests/test_session_persistence.py tests/test_postgres_schema.py
 REHEARSE_REQUIRE_POSTGRES_TESTS=1 PYTHONDONTWRITEBYTECODE=1 backend/.venv/bin/python -m pytest -W error
 git diff --check
 ```
@@ -230,6 +245,9 @@ entered password and local host/port. Integration tests downgrade/upgrade this s
 including an upgrade from an empty schema; **never use a database containing valuable
 data**. They verify schema/ORM parity, UUID/JSONB/timestamp persistence, constraints,
 immutability, foreign keys, delete policy and persistence across engine reconstruction.
+Session integration tests also prove transactional rollback, completion persistence,
+HTTP NUL rejection, and actual PostgreSQL row-lock blocking with independent-session
+progress. Existing audio/transcription API tests use database-backed session storage.
 They use real PostgreSQL, never SQLite. Without explicit local configuration they skip
 as `BLOCKED_BY_LOCAL_DB_ENV`; this is not PostgreSQL acceptance. Setting
 `REHEARSE_REQUIRE_POSTGRES_TESTS=1` makes missing configuration fail. Database-independent
@@ -506,7 +524,7 @@ This remains a local prototype without authentication or rate limits. Keep the
 key-enabled backend local. Speaking Metrics v1 adds no semantic scoring, coaching
 judgments, adaptive interviewing, pause diagnosis, longitudinal progress tracking,
 or persistent metrics history. Timing metrics remain unavailable when evidence is
-insufficient. Realtime transcription, Nemotron, AI follow-ups, TTS, database-backed sessions,
+insufficient. Realtime transcription, Nemotron, AI follow-ups, TTS,
 and authentication remain absent.
 
 ### Manual verification with a real key

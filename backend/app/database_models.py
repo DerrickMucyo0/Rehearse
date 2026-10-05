@@ -1,9 +1,9 @@
-"""PostgreSQL schema foundation, separate from the live in-memory API models.
+"""PostgreSQL persistence mappings, separate from public API response models.
 
     Session snapshots and measurements are immutable in PostgreSQL (migration
-    triggers). Progression, bounds against the owning question snapshot, current
-    question checks, attempt allocation, and attachment eligibility are
-    future transactional service responsibilities, not implemented runtime flows.
+    triggers). Session progression and current-question checks belong to the
+    transactional session service. Measurement attachment/eligibility and cleanup
+    remain future service responsibilities.
 """
 from datetime import datetime, timedelta
 from uuid import UUID, uuid4
@@ -21,7 +21,7 @@ UNLINKED_MEASUREMENT_RETENTION = timedelta(hours=24)
 
 
 def validate_submitted_answer_text(value: str) -> str:
-    """Future submission boundary; deliberately not wired into current endpoints."""
+    """Shared submission policy, enforced before PostgreSQL insertion."""
     if not isinstance(value, str):
         raise ValueError("Submitted answer must be text.")
     if "\x00" in value:

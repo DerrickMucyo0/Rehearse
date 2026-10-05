@@ -1,7 +1,7 @@
-"""Opt-in synchronous database foundation; importing it never opens a connection.
+"""Synchronous database configuration; importing it never opens a connection.
 
-The current HTTP application still uses its in-memory session service. No dotenv
-loading, runtime storage fallback, or automatic migrations are introduced here.
+Session routes resolve DATABASE_URL explicitly on first use. No dotenv loading,
+runtime storage fallback, or automatic migrations are introduced here.
 """
 import os
 from collections.abc import Mapping

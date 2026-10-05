@@ -366,3 +366,50 @@ Verification:
 - `git diff --check` passed. Fingerprints of all pre-existing runtime, frontend and
   test files remained unchanged. No Issue #9 research or held-out inspection, no live
   provider calls, commit, push or PR.
+
+## Issue #11 — PostgreSQL session runtime, second slice
+
+- Continues `feat/postgres-persistence` from foundation commit `20613fa`, starting
+  with a clean working tree. Replaces process-local session/answer storage with the
+  existing synchronous SQLAlchemy schema; no new migration or dependency changes.
+- Session routes lazily resolve `DATABASE_URL` and cache an engine/session factory,
+  never an ORM Session. Each service operation owns and closes its database session
+  and transaction. There is no in-memory or `TEST_DATABASE_URL` fallback.
+- Creation persists the immutable five-question snapshot and initial state. Retrieval
+  reads state and ordered attempt-1 answers in a single SQL statement for consistent
+  snapshots. UUIDs, public response fields, Location, trimming, 404/409/422 behavior,
+  and fifth-answer completion are preserved.
+- Submission locks the owning session with `SELECT ... FOR UPDATE`, checks
+  existence/status/current index, rejects NUL before insertion, inserts attempt 1,
+  advances state and sets UTC completion time on the fifth answer. Flush and commit
+  failures roll back the attempt, index, status and completion timestamp together.
+  The row lock serializes competing submissions without a global Python lock.
+- Async audio/transcription endpoints run synchronous session checks in the thread
+  pool; no database operation stays open during upload/provider awaits. Existing
+  temporary-file cleanup, transcription configuration and speaking metrics remain
+  unchanged. Measurement creation/linking is deferred; submitted attempts have no
+  measurement association. No frontend, auth, retry UI or provider changes.
+- Shared PostgreSQL fixtures preserve explicit destructive-test isolation. Existing
+  session/audio/transcription test assertions remain intact; their old in-memory
+  setup now injects a real database factory. README reflects active persistence and
+  required application/test configuration.
+
+Verification against local PostgreSQL 18.6 (Postgres.app):
+- Focused session/persistence/schema suite with warnings as errors and PostgreSQL
+  required: 102 passed, 0 failed, 0 skipped (23 existing API, 22 new persistence,
+  57 schema cases).
+- Full backend suite with warnings as errors and PostgreSQL required: 292 passed,
+  0 failed, 0 skipped. No SQLite substitution.
+- Tests prove session/answer/completion persistence across engine reconstruction,
+  timestamps and attempt 1, explicit configuration, pool connection return,
+  transactional rollback after flush/before commit, uniqueness protection, and
+  HTTP 422 for NUL without mutation. The default HTTP dependency is tested without
+  service overrides and retains answers after reconstruction.
+- Concurrency tests observe the actual PostgreSQL blocker for duplicate submissions,
+  require only one accepted answer, and advance a different session while that lock
+  remains held. A concurrent read retains a consistent state/answer snapshot even
+  when an answer commits before the reader returns.
+- `git diff --check` passed. Schema definitions/migration bytes, frontend, provider
+  implementations/configuration and speaking-metrics calculation files remain
+  unchanged. Issue #9/held-out data untouched; zero live provider calls. No commit,
+  push, PR or merge.
