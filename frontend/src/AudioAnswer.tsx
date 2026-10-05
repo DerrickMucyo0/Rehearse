@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { ApiError, isConflictError, transcribeAudio, uploadAudio } from './interviewApi'
 import type { InterviewSession, SpeakingMetrics } from './interviewApi'
 import { useAudioRecorder } from './useAudioRecorder'
@@ -10,11 +10,12 @@ interface Props {
   onTranscript: (text: string, measurementId: string) => void
   onInvalidateMeasurement: () => void
   onTranscribing: (busy: boolean) => void
+  onBusyChange?: (busy: boolean) => void
   onConflict?: () => void
   onUncertainTranscription?: () => void
 }
 
-export default function AudioAnswer({ session, disabled, hasAnswer, onTranscript, onInvalidateMeasurement, onTranscribing, onConflict, onUncertainTranscription }: Props) {
+export default function AudioAnswer({ session, disabled, hasAnswer, onTranscript, onInvalidateMeasurement, onTranscribing, onBusyChange, onConflict, onUncertainTranscription }: Props) {
   const recording = useAudioRecorder()
   const [uploadState, setUploadState] = useState<'idle' | 'uploading' | 'accepted' | 'transcribing' | 'transcribed' | 'error'>('idle')
   const [error, setError] = useState('')
@@ -26,6 +27,11 @@ export default function AudioAnswer({ session, disabled, hasAnswer, onTranscript
     onTranscribing(false)
   }, [onTranscribing])
   const pendingRequest = uploadState === 'uploading' || uploadState === 'transcribing'
+  const busy = pendingRequest || ['requesting', 'recording', 'stopping'].includes(recording.state)
+  useLayoutEffect(() => {
+    onBusyChange?.(busy)
+    return () => { onBusyChange?.(false) }
+  }, [busy, onBusyChange])
   const metrics = measurements && measurements.blob === recording.blob ? measurements.metrics : null
 
   async function transcribe() {
