@@ -13,6 +13,7 @@ from app.database_models import (
     MEASUREMENT_VERSION, QuestionAttempt, StoredInterviewSession,
     TranscriptionMeasurement, validate_submitted_answer_text,
 )
+from app.delivery_metrics import DeliveryMetrics
 from app.speaking_metrics import SpeakingMetrics
 
 QUESTIONS = (
@@ -237,13 +238,22 @@ class InterviewSessionService:
 
     def create_measurement(
         self, session_id: UUID, question_index: int, metrics: SpeakingMetrics,
-        *, expected_last_attempt_number: int,
+        *, expected_last_attempt_number: int, delivery_metrics: DeliveryMetrics | None = None,
     ) -> UUID:
         """Persist only original metrics after inference, in a new transaction.
 
         The session lock closes the revalidation/insert race with answer submission.
         No provider call, audio, transcript text or word timing array enters here.
+        Legacy callers may omit delivery facts; transcription always supplies the
+        calculated family, including explicit unavailability, before this insert.
         """
+        delivery_fields = {} if delivery_metrics is None else {
+            "delivery_measurement_version": delivery_metrics.version,
+            "pause_count": delivery_metrics.pause_count,
+            "total_pause_duration_seconds": delivery_metrics.total_pause_duration_seconds,
+            "longest_pause_seconds": delivery_metrics.longest_pause_seconds,
+            "pause_unavailable_reason": delivery_metrics.unavailable_reason,
+        }
         with self._session_factory.begin() as database:
             stored = self._locked_session(database, session_id)
             self._check_question(stored, question_index)
@@ -260,6 +270,7 @@ class InterviewSessionService:
                 timed_utterance_span_seconds=metrics.timed_utterance_span_seconds,
                 estimated_words_per_minute=metrics.estimated_words_per_minute,
                 timing_unavailable_reason=metrics.timing_unavailable_reason,
+                **delivery_fields,
             )
             database.add(measurement)
             database.flush()

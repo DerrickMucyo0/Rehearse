@@ -1,6 +1,6 @@
 from contextlib import asynccontextmanager
 from functools import lru_cache
-from typing import Annotated
+from typing import Annotated, Literal
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Path, Query, Request, Response
@@ -10,6 +10,7 @@ from starlette.concurrency import run_in_threadpool
 from app.audio import AudioAccepted, bounded_multipart_request, validated_audio
 from app.comparisons import AttemptComparison
 from app.database import create_database_engine, create_session_factory
+from app.delivery_metrics import DeliveryMetrics, measure_delivery
 from app.speaking_metrics import SpeakingMetrics, measure_transcription
 from app.sessions import (
     Attempt,
@@ -133,6 +134,10 @@ async def accept_audio(session_id: UUID, request: Request, sessions: SessionServ
         return metadata
 
 
+class SessionDeliveryMetrics(DeliveryMetrics):
+    source: Literal["original_transcription"]
+
+
 class SessionTranscription(TranscriptionResult):
     session_id: UUID
     question_index: int
@@ -141,6 +146,7 @@ class SessionTranscription(TranscriptionResult):
         description="Measurements of the original recognized transcription, not later edited answers. "
                     "Timing estimates exclude leading/trailing recording silence; null means unavailable.",
     )
+    delivery_metrics: SessionDeliveryMetrics
 
 
 @router.post("/{session_id}/transcriptions", response_model=SessionTranscription)
@@ -160,13 +166,15 @@ async def transcribe_audio(
         except TranscriptionFailed:
             raise HTTPException(502, "Unable to transcribe this recording. Try again or type your answer.") from None
         metrics = measure_transcription(result.text, result.language, result.words)
+        delivery_metrics = measure_delivery(result.text, result.words)
         # Revalidate and persist in a separate operation after inference/calculation.
         # Its session lock prevents stale measurement insertion during submission.
         measurement_id = await run_in_threadpool(
             sessions.create_measurement, session_id, metadata.question_index, metrics,
-            expected_last_attempt_number=expected,
+            expected_last_attempt_number=expected, delivery_metrics=delivery_metrics,
         )
         return SessionTranscription(
             session_id=session_id, question_index=metadata.question_index, **result.model_dump(),
             metrics=metrics, measurement_id=measurement_id,
+            delivery_metrics=SessionDeliveryMetrics(source=metrics.source, **delivery_metrics.model_dump()),
         )

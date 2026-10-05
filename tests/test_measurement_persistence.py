@@ -21,6 +21,7 @@ from app.database_models import (
     MEASUREMENT_VERSION, QuestionAttempt, StoredInterviewSession,
     TranscriptionMeasurement,
 )
+from app.delivery_metrics import measure_delivery
 from app.main import app
 from app.session_routes import get_session_service
 from app.sessions import (
@@ -94,6 +95,23 @@ def metrics_for(result):
     return measure_transcription(result.text, result.language, result.words)
 
 
+def delivery_for(result):
+    return measure_delivery(result.text, result.words)
+
+
+def delivery_projection(row):
+    if row["delivery_measurement_version"] is None:
+        return None
+    return {
+        "version": row["delivery_measurement_version"],
+        "source": row["measurement_source"],
+        "pause_count": row["pause_count"],
+        "total_pause_duration_seconds": row["total_pause_duration_seconds"],
+        "longest_pause_seconds": row["longest_pause_seconds"],
+        "unavailable_reason": row["pause_unavailable_reason"],
+    }
+
+
 def metrics_projection(row):
     return {
         "source": row["measurement_source"],
@@ -145,15 +163,17 @@ def test_success_persists_one_exact_original_measurement_with_opaque_uuid(setup,
     body = response.json()
     identifier = UUID(body["measurement_id"])
     assert identifier.version == 4
-    assert set(body) == {"session_id", "question_index", "text", "language", "words", "metrics", "measurement_id"}
+    assert set(body) == {"session_id", "question_index", "text", "language", "words", "metrics", "delivery_metrics", "measurement_id"}
     assert body["metrics"] == expected
     assert {key: body[key] for key in fake.result.model_dump()} == fake.result.model_dump()
+    assert body["delivery_metrics"] == {**delivery_for(fake.result).model_dump(), "source": "original_transcription"}
     rows = measurement_rows(postgres_session_factory)
     assert len(rows) == 1
     row = rows[0]
     assert (row["id"], row["session_id"], row["question_index"]) == (identifier, created.id, 0)
     assert row["measurement_version"] == MEASUREMENT_VERSION == "speaking-metrics-v1"
     assert metrics_projection(row) == expected
+    assert delivery_projection(row) == body["delivery_metrics"]
     assert row["created_at"].tzinfo is not None
     assert before <= row["created_at"] <= after
     assert service.get(created.id) == created
@@ -174,7 +194,12 @@ def test_unavailable_values_remain_null_in_persisted_measurement(setup, postgres
     assert expected["filler_unavailable_reason"] == "unsupported_language"
     assert expected["timing_unavailable_reason"] == "missing_timings"
     assert response.json()["metrics"] == expected
-    assert metrics_projection(measurement_rows(postgres_session_factory)[0]) == expected
+    row = measurement_rows(postgres_session_factory)[0]
+    assert metrics_projection(row) == expected
+    assert delivery_projection(row) == response.json()["delivery_metrics"] == {
+        "version": "pause-metrics-v1", "source": "original_transcription", "pause_count": None,
+        "total_pause_duration_seconds": None, "longest_pause_seconds": None, "unavailable_reason": "missing_timings",
+    }
 
 
 def test_measurement_storage_contains_no_audio_transcript_or_word_timing_columns(setup, postgres_session_factory):
@@ -188,6 +213,8 @@ def test_measurement_storage_contains_no_audio_transcript_or_word_timing_columns
         "measurement_source", "recognized_word_count", "um_count", "uh_count",
         "filler_unavailable_reason", "timed_utterance_span_seconds",
         "estimated_words_per_minute", "timing_unavailable_reason",
+        "delivery_measurement_version", "pause_count", "total_pause_duration_seconds",
+        "longest_pause_seconds", "pause_unavailable_reason",
     }
     assert b"PRIVATE-SYNTHETIC-AUDIO" not in [value for value in rows[0].values()]
     assert fake.result.text not in [value for value in rows[0].values()]
@@ -236,6 +263,7 @@ def test_replacement_transcription_gets_new_id_and_retains_old_unlinked_measurem
     assert len(rows) == 2
     assert next(row for row in rows if row["id"] == first_id) == first_row
     assert metrics_projection(next(row for row in rows if row["id"] == second_id)) == second.json()["metrics"]
+    assert delivery_projection(next(row for row in rows if row["id"] == second_id)) == second.json()["delivery_metrics"]
     assert stored_state(postgres_session_factory, created.id)[1] == []
     now = datetime.now(timezone.utc)
     with postgres_session_factory() as database:
@@ -443,7 +471,8 @@ def test_provider_failure_creates_no_measurement_or_attempt(setup, postgres_sess
     assert fake.calls == 1
 
 
-def test_metric_calculation_failure_creates_no_measurement(setup, postgres_session_factory, monkeypatch):
+@pytest.mark.parametrize("engine", ["measure_transcription", "measure_delivery"])
+def test_metric_calculation_failure_creates_no_measurement(setup, postgres_session_factory, monkeypatch, engine):
     import app.session_routes as routes
 
     client, service, fake = setup
@@ -453,7 +482,7 @@ def test_metric_calculation_failure_creates_no_measurement(setup, postgres_sessi
     def fail(*args):
         raise RuntimeError("Injected metric calculation failure")
 
-    monkeypatch.setattr(routes, "measure_transcription", fail)
+    monkeypatch.setattr(routes, engine, fail)
     response = transcribe(client, created.id)
     assert response.status_code == 500
     assert measurement_rows(postgres_session_factory) == []
@@ -478,7 +507,8 @@ def test_measurement_flush_or_commit_failure_does_not_leave_a_partial_row(
     failing = InterviewSessionService(sessionmaker(bind=postgres_engine, class_=FailingSession))
     try:
         with pytest.raises(RuntimeError, match="Injected measurement transaction failure"):
-            failing.create_measurement(created.id, 0, metrics_for(fake.result), expected_last_attempt_number=0)
+            failing.create_measurement(created.id, 0, metrics_for(fake.result),
+                                       delivery_metrics=delivery_for(fake.result), expected_last_attempt_number=0)
     finally:
         event.remove(FailingSession, failure_stage, fail)
     assert measurement_rows(postgres_session_factory) == []
@@ -553,19 +583,20 @@ def test_no_database_checkout_or_lock_is_held_during_provider_and_same_question_
     assert fake.calls == 1
 
 
+@pytest.mark.parametrize("engine", ["measure_transcription", "measure_delivery"])
 def test_attempt_appended_after_metric_calculation_is_revalidated_before_measurement_insert(
-        setup, postgres_session_factory, monkeypatch):
+        setup, postgres_session_factory, monkeypatch, engine):
     import app.session_routes as routes
 
     client, service, fake = setup
     created = service.start()
 
     def calculate_then_append(*args):
-        metrics = measure_transcription(*args)
+        metrics = (measure_transcription if engine == "measure_transcription" else measure_delivery)(*args)
         service.submit_attempt(created.id, 0, AttemptRequest(expected_last_attempt_number=0, answer="Won the race"))
         return metrics
 
-    monkeypatch.setattr(routes, "measure_transcription", calculate_then_append)
+    monkeypatch.setattr(routes, engine, calculate_then_append)
     response = transcribe(client, created.id)
     assert response.status_code == 409
     assert measurement_rows(postgres_session_factory) == []
@@ -699,7 +730,9 @@ def test_retry_attempts_keep_separate_explicit_measurements_and_typed_retry_is_u
     assert len(rows) == 2
     assert next(item for item in rows if item["id"] == first_id) == initial_measurement
     assert metrics_projection(initial_measurement) == first_metrics
+    assert delivery_projection(initial_measurement) == first.json()["delivery_metrics"]
     assert metrics_projection(next(item for item in rows if item["id"] == second_id)) == second.json()["metrics"]
+    assert delivery_projection(next(item for item in rows if item["id"] == second_id)) == second.json()["delivery_metrics"]
     assert (state["current_question_index"], state["status"], state["completed_at"]) == (0, "active", None)
     assert service.get(created.id).answers == []
     assert service.get(created.id).current_question_latest_attempt_number == 3
@@ -780,3 +813,134 @@ def test_failed_measured_retry_keeps_prior_attempt_and_measurement_unchanged(
     ))
     assert accepted.attempt.attempt_number == 2
     assert accepted.attempt.measurement_id == retry_id
+
+
+@pytest.mark.parametrize(("result", "expected"), [
+    (TranscriptionResult(text="one two", language="eng", words=[
+        {"text": "one", "start": 0.0, "end": 0.2}, {"text": "two", "start": 0.7, "end": 1.0},
+    ]), (1, 0.5, 0.5, None)),
+    (TranscriptionResult(text="one two", language="eng", words=[
+        {"text": "one", "start": 0.0, "end": 0.2}, {"text": "two", "start": 0.69, "end": 1.0},
+    ]), (0, 0.0, 0.0, None)),
+    (TranscriptionResult(text="one", language="eng", words=[
+        {"text": "one", "start": 2.0, "end": 2.25},
+    ]), (0, 0.0, 0.0, None)),
+    (TranscriptionResult(text="one two three", language="eng", words=[
+        {"text": "one", "start": 0.0, "end": 1.2345678901234567},
+        {"text": "two", "start": 2.234567890123458, "end": 2.5},
+        {"text": "three", "start": 3.1, "end": 3.3},
+    ]), (2, 1.6000000000000013, 1.0000000000000013, None)),
+    (TranscriptionResult(text="one two", language="eng"), (None, None, None, "missing_timings")),
+    (TranscriptionResult(text="one two", language="eng", words=[
+        {"text": "one", "start": 0.0, "end": 0.2},
+    ]), (None, None, None, "timing_coverage_mismatch")),
+    (TranscriptionResult(text="one two", language="eng", words=[
+        {"text": "one", "start": 0.0, "end": 1.0}, {"text": "two", "start": 0.5, "end": 2.0},
+    ]), (None, None, None, "invalid_timing_order")),
+    (TranscriptionResult(text="...", language="eng", words=[
+        {"text": "...", "start": 0.0, "end": 1.0},
+    ]), (None, None, None, "missing_timings")),
+    (TranscriptionResult(text="one", language="eng", words=[
+        {"text": "one", "start": 0.0, "end": 0.0},
+    ]), (None, None, None, "unusable_span")),
+])
+def test_transcription_round_trips_both_families_in_one_complete_snapshot(
+        setup, postgres_session_factory, result, expected):
+    client, service, fake = setup
+    fake.result = result
+    created = service.start()
+    before = result.model_dump()
+    response = transcribe(client, created.id)
+    assert response.status_code == 200
+    body = response.json()
+    rows = measurement_rows(postgres_session_factory)
+    assert len(rows) == 1
+    row = rows[0]
+    assert str(row["id"]) == body["measurement_id"]
+    assert row["measurement_version"] == "speaking-metrics-v1"
+    assert row["delivery_measurement_version"] == "pause-metrics-v1"
+    assert row["measurement_source"] == body["metrics"]["source"] == body["delivery_metrics"]["source"] == "original_transcription"
+    assert metrics_projection(row) == metrics_for(result).model_dump() == body["metrics"]
+    assert delivery_projection(row) == body["delivery_metrics"]
+    assert (row["pause_count"], row["total_pause_duration_seconds"], row["longest_pause_seconds"], row["pause_unavailable_reason"]) == expected
+    assert body["delivery_metrics"] == {**delivery_for(result).model_dump(), "source": row["measurement_source"]}
+    assert set(body["delivery_metrics"]) == {
+        "version", "source", "pause_count", "total_pause_duration_seconds", "longest_pause_seconds", "unavailable_reason",
+    }
+    assert body["words"] == result.model_dump()["words"]
+    assert not ({"words", "timings", "pause_events", "pause_gaps", "provider_payload"} & body["delivery_metrics"].keys())
+    assert all(not isinstance(value, (list, dict)) for value in body["delivery_metrics"].values())
+    assert result.model_dump() == before
+    assert fake.calls == 1
+    assert service.get(created.id) == created
+    assert stored_state(postgres_session_factory, created.id)[1] == []
+
+
+def test_legacy_direct_measurement_remains_readable_without_fabricated_delivery_version(setup, postgres_session_factory):
+    _, service, fake = setup
+    created = service.start()
+    expected = metrics_for(fake.result)
+    identifier = service.create_measurement(created.id, 0, expected, expected_last_attempt_number=0)
+    rows = measurement_rows(postgres_session_factory)
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["id"] == identifier
+    assert metrics_projection(row) == expected.model_dump()
+    assert delivery_projection(row) is None
+    for field in ("delivery_measurement_version", "pause_count", "total_pause_duration_seconds",
+                  "longest_pause_seconds", "pause_unavailable_reason"):
+        assert row[field] is None
+    with postgres_session_factory() as database:
+        stored = database.get(TranscriptionMeasurement, identifier)
+        assert stored.delivery_measurement_version is None
+        assert stored.pause_count is None
+    linked = service.submit_attempt(created.id, 0, AttemptRequest(
+        expected_last_attempt_number=0, answer="A historical measurement remains linkable", measurement_id=identifier,
+    ))
+    assert linked.attempt.measurement_id == identifier
+    assert measurement_rows(postgres_session_factory) == rows
+
+
+def test_delivery_exception_happens_before_any_measurement_insert(setup, postgres_session_factory, monkeypatch):
+    import app.session_routes as routes
+
+    client, service, fake = setup
+    created = service.start()
+    writes = []
+    original = service.create_measurement
+
+    def capture_insert(*args, **kwargs):
+        writes.append(True)
+        return original(*args, **kwargs)
+
+    def fail_delivery(*args):
+        raise RuntimeError("Injected delivery engine failure")
+
+    monkeypatch.setattr(service, "create_measurement", capture_insert)
+    monkeypatch.setattr(routes, "measure_delivery", fail_delivery)
+    response = transcribe(client, created.id)
+    assert response.status_code == 500
+    assert writes == []
+    assert measurement_rows(postgres_session_factory) == []
+    assert service.get(created.id) == created
+    assert fake.calls == 1
+
+
+def test_delivery_snapshot_adds_no_content_or_timing_logging(setup, postgres_session_factory, caplog, capsys):
+    client, service, fake = setup
+    fake.result = TranscriptionResult(text="PRIVATE-TRANSCRIPT token", language="eng", words=[
+        {"text": "PRIVATE-TRANSCRIPT", "start": 0.0, "end": 0.2},
+        {"text": "token", "start": 0.7, "end": 1.0},
+    ])
+    created = service.start()
+    response = transcribe(client, created.id)
+    assert response.status_code == 200
+    output = capsys.readouterr()
+    assert "PRIVATE-TRANSCRIPT" not in caplog.text + output.out + output.err
+    assert "PRIVATE-SYNTHETIC-AUDIO" not in caplog.text + output.out + output.err
+    body = response.json()
+    assert "PRIVATE-TRANSCRIPT" not in str(body["delivery_metrics"])
+    assert not any(isinstance(value, (list, dict, bytes)) for value in measurement_rows(postgres_session_factory)[0].values())
+    assert body["words"] == fake.result.model_dump()["words"]
+    assert not any(isinstance(value, (list, dict)) for value in body["delivery_metrics"].values())
+    assert fake.calls == 1

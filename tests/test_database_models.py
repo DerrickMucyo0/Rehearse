@@ -1,4 +1,5 @@
 from datetime import datetime, timedelta, timezone
+from hashlib import sha256
 from io import StringIO
 from pathlib import Path
 
@@ -15,6 +16,16 @@ from app.database_models import (
 from app.sessions import QUESTIONS
 
 ROOT = Path(__file__).resolve().parents[1]
+DELIVERY_COLUMNS = {
+    "delivery_measurement_version", "pause_count", "total_pause_duration_seconds",
+    "longest_pause_seconds", "pause_unavailable_reason",
+}
+DELIVERY_CONSTRAINTS = {
+    "ck_measurements_delivery_state", "ck_measurements_delivery_version",
+    "ck_measurements_pause_reason", "ck_measurements_pause_count",
+    "ck_measurements_finite_pause_total", "ck_measurements_finite_pause_longest",
+    "ck_measurements_pause_durations", "ck_measurements_pause_word_bound",
+}
 
 
 @pytest.mark.parametrize("value", ["\x00", "hello\x00world", " \x00 "])
@@ -66,14 +77,15 @@ def test_retention_rejects_ambiguous_naive_timestamps():
         record.unlinked_deletion_eligible(linked=False, now=datetime(2026, 1, 2, tzinfo=timezone.utc))
 
 
-def test_alembic_has_one_initial_revision_and_emits_postgresql_ddl_offline(monkeypatch):
+def test_alembic_has_delivery_head_after_initial_revision_and_emits_postgresql_ddl_offline(monkeypatch):
     monkeypatch.setenv("DATABASE_URL", "postgresql+psycopg://offline@localhost/rehearse_dev")
     output = StringIO()
     config = Config(str(ROOT / "alembic.ini"), output_buffer=output)
     config.attributes["skip_logging"] = True
     scripts = ScriptDirectory.from_config(config)
-    assert scripts.get_heads() == ["0001_database_foundation"]
-    assert scripts.get_revision("head").down_revision is None
+    assert scripts.get_heads() == ["0002_pause_delivery_metrics"]
+    assert scripts.get_revision("head").down_revision == "0001_database_foundation"
+    assert scripts.get_revision("0001_database_foundation").down_revision is None
     command.upgrade(config, "head", sql=True)
     sql = output.getvalue()
     for table in Base.metadata.tables:
@@ -82,9 +94,47 @@ def test_alembic_has_one_initial_revision_and_emits_postgresql_ddl_offline(monke
     assert "TIMESTAMP WITH TIME ZONE" in sql
     assert "FOREIGN KEY(measurement_id, session_id, question_index)" in sql
     assert "CREATE TRIGGER preserve_measurement" in sql
+    for column in DELIVERY_COLUMNS:
+        assert f"ADD COLUMN {column}" in sql
+    for constraint in DELIVERY_CONSTRAINTS:
+        assert f"ADD CONSTRAINT {constraint}" in sql
     output.seek(0)
     output.truncate(0)
     command.downgrade(config, "head:base", sql=True)
     sql = output.getvalue()
+    for column in DELIVERY_COLUMNS:
+        assert f"DROP COLUMN {column}" in sql
+    assert sql.index("DROP COLUMN delivery_measurement_version") < sql.index("DROP TABLE question_attempts")
     assert sql.index("DROP TABLE question_attempts") < sql.index("DROP TABLE transcription_measurements")
     assert "DROP FUNCTION rehearse_preserve_measurement()" in sql
+
+
+def test_delivery_orm_columns_are_nullable_without_historical_defaults():
+    columns = TranscriptionMeasurement.__table__.columns
+    for name in DELIVERY_COLUMNS:
+        column = columns[name]
+        assert column.nullable is True
+        assert column.default is None
+        assert column.server_default is None
+    record = TranscriptionMeasurement()
+    assert all(getattr(record, name) is None for name in DELIVERY_COLUMNS)
+
+
+def test_delivery_orm_declares_only_the_approved_extension_and_constraints():
+    assert set(TranscriptionMeasurement.__table__.columns.keys()) == {
+        "id", "session_id", "question_index", "created_at", "measurement_version",
+        "measurement_source", "recognized_word_count", "um_count", "uh_count",
+        "filler_unavailable_reason", "timed_utterance_span_seconds",
+        "estimated_words_per_minute", "timing_unavailable_reason",
+        *DELIVERY_COLUMNS,
+    }
+    names = {constraint.name for constraint in TranscriptionMeasurement.__table__.constraints}
+    assert DELIVERY_CONSTRAINTS <= names
+    assert set(Base.metadata.tables) == {
+        "interview_sessions", "question_attempts", "transcription_measurements",
+    }
+
+
+def test_initial_migration_remains_identical_to_the_main_foundation_bytes():
+    path = ROOT / "alembic" / "versions" / "0001_database_foundation.py"
+    assert sha256(path.read_bytes()).hexdigest() == "fe6eb90cac67dd1703fced254a18f890ce91fbb38edc435a2a3691cc9861acdb"

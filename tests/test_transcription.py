@@ -6,10 +6,12 @@ import httpx
 import pytest
 from fastapi.testclient import TestClient
 from starlette.datastructures import Headers, UploadFile
+from sqlalchemy import select
 
 from app.audio import MAX_AUDIO_BYTES, MAX_BODY_BYTES
+from app.database_models import TranscriptionMeasurement
 from app.main import app
-from app.session_routes import get_session_service
+from app.session_routes import SessionTranscription, get_session_service
 from app.sessions import AttemptRequest, ContinueRequest, InterviewSessionService
 from app.transcription import (
     ElevenLabsTranscriptionService, TranscriptionFailed, TranscriptionResult,
@@ -80,6 +82,11 @@ def test_success_does_not_advance_and_closes_file(setup):
                                  'um_count': 0, 'uh_count': 0, 'filler_unavailable_reason': None,
                                  'timed_utterance_span_seconds': None, 'estimated_words_per_minute': None,
                                  'timing_unavailable_reason': 'timing_coverage_mismatch',
+                             },
+                             'delivery_metrics': {
+                                 'version': 'pause-metrics-v1', 'source': 'original_transcription',
+                                 'pause_count': None, 'total_pause_duration_seconds': None,
+                                 'longest_pause_seconds': None, 'unavailable_reason': 'timing_coverage_mismatch',
                              }}
     assert service.get(session.id) == session
     assert fake.calls[0][1:] == ('answer-1.webm', b'fake audio')
@@ -111,6 +118,11 @@ def test_complete_metrics_belong_to_original_transcription_not_edited_answer(set
         'timed_utterance_span_seconds': 2.0, 'estimated_words_per_minute': 60.0,
         'timing_unavailable_reason': None,
     }
+    assert body['delivery_metrics'] == {
+        'version': 'pause-metrics-v1', 'source': 'original_transcription',
+        'pause_count': 0, 'total_pause_duration_seconds': 0.0,
+        'longest_pause_seconds': 0.0, 'unavailable_reason': None,
+    }
     edited = 'A different longer answer without any filler words'
     submitted = client.post(f'/api/sessions/{session.id}/questions/0/attempts', json={
         'expected_last_attempt_number': 0, 'answer': edited,
@@ -140,6 +152,11 @@ def test_response_metrics_explicitly_unavailable_without_language_or_timings(set
         'timed_utterance_span_seconds': None, 'estimated_words_per_minute': None,
         'timing_unavailable_reason': 'missing_timings',
     }
+    assert body['delivery_metrics'] == {
+        'version': 'pause-metrics-v1', 'source': 'original_transcription',
+        'pause_count': None, 'total_pause_duration_seconds': None,
+        'longest_pause_seconds': None, 'unavailable_reason': 'missing_timings',
+    }
 
 
 def test_metrics_after_adapter_filters_spacing_events_and_untimed_words(setup, monkeypatch):
@@ -166,6 +183,8 @@ def test_metrics_after_adapter_filters_spacing_events_and_untimed_words(setup, m
     assert body['metrics']['recognized_word_count'] == 2
     assert body['metrics']['estimated_words_per_minute'] is None
     assert body['metrics']['timing_unavailable_reason'] == 'timing_coverage_mismatch'
+    assert body['delivery_metrics']['unavailable_reason'] == 'timing_coverage_mismatch'
+    assert body['delivery_metrics']['pause_count'] is None
 
 
 def test_unknown_session(setup):
@@ -349,8 +368,12 @@ def test_total_provider_deadline(monkeypatch):
         run_adapter(monkeypatch, handler)
 
 
-@pytest.mark.parametrize('body', [provider_response(text=''), {'detail': 'private provider data'}])
-def test_real_adapter_failures_reach_route_as_sanitized_errors(setup, monkeypatch, body):
+@pytest.mark.parametrize('body', [
+    provider_response(text=''), {'detail': 'private provider data'},
+    provider_response(words=[{'type': 'word', 'text': 'Hello', 'start': -1.0, 'end': 0.0}]),
+    provider_response(words=[{'type': 'word', 'text': 'Hello', 'start': 2.0, 'end': 1.0}]),
+])
+def test_real_adapter_failures_reach_route_as_sanitized_errors(setup, postgres_session_factory, monkeypatch, body):
     client, service, _ = setup
     monkeypatch.setenv('ELEVENLABS_API_KEY', 'test-only-not-a-real-key')
     adapter = ElevenLabsTranscriptionService(httpx.MockTransport(lambda _: httpx.Response(200, json=body)))
@@ -358,6 +381,8 @@ def test_real_adapter_failures_reach_route_as_sanitized_errors(setup, monkeypatc
     result = post(client, service.start().id)
     assert result.status_code == 502
     assert result.json() == {'detail': 'Unable to transcribe this recording. Try again or type your answer.'}
+    with postgres_session_factory() as database:
+        assert database.scalars(select(TranscriptionMeasurement)).all() == []
 
 
 @pytest.mark.parametrize('flag', [None, '0', 'true'])
@@ -600,3 +625,79 @@ def test_transcription_requires_authoritative_revision_after_retry(setup):
     assert len(fake.calls) == 1
     assert service.get(session.id).current_question_index == 0
     assert service.get(session.id).current_question_latest_attempt_number == 1
+
+
+@pytest.mark.parametrize(('word_specs', 'expected', 'reason'), [
+    ([('one', 0.0, 0.2), ('two', 0.7, 1.0)], (1, 0.5, 0.5), None),
+    ([('one', 0.0, 0.200001), ('two', 0.7, 1.0)], (0, 0.0, 0.0), None),
+    ([('one', 0.0, 0.2), ('two', 0.2, 1.0)], (0, 0.0, 0.0), None),
+    ([('one', 0.0, 0.5)], (None, None, None), 'timing_coverage_mismatch'),
+    ([], (None, None, None), 'missing_timings'),
+    ([('one', 0.0, 0.8), ('two', 0.7, 1.0)], (None, None, None), 'invalid_timing_order'),
+])
+def test_one_mocked_provider_request_preserves_existing_transcription_and_adds_scalar_delivery(
+        setup, postgres_session_factory, monkeypatch, word_specs, expected, reason, caplog, capsys):
+    client, service, _ = setup
+    calls = []
+
+    def handler(request):
+        calls.append(request)
+        return httpx.Response(200, json=provider_response(
+            text='one two', words=[
+                {'type': 'word', 'text': text, 'start': start, 'end': end, 'logprob': -0.1}
+                for text, start, end in word_specs
+            ], provider_internal='PRIVATE-PROVIDER-PAYLOAD', audio_duration_secs=999.0,
+        ))
+
+    monkeypatch.setenv('ELEVENLABS_API_KEY', 'test-only-not-a-real-key')
+    app.dependency_overrides[get_transcription_service] = lambda: ElevenLabsTranscriptionService(httpx.MockTransport(handler))
+    created = service.start()
+    response = post(client, created.id)
+    assert response.status_code == 200
+    body = response.json()
+    assert set(body) == {'session_id', 'question_index', 'measurement_id', 'text', 'language', 'words', 'metrics', 'delivery_metrics'}
+    assert body['words'] == [
+        {'text': text, 'start': start, 'end': end} for text, start, end in word_specs
+    ]
+    assert body['delivery_metrics'] == {
+        'version': 'pause-metrics-v1', 'source': 'original_transcription',
+        'pause_count': expected[0], 'total_pause_duration_seconds': expected[1],
+        'longest_pause_seconds': expected[2], 'unavailable_reason': reason,
+    }
+    assert body['metrics']['recognized_word_count'] == 2
+    assert body['metrics']['timing_unavailable_reason'] == reason
+    assert len(calls) == 1
+    with postgres_session_factory() as database:
+        rows = database.scalars(select(TranscriptionMeasurement)).all()
+        assert len(rows) == 1
+        row = rows[0]
+        assert str(row.id) == body['measurement_id']
+        assert row.measurement_version == 'speaking-metrics-v1'
+        assert row.delivery_measurement_version == 'pause-metrics-v1'
+        assert row.measurement_source == body['delivery_metrics']['source']
+        assert (row.pause_count, row.total_pause_duration_seconds, row.longest_pause_seconds) == expected
+        assert row.pause_unavailable_reason == reason
+    output = capsys.readouterr()
+    assert 'PRIVATE-PROVIDER-PAYLOAD' not in response.text + caplog.text + output.out + output.err
+    assert 'test-only-not-a-real-key' not in response.text + caplog.text + output.out + output.err
+    assert not any(isinstance(value, (list, dict)) for value in body['delivery_metrics'].values())
+    assert set(body['delivery_metrics']) == {
+        'version', 'source', 'pause_count', 'total_pause_duration_seconds', 'longest_pause_seconds', 'unavailable_reason',
+    }
+    assert service.get(created.id) == created
+
+
+def test_transcription_response_schema_preserves_inherited_words_and_adds_delivery_only():
+    baseline = TranscriptionResult.model_json_schema(mode='serialization')
+    response = SessionTranscription.model_json_schema(mode='serialization')
+    # TranscriptionResult and WordTiming are unchanged from the committed base;
+    # response-only additions must preserve all inherited field definitions.
+    for field in ('text', 'language', 'words'):
+        assert response['properties'][field] == baseline['properties'][field]
+    assert response['$defs']['WordTiming'] == baseline['$defs']['WordTiming']
+    assert baseline['properties']['words']['type'] == 'array'
+    assert baseline['properties']['words']['items'] == {'$ref': '#/$defs/WordTiming'}
+    assert set(response['properties']) == set(baseline['properties']) | {
+        'session_id', 'question_index', 'measurement_id', 'metrics', 'delivery_metrics',
+    }
+    assert 'delivery_metrics' in response['required']
