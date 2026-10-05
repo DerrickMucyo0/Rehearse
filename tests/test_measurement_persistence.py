@@ -23,7 +23,9 @@ from app.database_models import (
 )
 from app.main import app
 from app.session_routes import get_session_service
-from app.sessions import AnswerRequest, InterviewSessionService, SessionConflict, SessionNotFound
+from app.sessions import (
+    AttemptRequest, ContinueRequest, InterviewSessionService, SessionConflict, SessionNotFound,
+)
 from app.speaking_metrics import measure_transcription
 from app.transcription import (
     TranscriptionFailed, TranscriptionResult, TranscriptionTimeout,
@@ -80,10 +82,10 @@ def setup(postgres_session_factory):
         app.dependency_overrides.pop(get_transcription_service, None)
 
 
-def transcribe(client, session_id, question_index=0):
+def transcribe(client, session_id, question_index=0, revision=0):
     return client.post(
         f"/api/sessions/{session_id}/transcriptions",
-        data={"question_index": str(question_index)},
+        data={"question_index": str(question_index), "expected_last_attempt_number": str(revision)},
         files={"audio": ("private-recording.webm", b"PRIVATE-SYNTHETIC-AUDIO", "audio/webm")},
     )
 
@@ -119,13 +121,16 @@ def stored_state(factory, session_id):
         )).mappings().one())
         attempts = [dict(row) for row in database.execute(select(QuestionAttempt.__table__).where(
             QuestionAttempt.session_id == session_id,
-        ).order_by(QuestionAttempt.question_index)).mappings()]
+        ).order_by(QuestionAttempt.question_index, QuestionAttempt.attempt_number)).mappings()]
         return session, attempts
 
 
 def advance(service, session_id, count):
     for index in range(count):
-        service.submit_answer(session_id, AnswerRequest(question_index=index, answer=f"Answer {index}"))
+        service.submit_attempt(session_id, index, AttemptRequest(
+            expected_last_attempt_number=0, answer=f"Answer {index}",
+        ))
+        service.continue_question(session_id, index, ContinueRequest(expected_last_attempt_number=1))
 
 
 def test_success_persists_one_exact_original_measurement_with_opaque_uuid(setup, postgres_session_factory):
@@ -203,10 +208,11 @@ def test_measurement_survives_engine_and_service_reconstruction(
     rebuilt_service = InterviewSessionService(rebuilt_factory)
     try:
         assert measurement_rows(rebuilt_factory) == expected_rows
-        updated = rebuilt_service.submit_answer(created.id, AnswerRequest(
-            question_index=0, answer="Durable answer", measurement_id=identifier,
+        updated = rebuilt_service.submit_attempt(created.id, 0, AttemptRequest(
+            expected_last_attempt_number=0, answer="Durable answer", measurement_id=identifier,
         ))
-        assert updated.current_question_index == 1
+        assert updated.session.current_question_index == 0
+        assert updated.attempt.attempt_number == 1
         assert stored_state(rebuilt_factory, created.id)[1][0]["measurement_id"] == identifier
         assert measurement_rows(rebuilt_factory) == expected_rows
     finally:
@@ -243,11 +249,12 @@ def test_typed_answer_never_implicitly_attaches_an_existing_measurement(setup, p
     created = service.start()
     assert transcribe(client, created.id).status_code == 200
     rows_before = measurement_rows(postgres_session_factory)
-    response = client.post(f"/api/sessions/{created.id}/answers", json={
-        "question_index": 0, "answer": "  Typed answer  ",
+    response = client.post(f"/api/sessions/{created.id}/questions/0/attempts", json={
+        "expected_last_attempt_number": 0, "answer": "  Typed answer  ",
     })
-    assert response.status_code == 200
-    assert response.json()["answers"] == ["Typed answer"]
+    assert response.status_code == 201
+    assert response.json()["attempt"]["answer"] == "Typed answer"
+    assert response.json()["session"]["answers"] == []
     assert stored_state(postgres_session_factory, created.id)[1][0]["measurement_id"] is None
     assert measurement_rows(postgres_session_factory) == rows_before
 
@@ -264,11 +271,12 @@ def test_edited_answer_links_exact_original_id_without_recalculating_metrics(set
     assert UUID(second.json()["measurement_id"]) != first_id
     before = measurement_rows(postgres_session_factory)
     edited = "A substantially edited answer without the original filler words"
-    response = client.post(f"/api/sessions/{created.id}/answers", json={
-        "question_index": 0, "answer": f"  {edited}  ", "measurement_id": str(first_id),
+    response = client.post(f"/api/sessions/{created.id}/questions/0/attempts", json={
+        "expected_last_attempt_number": 0, "answer": f"  {edited}  ", "measurement_id": str(first_id),
     })
-    assert response.status_code == 200
-    assert response.json()["answers"] == [edited]
+    assert response.status_code == 201
+    assert response.json()["attempt"]["answer"] == edited
+    assert response.json()["session"]["answers"] == []
     attempt = stored_state(postgres_session_factory, created.id)[1][0]
     assert (attempt["session_id"], attempt["question_index"], attempt["attempt_number"],
             attempt["answer_text"], attempt["measurement_id"]) == (created.id, 0, 1, edited, first_id)
@@ -291,7 +299,7 @@ def test_invalid_measurement_reference_has_uniform_409_and_rolls_back_all_answer
         identifier = uuid4()
     elif invalid_reference == "different_session":
         other = service.start()
-        identifier = service.create_measurement(other.id, 0, metrics_for(fake.result))
+        identifier = service.create_measurement(other.id, 0, metrics_for(fake.result), expected_last_attempt_number=0)
     elif invalid_reference == "different_question":
         # A controlled row provides the wrong context without changing the
         # immutable measurement after insertion or advancing this session.
@@ -306,7 +314,7 @@ def test_invalid_measurement_reference_has_uniform_409_and_rolls_back_all_answer
             database.flush()
             identifier = measurement.id
     else:
-        identifier = service.create_measurement(created.id, initial_answers, metrics_for(fake.result))
+        identifier = service.create_measurement(created.id, initial_answers, metrics_for(fake.result), expected_last_attempt_number=0)
         # Seed a linked row while the current index is unchanged to exercise
         # the explicit already-linked guard before any attempt uniqueness error.
         with postgres_session_factory.begin() as database:
@@ -316,8 +324,8 @@ def test_invalid_measurement_reference_has_uniform_409_and_rolls_back_all_answer
             ))
     before = stored_state(postgres_session_factory, created.id)
     measurements_before = measurement_rows(postgres_session_factory)
-    response = client.post(f"/api/sessions/{created.id}/answers", json={
-        "question_index": initial_answers, "answer": "Rejected", "measurement_id": str(identifier),
+    response = client.post(f"/api/sessions/{created.id}/questions/{initial_answers}/attempts", json={
+        "expected_last_attempt_number": (1 if invalid_reference == "already_linked" else 0), "answer": "Rejected", "measurement_id": str(identifier),
     })
     assert response.status_code == 409
     assert response.json() == {"detail": "Measurement cannot be attached to this answer."}
@@ -332,8 +340,8 @@ def test_malformed_measurement_uuid_is_422_with_no_database_mutation(setup, post
     client, service, _ = setup
     created = service.start()
     before = stored_state(postgres_session_factory, created.id)
-    response = client.post(f"/api/sessions/{created.id}/answers", json={
-        "question_index": 0, "answer": "Rejected", "measurement_id": identifier,
+    response = client.post(f"/api/sessions/{created.id}/questions/0/attempts", json={
+        "expected_last_attempt_number": 0, "answer": "Rejected", "measurement_id": identifier,
     })
     assert response.status_code == 422
     assert stored_state(postgres_session_factory, created.id) == before
@@ -346,13 +354,14 @@ def test_real_link_cannot_be_reused_on_later_question(setup, postgres_session_fa
     transcription = transcribe(client, created.id)
     assert transcription.status_code == 200
     identifier = transcription.json()["measurement_id"]
-    first = client.post(f"/api/sessions/{created.id}/answers", json={
-        "question_index": 0, "answer": "First", "measurement_id": identifier,
+    first = client.post(f"/api/sessions/{created.id}/questions/0/attempts", json={
+        "expected_last_attempt_number": 0, "answer": "First", "measurement_id": identifier,
     })
-    assert first.status_code == 200
+    assert first.status_code == 201
+    assert service.continue_question(created.id, 0, ContinueRequest(expected_last_attempt_number=1)).current_question_index == 1
     before = stored_state(postgres_session_factory, created.id)
-    second = client.post(f"/api/sessions/{created.id}/answers", json={
-        "question_index": 1, "answer": "Reuse", "measurement_id": identifier,
+    second = client.post(f"/api/sessions/{created.id}/questions/1/attempts", json={
+        "expected_last_attempt_number": 0, "answer": "Reuse", "measurement_id": identifier,
     })
     assert second.status_code == 409
     assert second.json() == {"detail": "Measurement cannot be attached to this answer."}
@@ -361,7 +370,7 @@ def test_real_link_cannot_be_reused_on_later_question(setup, postgres_session_fa
     assert before[1][0]["measurement_id"] == UUID(identifier)
 
 
-def test_fifth_answer_links_and_completes_atomically(setup, postgres_session_factory):
+def test_fifth_attempt_links_then_explicit_continue_completes(setup, postgres_session_factory):
     client, service, _ = setup
     created = service.start()
     advance(service, created.id, 4)
@@ -369,13 +378,17 @@ def test_fifth_answer_links_and_completes_atomically(setup, postgres_session_fac
     assert transcription.status_code == 200
     identifier = UUID(transcription.json()["measurement_id"])
     measurements_before = measurement_rows(postgres_session_factory)
-    response = client.post(f"/api/sessions/{created.id}/answers", json={
-        "question_index": 4, "answer": "Final", "measurement_id": str(identifier),
+    response = client.post(f"/api/sessions/{created.id}/questions/4/attempts", json={
+        "expected_last_attempt_number": 0, "answer": "Final", "measurement_id": str(identifier),
     })
-    assert response.status_code == 200
-    assert response.json()["status"] == "completed"
-    assert response.json()["current_question_index"] == 5
-    assert response.json()["current_question"] is None
+    assert response.status_code == 201
+    assert response.json()["session"]["status"] == "active"
+    assert response.json()["session"]["current_question_index"] == 4
+    assert stored_state(postgres_session_factory, created.id)[0]["completed_at"] is None
+    completed = service.continue_question(created.id, 4, ContinueRequest(expected_last_attempt_number=1))
+    assert completed.status == "completed"
+    assert completed.current_question_index == 5
+    assert completed.current_question is None
     session, attempts = stored_state(postgres_session_factory, created.id)
     assert (session["status"], session["current_question_index"]) == ("completed", 5)
     assert session["completed_at"].tzinfo is not None
@@ -392,7 +405,7 @@ def test_link_flush_or_commit_failure_rolls_back_attempt_progress_and_completion
     _, service, fake = setup
     created = service.start()
     advance(service, created.id, initial_answers)
-    identifier = service.create_measurement(created.id, initial_answers, metrics_for(fake.result))
+    identifier = service.create_measurement(created.id, initial_answers, metrics_for(fake.result), expected_last_attempt_number=0)
     before = stored_state(postgres_session_factory, created.id)
     measurements_before = measurement_rows(postgres_session_factory)
 
@@ -406,8 +419,8 @@ def test_link_flush_or_commit_failure_rolls_back_attempt_progress_and_completion
     failing = InterviewSessionService(sessionmaker(bind=postgres_engine, class_=FailingSession))
     try:
         with pytest.raises(RuntimeError, match="Injected transactional failure"):
-            failing.submit_answer(created.id, AnswerRequest(
-                question_index=initial_answers, answer="Rejected", measurement_id=identifier,
+            failing.submit_attempt(created.id, initial_answers, AttemptRequest(
+                expected_last_attempt_number=0, answer="Rejected", measurement_id=identifier,
             ))
     finally:
         event.remove(FailingSession, failure_stage, fail)
@@ -465,7 +478,7 @@ def test_measurement_flush_or_commit_failure_does_not_leave_a_partial_row(
     failing = InterviewSessionService(sessionmaker(bind=postgres_engine, class_=FailingSession))
     try:
         with pytest.raises(RuntimeError, match="Injected measurement transaction failure"):
-            failing.create_measurement(created.id, 0, metrics_for(fake.result))
+            failing.create_measurement(created.id, 0, metrics_for(fake.result), expected_last_attempt_number=0)
     finally:
         event.remove(FailingSession, failure_stage, fail)
     assert measurement_rows(postgres_session_factory) == []
@@ -488,14 +501,14 @@ def test_create_measurement_rejects_invalid_authoritative_session_context(setup,
         identifier, index, error = created.id, 1, SessionConflict
     before = stored_state(postgres_session_factory, created.id)
     with pytest.raises(error):
-        service.create_measurement(identifier, index, metrics_for(fake.result))
+        service.create_measurement(identifier, index, metrics_for(fake.result), expected_last_attempt_number=0)
     assert measurement_rows(postgres_session_factory) == []
     assert stored_state(postgres_session_factory, created.id) == before
     assert fake.calls == 0
 
 
 @pytest.mark.parametrize("initial_answers", [0, 4])
-def test_no_database_checkout_or_lock_is_held_during_provider_and_advanced_context_is_rejected(
+def test_no_database_checkout_or_lock_is_held_during_provider_and_same_question_revision_is_rejected(
         setup, postgres_engine, postgres_session_factory, initial_answers):
     client, service, fake = setup
     created = service.start()
@@ -512,12 +525,13 @@ def test_no_database_checkout_or_lock_is_held_during_provider_and_advanced_conte
         assert checked_out == set()
         assert postgres_engine.pool.checkedout() == 0
         # A separate connection can acquire this session's row lock while the
-        # synthetic provider is executing, then commit progression/completion.
+        # synthetic provider is executing, then append without advancing.
         with ThreadPoolExecutor(max_workers=1) as executor:
-            updated = executor.submit(service.submit_answer, created.id, AnswerRequest(
-                question_index=initial_answers, answer="Other tab accepted",
+            updated = executor.submit(service.submit_attempt, created.id, initial_answers, AttemptRequest(
+                expected_last_attempt_number=0, answer="Other tab accepted",
             )).result(timeout=3)
-        assert updated.current_question_index == initial_answers + 1
+        assert updated.session.current_question_index == initial_answers
+        assert updated.session.current_question_latest_attempt_number == 1
         assert checked_out == set()
 
     fake.during_provider = during_provider
@@ -533,34 +547,37 @@ def test_no_database_checkout_or_lock_is_held_during_provider_and_advanced_conte
         event.remove(postgres_engine, "checkin", checkin)
     assert measurement_rows(postgres_session_factory) == []
     stored, attempts = stored_state(postgres_session_factory, created.id)
-    assert stored["current_question_index"] == initial_answers + 1
+    assert stored["current_question_index"] == initial_answers
+    assert stored["status"] == "active"
     assert attempts[-1]["answer_text"] == "Other tab accepted"
     assert fake.calls == 1
 
 
-def test_session_advancing_after_metric_calculation_is_revalidated_before_insert(
+def test_attempt_appended_after_metric_calculation_is_revalidated_before_measurement_insert(
         setup, postgres_session_factory, monkeypatch):
     import app.session_routes as routes
 
     client, service, fake = setup
     created = service.start()
 
-    def calculate_then_advance(*args):
+    def calculate_then_append(*args):
         metrics = measure_transcription(*args)
-        service.submit_answer(created.id, AnswerRequest(question_index=0, answer="Won the race"))
+        service.submit_attempt(created.id, 0, AttemptRequest(expected_last_attempt_number=0, answer="Won the race"))
         return metrics
 
-    monkeypatch.setattr(routes, "measure_transcription", calculate_then_advance)
+    monkeypatch.setattr(routes, "measure_transcription", calculate_then_append)
     response = transcribe(client, created.id)
     assert response.status_code == 409
     assert measurement_rows(postgres_session_factory) == []
-    assert service.get(created.id).answers == ["Won the race"]
+    assert service.get(created.id).answers == []
+    assert service.get(created.id).current_question_latest_attempt_number == 1
+    assert service.get_attempts(created.id, 0)[0].answer == "Won the race"
     assert fake.calls == 1
 
 
 def test_measurement_creation_waits_for_session_row_lock_then_rechecks_context(
         setup, postgres_engine, postgres_session_factory):
-    """Observe a real blocker before allowing an answer to advance the row."""
+    """Observe a real blocker before committing a same-question revision change."""
     _, service, fake = setup
     created = service.start()
     started = Event()
@@ -576,7 +593,7 @@ def test_measurement_creation_waits_for_session_row_lock_then_rechecks_context(
 
     def create_measurement():
         try:
-            results["measurement_id"] = service.create_measurement(created.id, 0, metrics_for(fake.result))
+            results["measurement_id"] = service.create_measurement(created.id, 0, metrics_for(fake.result), expected_last_attempt_number=0)
         except Exception as error:
             errors["measurement"] = error
 
@@ -605,7 +622,6 @@ def test_measurement_creation_waits_for_session_row_lock_then_rechecks_context(
             holding.add(QuestionAttempt(
                 session_id=created.id, question_index=0, attempt_number=1, answer_text="Accepted while locked",
             ))
-            stored.current_question_index = 1
             holding.flush()
         worker.join(10)
         assert not worker.is_alive()
@@ -616,17 +632,21 @@ def test_measurement_creation_waits_for_session_row_lock_then_rechecks_context(
     assert isinstance(errors.get("measurement"), SessionConflict)
     assert results == {}
     assert measurement_rows(postgres_session_factory) == []
-    assert service.get(created.id).answers == ["Accepted while locked"]
+    restored = service.get(created.id)
+    assert restored.current_question_index == 0
+    assert restored.current_question_latest_attempt_number == 1
+    assert restored.answers == []
+    assert service.get_attempts(created.id, 0)[0].answer == "Accepted while locked"
 
 
 def test_concurrent_submissions_attach_once_and_preserve_session_locking(setup, postgres_session_factory):
     _, service, fake = setup
     created = service.start()
-    identifier = service.create_measurement(created.id, 0, metrics_for(fake.result))
+    identifier = service.create_measurement(created.id, 0, metrics_for(fake.result), expected_last_attempt_number=0)
     before = measurement_rows(postgres_session_factory)
     with ThreadPoolExecutor(max_workers=2) as executor:
-        futures = [executor.submit(service.submit_answer, created.id, AnswerRequest(
-            question_index=0, answer=f"Concurrent answer {index}", measurement_id=identifier,
+        futures = [executor.submit(service.submit_attempt, created.id, 0, AttemptRequest(
+            expected_last_attempt_number=0, answer=f"Concurrent answer {index}", measurement_id=identifier,
         )) for index in range(2)]
         successes, failures = [], []
         for future in futures:
@@ -636,8 +656,127 @@ def test_concurrent_submissions_attach_once_and_preserve_session_locking(setup, 
                 failures.append(error)
     assert len(successes) == len(failures) == 1
     session, attempts = stored_state(postgres_session_factory, created.id)
-    assert session["current_question_index"] == 1
+    assert session["current_question_index"] == 0
+    assert session["completed_at"] is None
     assert len(attempts) == 1
     assert attempts[0]["measurement_id"] == identifier
-    assert attempts[0]["answer_text"] == successes[0].answers[0]
+    assert attempts[0]["answer_text"] == successes[0].attempt.answer
     assert measurement_rows(postgres_session_factory) == before
+
+
+def test_retry_attempts_keep_separate_explicit_measurements_and_typed_retry_is_unmeasured(
+        setup, postgres_session_factory):
+    client, service, fake = setup
+    created = service.start()
+    first = transcribe(client, created.id)
+    assert first.status_code == 200
+    first_id = UUID(first.json()["measurement_id"])
+    first_metrics = first.json()["metrics"]
+    first_attempt = service.submit_attempt(created.id, 0, AttemptRequest(
+        expected_last_attempt_number=0, answer="Edited first answer", measurement_id=first_id,
+    ))
+    initial_attempt = stored_state(postgres_session_factory, created.id)[1][0]
+    initial_measurement = measurement_rows(postgres_session_factory)[0]
+    fake.result = TranscriptionResult(text="A new retry transcript", language="eng")
+    second = transcribe(client, created.id, revision=1)
+    assert second.status_code == 200
+    second_id = UUID(second.json()["measurement_id"])
+    assert second_id != first_id
+    second_attempt = service.submit_attempt(created.id, 0, AttemptRequest(
+        expected_last_attempt_number=1, answer="Edited retry answer", measurement_id=second_id,
+    ))
+    typed_attempt = service.submit_attempt(created.id, 0, AttemptRequest(
+        expected_last_attempt_number=2, answer="Typed third answer",
+    ))
+    state, attempts = stored_state(postgres_session_factory, created.id)
+    assert [item["attempt_number"] for item in attempts] == [1, 2, 3]
+    assert [item["measurement_id"] for item in attempts] == [first_id, second_id, None]
+    assert attempts[0] == initial_attempt
+    assert [item.id for item in service.get_attempts(created.id, 0)] == [
+        first_attempt.attempt.id, second_attempt.attempt.id, typed_attempt.attempt.id,
+    ]
+    rows = measurement_rows(postgres_session_factory)
+    assert len(rows) == 2
+    assert next(item for item in rows if item["id"] == first_id) == initial_measurement
+    assert metrics_projection(initial_measurement) == first_metrics
+    assert metrics_projection(next(item for item in rows if item["id"] == second_id)) == second.json()["metrics"]
+    assert (state["current_question_index"], state["status"], state["completed_at"]) == (0, "active", None)
+    assert service.get(created.id).answers == []
+    assert service.get(created.id).current_question_latest_attempt_number == 3
+    assert fake.calls == 2
+
+
+def test_linked_measurement_cannot_be_reused_for_retry_on_same_question(setup, postgres_session_factory):
+    client, service, _ = setup
+    created = service.start()
+    response = transcribe(client, created.id)
+    assert response.status_code == 200
+    measurement_id = response.json()["measurement_id"]
+    accepted = client.post(f"/api/sessions/{created.id}/questions/0/attempts", json={
+        "expected_last_attempt_number": 0, "answer": "First", "measurement_id": measurement_id,
+    })
+    assert accepted.status_code == 201
+    before = stored_state(postgres_session_factory, created.id)
+    measurements_before = measurement_rows(postgres_session_factory)
+    rejected = client.post(f"/api/sessions/{created.id}/questions/0/attempts", json={
+        "expected_last_attempt_number": 1, "answer": "Retry", "measurement_id": measurement_id,
+    })
+    assert rejected.status_code == 409
+    assert rejected.json() == {"detail": "Measurement cannot be attached to this answer."}
+    assert stored_state(postgres_session_factory, created.id) == before
+    assert measurement_rows(postgres_session_factory) == measurements_before
+
+
+def test_stale_transcription_revision_rejected_before_provider(setup, postgres_session_factory):
+    client, service, fake = setup
+    created = service.start()
+    service.submit_attempt(created.id, 0, AttemptRequest(
+        expected_last_attempt_number=0, answer="Accepted first attempt",
+    ))
+    before = stored_state(postgres_session_factory, created.id)
+    response = transcribe(client, created.id, revision=0)
+    assert response.status_code == 409
+    assert fake.calls == 0
+    assert measurement_rows(postgres_session_factory) == []
+    assert stored_state(postgres_session_factory, created.id) == before
+
+
+@pytest.mark.parametrize("failure_stage", ["after_flush_postexec", "before_commit"])
+def test_failed_measured_retry_keeps_prior_attempt_and_measurement_unchanged(
+        setup, postgres_engine, postgres_session_factory, failure_stage):
+    _, service, fake = setup
+    created = service.start()
+    first_id = service.create_measurement(
+        created.id, 0, metrics_for(fake.result), expected_last_attempt_number=0,
+    )
+    service.submit_attempt(created.id, 0, AttemptRequest(
+        expected_last_attempt_number=0, answer="Saved first attempt", measurement_id=first_id,
+    ))
+    retry_id = service.create_measurement(
+        created.id, 0, metrics_for(fake.result), expected_last_attempt_number=1,
+    )
+    before = stored_state(postgres_session_factory, created.id)
+    measurements_before = measurement_rows(postgres_session_factory)
+
+    class FailingSession(Session):
+        pass
+
+    def fail(*args):
+        raise RuntimeError("Injected retry failure")
+
+    event.listen(FailingSession, failure_stage, fail)
+    failing = InterviewSessionService(sessionmaker(bind=postgres_engine, class_=FailingSession))
+    try:
+        with pytest.raises(RuntimeError, match="Injected retry failure"):
+            failing.submit_attempt(created.id, 0, AttemptRequest(
+                expected_last_attempt_number=1, answer="Rejected retry", measurement_id=retry_id,
+            ))
+    finally:
+        event.remove(FailingSession, failure_stage, fail)
+    assert stored_state(postgres_session_factory, created.id) == before
+    assert measurement_rows(postgres_session_factory) == measurements_before
+    accepted = service.submit_attempt(created.id, 0, AttemptRequest(
+        expected_last_attempt_number=1, answer="Successful retry", measurement_id=retry_id,
+    ))
+    assert accepted.attempt.attempt_number == 2
+    assert accepted.attempt.measurement_id == retry_id

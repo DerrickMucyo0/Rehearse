@@ -58,14 +58,24 @@ def validate_audio(upload: UploadFile, session_id: UUID, question_index: int) ->
 
 
 @asynccontextmanager
-async def validated_audio(bounded: Request, session_id: UUID):
+async def validated_audio(bounded: Request, session_id: UUID, *, require_attempt_revision: bool = False):
     """Share multipart shape/audio validation and file lifetime across audio operations."""
-    async with bounded.form(max_files=1, max_fields=1, max_part_size=1024) as form:
+    async with bounded.form(max_files=1, max_fields=2 if require_attempt_revision else 1, max_part_size=1024) as form:
         upload = form.get("audio")
         index = form.get("question_index")
-        if (set(form) != {"audio", "question_index"} or
+        fields = {"audio", "question_index"}
+        if require_attempt_revision:
+            fields.add("expected_last_attempt_number")
+        if (set(form) != fields or
                 not isinstance(upload, UploadFile) or not isinstance(index, str) or
                 not index.isascii() or not index.isdecimal() or len(index) > 9):
             raise HTTPException(422, "Provide an audio file and a non-negative question_index.")
+        expected = None
+        if require_attempt_revision:
+            revision = form.get("expected_last_attempt_number")
+            if (not isinstance(revision, str) or not revision.isascii() or
+                    not revision.isdecimal() or len(revision) > 10):
+                raise HTTPException(422, "Provide a non-negative expected_last_attempt_number.")
+            expected = int(revision)
         metadata = validate_audio(upload, session_id, int(index))
-        yield upload, metadata
+        yield upload, metadata, expected

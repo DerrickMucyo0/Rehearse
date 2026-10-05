@@ -10,7 +10,7 @@ from starlette.datastructures import Headers, UploadFile
 from app.audio import MAX_AUDIO_BYTES, MAX_BODY_BYTES
 from app.main import app
 from app.session_routes import get_session_service
-from app.sessions import AnswerRequest, InterviewSessionService
+from app.sessions import AttemptRequest, ContinueRequest, InterviewSessionService
 from app.transcription import (
     ElevenLabsTranscriptionService, TranscriptionFailed, TranscriptionResult,
     TranscriptionTimeout, TranscriptionUnavailable, get_transcription_service,
@@ -58,8 +58,9 @@ def setup(postgres_session_factory):
         app.dependency_overrides.clear()
 
 
-def post(client, session_id, index='0', audio=b'fake audio', mime='audio/webm;codecs=opus'):
-    return client.post(f'/api/sessions/{session_id}/transcriptions', data={'question_index': index},
+def post(client, session_id, index='0', audio=b'fake audio', mime='audio/webm;codecs=opus', revision='0'):
+    return client.post(f'/api/sessions/{session_id}/transcriptions',
+                       data={'question_index': index, 'expected_last_attempt_number': revision},
                        files={'audio': ('../../private.webm', audio, mime)})
 
 
@@ -83,9 +84,13 @@ def test_success_does_not_advance_and_closes_file(setup):
     assert service.get(session.id) == session
     assert fake.calls[0][1:] == ('answer-1.webm', b'fake audio')
     assert fake.calls[0][0].file.closed
-    assert client.post(f'/api/sessions/{session.id}/answers', json={
-        'question_index': 0, 'answer': 'Edited transcript',
-    }).json()['current_question_index'] == 1
+    submitted = client.post(f'/api/sessions/{session.id}/questions/0/attempts', json={
+        'expected_last_attempt_number': 0, 'answer': 'Edited transcript',
+        'measurement_id': measurement_id,
+    })
+    assert submitted.status_code == 201
+    assert submitted.json()['session']['current_question_index'] == 0
+    assert submitted.json()['attempt']['measurement_id'] == measurement_id
 
 
 def test_complete_metrics_belong_to_original_transcription_not_edited_answer(setup):
@@ -107,11 +112,13 @@ def test_complete_metrics_belong_to_original_transcription_not_edited_answer(set
         'timing_unavailable_reason': None,
     }
     edited = 'A different longer answer without any filler words'
-    submitted = client.post(f'/api/sessions/{session.id}/answers', json={
-        'question_index': 0, 'answer': edited,
+    submitted = client.post(f'/api/sessions/{session.id}/questions/0/attempts', json={
+        'expected_last_attempt_number': 0, 'answer': edited,
+        'measurement_id': body['measurement_id'],
     })
-    assert submitted.status_code == 200
-    assert submitted.json()['answers'] == [edited]
+    assert submitted.status_code == 201
+    assert submitted.json()['attempt']['answer'] == edited
+    assert submitted.json()['session']['answers'] == []
     assert 'metrics' not in submitted.json()
     assert fake.result.model_dump() == original
     assert body['metrics']['recognized_word_count'] == 2
@@ -171,7 +178,8 @@ def test_unknown_session(setup):
 def test_wrong_question(setup, index):
     client, service, fake = setup
     session = service.start()
-    service.submit_answer(session.id, AnswerRequest(question_index=0, answer='First'))
+    service.submit_attempt(session.id, 0, AttemptRequest(expected_last_attempt_number=0, answer='First'))
+    service.continue_question(session.id, 0, ContinueRequest(expected_last_attempt_number=1))
     assert post(client, session.id, index=index).status_code == 409
     assert fake.calls == []
 
@@ -180,7 +188,8 @@ def test_completed_session(setup):
     client, service, fake = setup
     session = service.start()
     for index in range(5):
-        service.submit_answer(session.id, AnswerRequest(question_index=index, answer='Answer'))
+        service.submit_attempt(session.id, index, AttemptRequest(expected_last_attempt_number=0, answer='Answer'))
+        service.continue_question(session.id, index, ContinueRequest(expected_last_attempt_number=1))
     assert post(client, session.id, index='5').status_code == 409
     assert fake.calls == []
 
@@ -238,7 +247,10 @@ def test_missing_configuration_uses_real_adapter_without_network(setup):
 def test_question_advanced_during_provider_call(setup):
     client, service, fake = setup
     session = service.start()
-    fake.after = lambda: service.submit_answer(session.id, AnswerRequest(question_index=0, answer='Other tab'))
+    def advance():
+        service.submit_attempt(session.id, 0, AttemptRequest(expected_last_attempt_number=0, answer='Other tab'))
+        service.continue_question(session.id, 0, ContinueRequest(expected_last_attempt_number=1))
+    fake.after = advance
     assert post(client, session.id).status_code == 409
     assert fake.calls[0][0].file.closed
     assert service.get(session.id).answers == ['Other tab']
@@ -538,3 +550,53 @@ def test_actual_route_default_dependency(setup, monkeypatch, capsys, outcome):
         assert 'stage=provider_request provider_status=403 category=authorization' in output
     if outcome == 'mapping_failure':
         assert 'stage=result_mapping provider_status=unavailable category=validation' in output
+
+
+@pytest.mark.parametrize('revision', ['', '-1', '+1', '1.5', 'true', ' 0 ', '١', '9' * 100])
+def test_invalid_transcription_revision_never_calls_provider(setup, revision):
+    client, service, fake = setup
+    session = service.start()
+    result = post(client, session.id, revision=revision)
+    assert result.status_code == 422
+    assert fake.calls == []
+    assert service.get(session.id) == session
+
+
+def test_transcription_revision_required_before_provider(setup):
+    client, service, fake = setup
+    session = service.start()
+    response = client.post(f'/api/sessions/{session.id}/transcriptions',
+                           data={'question_index': '0'},
+                           files={'audio': ('answer.webm', b'fake audio', 'audio/webm')})
+    assert response.status_code == 422
+    assert fake.calls == []
+    assert service.get(session.id) == session
+
+
+def test_same_question_attempt_during_provider_rejects_stale_transcription_and_closes_file(setup):
+    client, service, fake = setup
+    session = service.start()
+    fake.after = lambda: service.submit_attempt(session.id, 0, AttemptRequest(
+        expected_last_attempt_number=0, answer='Other tab',
+    ))
+    result = post(client, session.id)
+    assert result.status_code == 409
+    assert fake.calls[0][0].file.closed
+    current = service.get(session.id)
+    assert current.current_question_index == 0
+    assert current.current_question_latest_attempt_number == 1
+    assert current.answers == []
+
+
+def test_transcription_requires_authoritative_revision_after_retry(setup):
+    client, service, fake = setup
+    session = service.start()
+    service.submit_attempt(session.id, 0, AttemptRequest(
+        expected_last_attempt_number=0, answer='First attempt',
+    ))
+    assert post(client, session.id, revision='0').status_code == 409
+    assert fake.calls == []
+    assert post(client, session.id, revision='1').status_code == 200
+    assert len(fake.calls) == 1
+    assert service.get(session.id).current_question_index == 0
+    assert service.get(session.id).current_question_latest_attempt_number == 1
