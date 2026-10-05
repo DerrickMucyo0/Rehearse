@@ -3,7 +3,14 @@
 Rehearse is a communication practice platform in development for interviews,
 public speaking, negotiations, and presentations. The current prototype supports
 interviews with five fixed questions, typed or transcribed drafts, append-only attempts,
-Retry, deterministic Before/After comparison, and explicit Continue to completion.
+Retry, deterministic Before/After comparison, explicit Continue to completion,
+browser-local History, and an objective Progress dashboard.
+
+Current product loop: **Speak → Transcribe → Measure → Persist → Retry → Compare
+→ History → Progress**. Typed practice is also supported. Transcription creates
+an immutable measurement; Submit Attempt saves reviewed text and optionally links
+that exact measurement. Continue finalizes the question. History and Progress read
+persisted facts without making provider requests.
 
 ## Current architecture
 
@@ -66,8 +73,9 @@ attempt. Retrieved attempts contain `id`, `question_index`, `attempt_number`, `a
 After completion, the index equals the question count and `current_question` is null.
 
 Sessions and submitted attempts survive backend restart/reload in PostgreSQL and
-are shared across backend workers. The browser keeps only the session identifier in
-tab-scoped `sessionStorage`; drafts, recordings, and measurements are not stored there.
+are shared across backend workers. Current Practice restoration keeps only the session
+identifier in tab-scoped `sessionStorage`; drafts, recordings, and measurements are
+not stored there. The separate browser-local History registry is described below.
 Reload fetches session state and current-question attempts: zero attempts opens the
 composer, saved attempts open review, and a completed session restores completion.
 Unsaved drafts are discarded on reload; restoration requires browser tab storage.
@@ -86,6 +94,152 @@ failed review load blocks mutations until **Recheck saved state**. Recheck perfo
 reads only: it restores a saved success or permits a manual retry when the same question
 and revision remain current. Pending actions and duplicate clicks are guarded.
 
+## Session History and Progress
+
+Navigation offers **Practice**, **History**, and **Progress**. Practice stays mounted
+across safe navigation, preserving idle typed drafts, same-draft measurement
+association, saved review, and retry composing state. Leaving Practice is blocked
+during microphone permission, recording/finalization, upload, transcription, Attempt
+submission, Continue, conflict reconciliation, and ambiguous recovery/Recheck.
+
+### Sessions remembered on this browser
+
+History discovers sessions only through this browser's `localStorage` registry:
+
+```text
+rehearse.history.v1:<canonical lowercase session UUID> = "1"
+```
+
+The registry stores opaque session UUID capability keys only: no answers, questions,
+measurements, measurement IDs, summaries, recordings, or provider content. The
+current Practice ID remains separately in `sessionStorage`. Successful session
+creation and verified Practice restoration register the session. Removing or clearing
+remembered History removes local discovery keys; it does not delete PostgreSQL records,
+clear the active Practice restoration ID, or discard its safe draft.
+
+History is device/profile/origin-bound, not an account-owned server list. Authentication
+and cross-device account history are not implemented. Anyone possessing a session UUID
+can access that session under the existing prototype access model; local discovery is
+not an authorization check. There is no server-wide session enumeration endpoint.
+
+The normal registration cap is 500 remembered IDs, without automatic eviction; an
+already remembered ID remains usable at capacity. This browser-local cap is a soft
+limit under concurrent-tab writes. Storage failures warn without blocking Practice.
+Malformed keys are ignored safely. Other-tab storage events for the History namespace
+refresh its registry and invalidate cached reads. Missing server sessions stay visible
+and locally removable; an empty registry says “No sessions are remembered on this
+browser yet,” without implying that no server sessions exist.
+
+### Scoped, read-only History API
+
+| Method | Endpoint | Contract |
+| --- | --- | --- |
+| POST | `/api/history/summaries` | Body `{"session_ids":["<session UUID>"]}`; 1–50 explicitly supplied UUIDs per batch, with canonical deduplication after the raw-list size check. Returns `summaries` and `missing_session_ids` only for requested IDs. |
+| GET | `/api/sessions/{session_id}/history-detail` | One explicitly supplied session UUID. Returns its summary and question overview; answer text is returned only for an explicitly selected question's bounded attempt page. |
+
+There is no `GET /api/sessions` list or wildcard History read. Summaries omit answer
+and question text. The new History/Progress measurement DTOs expose nine persisted
+scalar/provenance/availability fields, with no measurement UUID or raw provider data.
+Detail without `question_index` returns no attempt text. Its optional zero-based
+`question_index` selects one question; `limit` defaults to 10 and is bounded to 1–20.
+The positive `after_attempt_number` cursor requires a selected question and returns
+attempts with greater persisted numbers, ascending. `has_more` and
+`next_after_attempt_number` describe the next page; numbering gaps are safe.
+Malformed requests return sanitized 422 errors; unknown detail resources return 404.
+Stored-integrity errors return 500 and database/configuration unavailability returns
+503, without echoing supplied values, stored content, credentials, or exception text.
+New History responses, including errors and method rejection, use
+`Cache-Control: no-store`; browser read requests also use `cache: 'no-store'`.
+
+History reads use an operation-local read-only, repeatable-read transaction, without
+session write locks or provider inference. Summaries are ordered by persisted
+`last_saved_activity_at` descending, then session UUID ascending. This timestamp is
+the maximum of creation, latest submission, and completion timestamps; earlier
+Continue operations have no separately stored activity timestamp. Each batch/detail
+response has one database snapshot; separate hydration batches can have separate
+snapshots. Browser hydration
+batches remembered IDs in groups of at most 50, with at most three concurrent reads,
+and applies that ordering globally across batches, preserving timestamp microseconds.
+Detail shows finalized/current/upcoming questions and paginates saved attempts; only
+a finalized question's final attempt is marked Final. Stale responses are suppressed.
+
+### Final attempts and count definitions
+
+A final attempt is the **greatest persisted `attempt_number` for a finalized
+question**. Continue makes a question finalized; the current open question's latest
+attempt remains provisional. Earlier finalized questions of an active session are
+stable and included. `final_attempt_id` in detail is a derived response field;
+no `final_attempt_id` database column exists or is needed.
+
+`total_attempt_count` counts actual persisted attempt rows.
+`questions_practiced_count` counts distinct questions with an attempt, including
+the current question. **`total_retry_count = total_attempt_count -
+questions_practiced_count`**. Retry counts never substitute `MAX(attempt_number)` for
+row counts; a numbering gap does not invent attempts.
+
+### Objective Progress projection
+
+Progress means objective persisted facts. Its overview counts completed sessions,
+active sessions, finalized questions, saved attempts, saved retries, and measured
+final answers. Session status supplies the first two counts; the remaining counts
+sum their respective summary fields. These are facts about remembered sessions,
+without a judgment about retry frequency or practice quality.
+
+One measurement row is **one final attempt of one finalized question**, supplied
+only by backend `finalized_points`. Superseded retries, open-question attempts,
+unsaved drafts, unlinked recordings, and measurements from earlier attempts are
+excluded. If a measured attempt is superseded by a typed final, no earlier measurement
+is substituted. Progress never recomputes values from edited answer text.
+
+Five chronological tables show recognized words, um count, uh count, timed speech
+span (seconds), and estimated WPM (words/minute), with date/time, question number,
+session status, and attempt number. Rows sort by persisted `submitted_at` ascending,
+then session UUID, question index, and attempt number. Raw UUIDs are not displayed in
+the primary UI. Counts display as integers; span and WPM use up to one decimal place
+for presentation. Exact stored floats remain unchanged internally.
+
+Measured rows form separate cohorts for each exact
+`(measurement_version, measurement_source)` tuple. The current version is
+`speaking-metrics-v1`, with source `original_transcription` (displayed as Original
+transcription). Different versions/sources never form one continuous series or
+cross-cohort numeric comparison. Typed finals have `measurement: null`; they remain
+finalized answers and appear in a separate no-measurement group as
+**Unavailable — No measurement** for every speech metric.
+
+**0 is real measured zero; null is unavailable.** Stored filler/timing reasons map
+to factual explanations: Unsupported language, Missing timings, Timing coverage
+mismatch, Invalid timing, Invalid timing order, or Unusable span. Unknown future
+reasons display Unavailable without inventing a cause. Recognized words use their
+stored count independently of filler/timing availability. Each metric reports
+coverage as available values out of all finalized points in that cohort, including
+unavailable points; zero is available. The separate no-measurement group reports
+zero available out of its typed/unmeasured final points.
+
+There are no averages, medians, trend slopes, charts, communication/confidence/
+readiness/answer-quality scores, semantic improvement claims, or better/worse
+judgments. Metric magnitude has no quality color coding. Tables have captions,
+column headers, explicit units, and readable provenance/unavailable text.
+
+### Shared hydration and completeness
+
+History and Progress share one memory-only hydration owner; switching between them
+does not duplicate current summary reads. Complete hydration permits overview
+totals for available remembered sessions, with an explicit caveat for missing server
+sessions. Partial, loading, or error hydration hides totals; partial results say
+“Progress totals are unavailable until all remembered sessions load.” Loaded points
+remain visible as loaded-session facts. Errors offer retry, and failed-chunk retry
+retains successes and requests only failed remembered chunks. Reload history reads
+all remembered IDs again.
+
+Session creation, successful Attempt/Continue, authoritative recovery, registration,
+removal, clearing, relevant storage events, and explicit reload invalidate the cache.
+Reads resume on safe History/Progress navigation, without polling or background
+timers. Unlinked transcription alone changes no History DTO and does not invalidate
+it. Writes elsewhere that emit no History storage event require explicit Reload
+history. Clearing discards in-memory reads even if local storage fails; retained IDs
+then reload safely. This milestone requires no schema change or migration and adds
+no provider requests or provider persistence.
+
 ## Local frontend setup
 
 Use Node.js 24 LTS with npm (also used by CI). From the project root:
@@ -100,8 +254,9 @@ Open `http://localhost:5173`. Run the backend in a separate terminal.
 To type-check and build: `npm run build`. To lint: `npm run lint`.
 To run frontend regression tests: `npm test`.
 
-For the real-browser App integration test, keep the local frontend and backend
-running as above/below, then run from `frontend/`:
+For the real-browser integration suite, keep local frontend and backend services
+running against an isolated disposable PostgreSQL database, with provider credentials
+unset, then run from `frontend/`:
 
 ```sh
 npx playwright install chromium
@@ -109,11 +264,21 @@ npm run test:integration
 ```
 
 Alternatively, set `PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH` to an installed Chrome
-executable. This test uses real API requests and creates sessions in the configured
-database. It checks Attempt 1 staying on Question 1, Retry to Attempt 2, comparison,
-explicit Continue through all questions, reload reconstruction, completion, and restart.
-It uses typed answers and blocks external page requests; no transcription/provider call
-is required. Failure traces are written to ignored `test-results/`.
+executable. These tests make real localhost API requests and create sessions in the
+configured isolated database. They cover retry/completion/reload, browser-local History
+and paginated detail, and typed-final Progress with preserved Practice state. External
+page requests are blocked; no audio/transcription route or provider call is required.
+Failure traces are written to ignored `test-results/`.
+
+The fourth configured test requires `REHEARSE_E2E_MEASURED_SESSION_ID`: an opaque UUID
+of a provider-free fixture in that same isolated database. It expects active Question 2,
+two saved attempts (finalized Question 1 plus open Question 2), and Question 1's exact
+linked `speaking-metrics-v1` / `original_transcription` values: 12 recognized words,
+um 0, uh 1, 12.5 seconds, and 57.6 WPM. It is skipped when the fixture ID is absent.
+The release audit supplies this fixture through the existing persistence service and
+an execution-local test harness using the validated dedicated test database/role;
+the backend never falls back from `DATABASE_URL` to `TEST_DATABASE_URL`. No provider,
+schema, or application configuration change is needed.
 
 ## Local backend setup
 
@@ -272,7 +437,8 @@ measurements remain unlinked; the frontend does not synchronously delete them.
 
 Every saved trimmed attempt is durable text. No audio, second
 original-transcription text copy or word timings are stored. There are no user
-accounts, semantic scoring, or session-history dashboard. Hosting remains provider-neutral;
+accounts or semantic scoring. The browser-local History and objective Progress reads
+described above reuse this schema. Hosting remains provider-neutral;
 no Supabase-specific APIs are used. Issue #9 remains open and frozen.
 
 ### Deterministic Before/After comparison
@@ -526,8 +692,9 @@ implemented.
 The panel states: “Based on your original recording. Editing the transcript won’t
 change these measurements.” Measurements describe the original transcribed recording;
 editing the draft does not recalculate them. The backend stores their exact unrounded
-values in an immutable `transcription_measurements` record tagged `speaking-metrics-v1`;
-there is no session-history dashboard. The response supplies an opaque `measurement_id`
+values in an immutable `transcription_measurements` record tagged `speaking-metrics-v1`.
+History and Progress read only measurements explicitly linked to saved attempts;
+Progress uses finalized questions only. The response supplies an opaque `measurement_id`
 that the frontend keeps beside the draft and preserves through same-draft edits,
 including delete/retype. A replacement recording clears them immediately, a new
 successful transcription replaces them, and leaving the question/session clears them.
@@ -637,9 +804,9 @@ started. The backend deadline bounds how long Rehearse waits.
 
 This remains a local prototype without authentication or rate limits. Keep the
 key-enabled backend local. Speaking Metrics v1 adds no semantic scoring, coaching
-judgments, adaptive interviewing, pause diagnosis, longitudinal progress tracking,
-or a history dashboard. Immutable measurement snapshots and all saved attempts are
-persistent; there is no longitudinal progress interpretation. Timing remains unavailable
+judgments, adaptive interviewing, or pause diagnosis. Browser-local History and
+Progress now display persisted facts over time without semantic interpretation.
+Immutable measurement snapshots and all saved attempts are persistent. Timing remains unavailable
 when evidence is insufficient. Realtime transcription, Nemotron, AI follow-ups, TTS,
 and authentication remain absent.
 

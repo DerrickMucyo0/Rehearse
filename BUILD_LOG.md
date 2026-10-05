@@ -528,3 +528,93 @@ Final verification with PostgreSQL required:
   historical build-log entries are preserved.
 - No release-blocking code defect found. Zero live provider calls; Issue #9 research
   and held-out data untouched. No new commit, push, PR or merge during this audit.
+
+## Session History + Progress Dashboard — Completed milestone and release audit
+
+- Branch: `feat/session-history-dashboard`, based on the merged Retry + Before/After
+  Comparison milestone. Earlier entries retain their historical scope and results.
+- Four slices: capability-scoped backend History reads; browser-local registry,
+  navigation and detail; deterministic Progress projection/dashboard; documentation
+  and release-class audit. Schema decision: **NO_MIGRATION_REQUIRED**. Database
+  models and migration `0001_database_foundation` are byte-identical to `main`;
+  no new migration, authentication, owner columns, dependencies or CI changes.
+
+| Slice | Commit | Subject / status |
+| --- | --- | --- |
+| 1 — History API | `19addbb8241bc06a524d1ea13b9d4813937f1411` | `feat(history): add capability-scoped session history reads` |
+| 2 — Browser History/detail | `221d8a5a2d72b80b529649a10b932a59f977c7b0` | `feat(history): add browser-local history and session detail` |
+| 3 — Progress | `4895f2b169c9b0c8939eace3987afeb7fbd1c190` | `feat(progress): add deterministic practice progress dashboard` |
+| 4 — Documentation/audit | Not committed | README, this record, and the test-only readiness correction below; no commit made during the audit. |
+
+- Backend: `POST /api/history/summaries` reads only explicitly supplied UUIDs, with
+  raw batch size 1–50, canonical deduplication and explicit missing IDs. No global
+  session list or wildcard read exists. Summaries select no answer text. Scoped
+  detail returns question overviews and only the selected question's bounded
+  attempt page (default 10, maximum 20), using persisted-number cursors. New DTOs
+  omit measurement UUIDs/raw provider data; success/error/method responses are
+  sanitized and `Cache-Control: no-store`. Each operation uses a read-only,
+  repeatable-read snapshot without provider work or write locks.
+- Final attempt is the greatest persisted attempt number for a finalized question;
+  final identity is derived, without a new column. Earlier finalized questions of
+  active sessions are included; the open question remains provisional. Counts use
+  actual attempt rows and practiced questions, with retries = attempts − practiced
+  questions. Numbering gaps do not create phantom attempts.
+- Browser: only `rehearse.history.v1:<canonical UUID> = "1"` capability keys enter
+  History localStorage. Current Practice restoration remains in sessionStorage.
+  Registration has a 500-ID soft cap, no eviction, and nonblocking storage errors.
+  Remove/clear affect local discovery only, preserve active Practice, and never
+  delete PostgreSQL records. Cross-tab storage events refresh the registry; missing
+  sessions remain visible/removable. Ownership remains browser/device/profile-bound,
+  with existing UUID bearer access and no cross-device account history.
+- Shared hydration batches at most 50 IDs with three concurrent reads, globally
+  orders summaries by stored activity/UUID, suppresses stale responses, and retains
+  successes during failed-chunk retry. History and Progress share one memory-only
+  cache. Successful persisted Practice writes/recovery, registry changes, storage
+  events and explicit reload invalidate it. Reads wait for safe navigation; unlinked
+  transcription alone does not change History facts. No polling/background timer.
+- Progress uses only backend `finalized_points` and exact attempt-linked immutable
+  measurements. Superseded retries/open attempts/edited text never supply metrics.
+  Overview shows objective counts. Five individual tables sort by persisted
+  submission time (including microseconds), UUID, question and attempt number;
+  exact version/source cohorts remain separate. Typed finals remain an explicit
+  no-measurement group. Null stays unavailable; measured zero stays zero. Stored
+  floats are retained, with presentation-only rounding and factual unavailable
+  reasons. Coverage includes unavailable rows within each group. Incomplete
+  hydration hides overview totals and labels loaded rows. No averages, medians,
+  charts, scores, semantic improvement claims or quality color coding.
+- Practice stays mounted across safe navigation, preserving draft/measurement,
+  review and retry state. Permission, recording/finalization, upload, transcription,
+  submit/Continue, reconciliation and ambiguous recovery/Recheck block navigation.
+- Slice 4 found a test-only readiness race in `frontend/src/App.test.tsx`: the
+  static Session detail heading was mistaken for completion of its async overview
+  read. The regression now deliberately delays that read, asserts the loading state
+  and absence of question controls, and awaits the actual Question 1 button. Existing
+  saved-answer/final-badge/draft-identity checks remain. No runtime defect or runtime
+  change was needed. Additional commit-boundary file is this existing test file.
+
+Final verification (2026-10-05):
+
+- Focused frontend History/Progress/storage/hydration/Practice tests: 241 passed.
+  Database-free backend History tests with warnings as errors: 158 passed.
+- Full frontend after the readiness correction: 385 passed, 0 failed. TypeScript/
+  Vite build passed; Oxlint passed with zero warnings.
+- All configured browser E2E: 4 passed, 0 failed, 0 skipped, using isolated PostgreSQL,
+  provider credentials removed and a compatible browser outside the repository.
+  Includes typed retry/completion/reload, History/detail, typed-final Progress and
+  a service-created immutable measured fixture proving zero/units/open-point exclusion.
+- Full backend with PostgreSQL required and warnings as errors: 712 passed,
+  0 failed, 0 skipped. Covers History isolation, actual counts, final provenance,
+  bounded paging, read-only snapshots/concurrency, reconstruction, existing schema
+  upgrade/downgrade, session rollback and measurement association.
+- Cumulative and working-tree `git diff --check` passed. Audit fingerprinting confirms
+  all runtime/schema/migration/other test/dependency/CI files unchanged during Slice 4;
+  only README, BUILD_LOG and the explicit readiness regression changed. No secrets,
+  temp files, build/browser artifacts, database dumps or sensitive provider fixtures
+  were added to the milestone diff. Language audit found no unsupported History/
+  Progress claims; negative scope statements and unrelated historical wording remain.
+- **RELEASE_CLASSIFICATION: READY_FOR_PR**. No unresolved release blocker. Browser-local
+  ownership, bearer UUID access, the concurrent-tab soft cap and snapshot refresh
+  limitations remain explicit; external writes without a History event need Reload.
+- Provider calls: **0** (Nemotron 0, ElevenLabs 0, other external providers 0).
+  `feat/nemotron-interviewer` remains unchanged; Issue #9 remains open/frozen and
+  held-out research sealed/uninspected. No commit, push, PR or merge during this audit.
