@@ -16,6 +16,7 @@ Both timing metrics are unavailable unless coverage and intervals are usable.
 import math
 import re
 from collections.abc import Sequence
+from dataclasses import dataclass
 from typing import Annotated, Literal, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -83,6 +84,31 @@ def measure_transcription(
 def _timing_metrics(
     tokens: list[str], words: Sequence[RecognizedWordTiming],
 ) -> tuple[float | None, float | None, TimingUnavailableReason | None]:
+    validated, unavailable = _validated_timings(tokens, words)
+    if validated is None:
+        return None, None, unavailable
+    return validated.span, validated.pace, None
+
+
+@dataclass(frozen=True)
+class ValidatedTimings:
+    """Call-local lexical intervals and the unchanged speaking-v1 timing values."""
+
+    words: tuple[RecognizedWordTiming, ...]
+    span: float
+    pace: float
+
+
+def validate_transcription_timings(
+    text: str, words: Sequence[RecognizedWordTiming],
+) -> tuple[ValidatedTimings | None, TimingUnavailableReason | None]:
+    """Share speaking-v1 eligibility and failure precedence with derived metrics."""
+    return _validated_timings(_WORD.findall(text), words)
+
+
+def _validated_timings(
+    tokens: list[str], words: Sequence[RecognizedWordTiming],
+) -> tuple[ValidatedTimings | None, TimingUnavailableReason | None]:
     eligible = []
     timed_tokens = []
     for word in words:
@@ -90,24 +116,24 @@ def _timing_metrics(
         if not lexical:
             continue
         if len(lexical) != 1:
-            return None, None, "timing_coverage_mismatch"
+            return None, "timing_coverage_mismatch"
         # Normal WordTiming validation already guarantees these interval rules;
         # keep the pure function defensive against unvalidated internal inputs.
         if any(type(value) not in (int, float) or not math.isfinite(value) or value < 0
                for value in (word.start, word.end)) or word.end < word.start:
-            return None, None, "invalid_timing"
+            return None, "invalid_timing"
         if eligible and word.start < eligible[-1].end:
-            return None, None, "invalid_timing_order"
+            return None, "invalid_timing_order"
         eligible.append(word)
         timed_tokens.append(lexical[0])
     if not eligible:
-        return None, None, "missing_timings"
+        return None, "missing_timings"
     if timed_tokens != tokens:
-        return None, None, "timing_coverage_mismatch"
+        return None, "timing_coverage_mismatch"
     span = float(eligible[-1].end - eligible[0].start)
     if span <= 0 or not math.isfinite(span):
-        return None, None, "unusable_span"
+        return None, "unusable_span"
     pace = len(tokens) * 60 / span
     if not math.isfinite(pace) or pace <= 0:
-        return None, None, "unusable_span"
-    return span, pace, None
+        return None, "unusable_span"
+    return ValidatedTimings(tuple(eligible), span, pace), None
