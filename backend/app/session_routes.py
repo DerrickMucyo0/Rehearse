@@ -3,15 +3,20 @@ from functools import lru_cache
 from typing import Annotated
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, Request, Response
+from fastapi import APIRouter, Depends, HTTPException, Path, Query, Request, Response
 from pydantic import Field
 from starlette.concurrency import run_in_threadpool
 
 from app.audio import AudioAccepted, bounded_multipart_request, validated_audio
+from app.comparisons import AttemptComparison
 from app.database import create_database_engine, create_session_factory
 from app.speaking_metrics import SpeakingMetrics, measure_transcription
 from app.sessions import (
-    AnswerRequest,
+    Attempt,
+    AttemptRequest,
+    AttemptSubmission,
+    ContinueRequest,
+    InvalidComparisonSelection,
     InterviewSession,
     InterviewSessionService,
     SessionConflict,
@@ -51,26 +56,71 @@ def get_session(session_id: UUID, sessions: SessionService) -> InterviewSession:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
-@router.post("/{session_id}/answers", response_model=InterviewSession)
-def submit_answer(
-    session_id: UUID, answer: AnswerRequest, sessions: SessionService
-) -> InterviewSession:
+@router.post(
+    "/{session_id}/questions/{question_index}/attempts", response_model=AttemptSubmission, status_code=201,
+)
+def submit_attempt(
+    session_id: UUID, question_index: Annotated[int, Path(ge=0)],
+    answer: AttemptRequest, sessions: SessionService,
+) -> AttemptSubmission:
     try:
-        return sessions.submit_answer(session_id, answer)
+        return sessions.submit_attempt(session_id, question_index, answer)
     except SessionNotFound as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except SessionConflict as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
+@router.post("/{session_id}/questions/{question_index}/continue", response_model=InterviewSession)
+def continue_question(
+    session_id: UUID, question_index: Annotated[int, Path(ge=0)],
+    request: ContinueRequest, sessions: SessionService,
+) -> InterviewSession:
+    try:
+        return sessions.continue_question(session_id, question_index, request)
+    except SessionNotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except SessionConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@router.get("/{session_id}/questions/{question_index}/attempts", response_model=list[Attempt])
+def get_attempts(
+    session_id: UUID, question_index: Annotated[int, Path(ge=0)], sessions: SessionService,
+) -> list[Attempt]:
+    try:
+        return sessions.get_attempts(session_id, question_index)
+    except SessionNotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.get("/{session_id}/questions/{question_index}/comparison", response_model=AttemptComparison)
+def get_comparison(
+    session_id: UUID, question_index: Annotated[int, Path(ge=0)], sessions: SessionService,
+    before: Annotated[int | None, Query(ge=1)] = None,
+    after: Annotated[int | None, Query(ge=1)] = None,
+) -> AttemptComparison:
+    try:
+        return sessions.get_comparison(session_id, question_index, before=before, after=after)
+    except SessionNotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except InvalidComparisonSelection as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
 @asynccontextmanager
-async def current_audio(session_id: UUID, request: Request, sessions: InterviewSessionService):
+async def current_audio(
+    session_id: UUID, request: Request, sessions: InterviewSessionService,
+    *, require_attempt_revision: bool = False,
+):
     try:
         await run_in_threadpool(sessions.get, session_id)
         bounded = await bounded_multipart_request(request)
-        async with validated_audio(bounded, session_id) as (upload, metadata):
-            await run_in_threadpool(sessions.validate_current_question, session_id, metadata.question_index)
-            yield upload, metadata
+        async with validated_audio(
+            bounded, session_id, require_attempt_revision=require_attempt_revision,
+        ) as (upload, metadata, expected):
+            await run_in_threadpool(sessions.validate_current_question, session_id, metadata.question_index, expected)
+            yield upload, metadata, expected
     except SessionNotFound as exc:
         raise HTTPException(404, str(exc)) from exc
     except SessionConflict as exc:
@@ -79,7 +129,7 @@ async def current_audio(session_id: UUID, request: Request, sessions: InterviewS
 
 @router.post("/{session_id}/audio", response_model=AudioAccepted)
 async def accept_audio(session_id: UUID, request: Request, sessions: SessionService) -> AudioAccepted:
-    async with current_audio(session_id, request, sessions) as (_, metadata):
+    async with current_audio(session_id, request, sessions) as (_, metadata, _):
         return metadata
 
 
@@ -98,7 +148,9 @@ async def transcribe_audio(
     session_id: UUID, request: Request, sessions: SessionService,
     transcriber: Annotated[TranscriptionService, Depends(get_transcription_service)],
 ) -> SessionTranscription:
-    async with current_audio(session_id, request, sessions) as (upload, metadata):
+    async with current_audio(
+        session_id, request, sessions, require_attempt_revision=True,
+    ) as (upload, metadata, expected):
         try:
             result = await transcriber.transcribe(upload, metadata.filename)
         except TranscriptionUnavailable:
@@ -112,6 +164,7 @@ async def transcribe_audio(
         # Its session lock prevents stale measurement insertion during submission.
         measurement_id = await run_in_threadpool(
             sessions.create_measurement, session_id, metadata.question_index, metrics,
+            expected_last_attempt_number=expected,
         )
         return SessionTranscription(
             session_id=session_id, question_index=metadata.question_index, **result.model_dump(),

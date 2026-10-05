@@ -95,3 +95,39 @@ button:disabled {
 .speaking-measurements dd {
   margin: 0;
 }
+
+.attempt-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+  margin: 1rem 0;
+}
+
+.saved-attempts,
+.attempt-comparison {
+  margin: 1.5rem 0;
+  text-align: left;
+}
+
+.saved-answer {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.comparison-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-variant-numeric: tabular-nums;
+}
+
+.comparison-table th,
+.comparison-table td {
+  padding: 0.5rem;
+  border-bottom: 1px solid #526174;
+  vertical-align: top;
+  overflow-wrap: anywhere;
+}
+
+.comparison-table small {
+  display: block;
+}

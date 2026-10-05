@@ -1,0 +1,91 @@
+import { useId } from 'react'
+import type { AttemptComparison as Comparison, ComparisonMetrics, MetricChange } from './interviewApi'
+
+type SideReason = NonNullable<MetricChange['before_unavailable_reason']>
+type ComparisonReason = NonNullable<MetricChange['comparison_unavailable_reason']>
+
+const sideReasons: Record<SideReason, string> = {
+  no_measurement: 'No linked speaking measurement.',
+  unsupported_language: 'Filler counts are unavailable for this language.',
+  missing_timings: 'Word timings were not available.',
+  timing_coverage_mismatch: 'Word timings do not cover the recognized words.',
+  invalid_timing: 'Word timings were not usable.',
+  invalid_timing_order: 'Word timings were not in a usable order.',
+  unusable_span: 'A speaking duration could not be calculated from the word timings.',
+}
+
+const comparisonReasons: Record<ComparisonReason, string> = {
+  measurement_version_mismatch: 'Measurement versions differ.',
+  measurement_source_incompatible: 'Measurement sources are incompatible.',
+  before_unavailable: 'The before measurement is unavailable.',
+  after_unavailable: 'The after measurement is unavailable.',
+  both_unavailable: 'Both measurements are unavailable.',
+}
+
+const metrics: { key: keyof ComparisonMetrics; label: string; decimals: 0 | 1 }[] = [
+  { key: 'recognized_word_count', label: 'Recognized words', decimals: 0 },
+  { key: 'um_count', label: 'Um', decimals: 0 },
+  { key: 'uh_count', label: 'Uh', decimals: 0 },
+  { key: 'timed_utterance_span_seconds', label: 'Speaking duration', decimals: 1 },
+  { key: 'estimated_words_per_minute', label: 'Words per minute', decimals: 1 },
+]
+
+function formatValue(value: number, decimals: 0 | 1): string {
+  return value.toFixed(decimals)
+}
+
+function formatDelta(value: number, decimals: 0 | 1): string {
+  if (value === 0) return '0'
+  // Keep the original delta's sign even when its displayed magnitude rounds to zero.
+  return `${value > 0 ? '+' : '-'}${formatValue(Math.abs(value), decimals)}`
+}
+
+function MeasurementCell({ value, reason, decimals }: {
+  value: number | null
+  reason: MetricChange['before_unavailable_reason']
+  decimals: 0 | 1
+}) {
+  return <td>
+    {value === null ? <>
+      Unavailable
+      {reason !== null && <small>{sideReasons[reason]}</small>}
+    </> : formatValue(value, decimals)}
+  </td>
+}
+
+export default function AttemptComparison({ comparison }: { comparison: Comparison }) {
+  const headingId = useId()
+  const data = comparison.comparison
+  if (data === null) return null
+
+  return <section className="attempt-comparison" aria-labelledby={headingId}>
+    <h3 id={headingId}>Before / After comparison</h3>
+    <p>
+      Before: Attempt {comparison.before_attempt?.attempt_number}.
+      {' '}After: Attempt {comparison.after_attempt?.attempt_number}.
+    </p>
+    <table className="comparison-table">
+      <caption>Speaking duration is shown in seconds.</caption>
+      <thead><tr>
+        <th scope="col">Metric</th>
+        <th scope="col">Before</th>
+        <th scope="col">After</th>
+        <th scope="col">Change</th>
+      </tr></thead>
+      <tbody>{metrics.map(({ key, label, decimals }) => {
+        const metric = data[key]
+        return <tr key={key}>
+          <th scope="row">{label}</th>
+          <MeasurementCell value={metric.before} reason={metric.before_unavailable_reason} decimals={decimals} />
+          <MeasurementCell value={metric.after} reason={metric.after_unavailable_reason} decimals={decimals} />
+          <td>{metric.comparable && metric.delta !== null ? formatDelta(metric.delta, decimals) : <>
+            Unavailable
+            {metric.comparison_unavailable_reason !== null && <small>
+              {comparisonReasons[metric.comparison_unavailable_reason]}
+            </small>}
+          </>}</td>
+        </tr>
+      })}</tbody>
+    </table>
+  </section>
+}

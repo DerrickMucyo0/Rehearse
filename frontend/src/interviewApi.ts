@@ -3,38 +3,201 @@ export interface InterviewSession {
   status: 'active' | 'completed'
   current_question_index: number
   current_question: string | null
+  current_question_latest_attempt_number: number
   questions: string[]
   answers: string[]
 }
 
-async function requestSession(path: string, options?: RequestInit): Promise<InterviewSession> {
+export interface Attempt {
+  id: string
+  question_index: number
+  attempt_number: number
+  answer: string
+  submitted_at: string
+  measurement_id: string | null
+}
+
+export interface AttemptSubmission {
+  attempt: Attempt
+  session: InterviewSession
+}
+
+export type TimingUnavailableReason = 'missing_timings' | 'timing_coverage_mismatch' | 'invalid_timing' | 'invalid_timing_order' | 'unusable_span'
+export type MetricUnavailableReason = 'no_measurement' | 'unsupported_language' | TimingUnavailableReason
+export type ComparisonUnavailableReason = 'measurement_version_mismatch' | 'measurement_source_incompatible' | 'before_unavailable' | 'after_unavailable' | 'both_unavailable'
+
+export interface MetricChange {
+  before: number | null
+  after: number | null
+  delta: number | null
+  before_unavailable_reason: MetricUnavailableReason | null
+  after_unavailable_reason: MetricUnavailableReason | null
+  comparable: boolean
+  comparison_unavailable_reason: ComparisonUnavailableReason | null
+}
+
+export interface ComparisonMetrics {
+  recognized_word_count: MetricChange
+  um_count: MetricChange
+  uh_count: MetricChange
+  timed_utterance_span_seconds: MetricChange
+  estimated_words_per_minute: MetricChange
+}
+
+export interface ComparedAttempt {
+  id: string
+  attempt_number: number
+  measurement_id: string | null
+  measurement_version: string | null
+  measurement_source: string | null
+}
+
+export interface AttemptComparison {
+  session_id: string
+  question_index: number
+  before_attempt: ComparedAttempt | null
+  after_attempt: ComparedAttempt | null
+  comparison: ComparisonMetrics | null
+}
+
+export class ApiError extends Error {
+  readonly status: number | null
+  readonly ambiguousWrite: boolean
+
+  constructor(message: string, status: number | null = null, ambiguousWrite = false) {
+    super(message)
+    this.name = 'ApiError'
+    this.status = status
+    this.ambiguousWrite = ambiguousWrite
+  }
+}
+
+export function isConflictError(error: unknown): boolean {
+  return error instanceof ApiError && error.status === 409
+}
+
+function object(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+function nonnegativeInteger(value: unknown): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0
+}
+function nullableString(value: unknown): value is string | null {
+  return value === null || typeof value === 'string'
+}
+function validSession(value: unknown): value is InterviewSession {
+  return object(value) && typeof value.id === 'string' &&
+    (value.status === 'active' || value.status === 'completed') &&
+    nonnegativeInteger(value.current_question_index) && nullableString(value.current_question) &&
+    nonnegativeInteger(value.current_question_latest_attempt_number) &&
+    Array.isArray(value.questions) && value.questions.every((question) => typeof question === 'string') &&
+    Array.isArray(value.answers) && value.answers.every((answer) => typeof answer === 'string')
+}
+function validAttempt(value: unknown): value is Attempt {
+  return object(value) && typeof value.id === 'string' && nonnegativeInteger(value.question_index) &&
+    nonnegativeInteger(value.attempt_number) && value.attempt_number > 0 &&
+    typeof value.answer === 'string' && typeof value.submitted_at === 'string' && nullableString(value.measurement_id)
+}
+
+async function request<T>(path: string, valid: (value: unknown) => value is T, options?: RequestInit): Promise<T> {
+  const write = options?.method === 'POST'
   let response: Response
   try {
     response = await fetch(path, { ...options, signal: AbortSignal.timeout(10000) })
   } catch {
-    throw new Error('Unable to reach the backend. Check your connection and try again.')
+    throw new ApiError('Unable to reach the backend. Check your connection and recheck the interview.', null, write)
   }
   if (!response.ok) {
-    if (response.status === 404) throw new Error('Session not found. The backend may have restarted. Start a new interview.')
-    throw new Error('Unable to update the interview. Please try again.')
+    const messages: Record<number, string> = {
+      404: 'Session or attempt not found. Recheck the interview or start a new one.',
+      409: 'The interview changed. Recheck it before continuing.',
+      422: 'The request was not accepted. Recheck the interview and try again.',
+    }
+    throw new ApiError(messages[response.status] || 'Unable to update the interview. Please try again.', response.status)
   }
-  return response.json() as Promise<InterviewSession>
+  let result: unknown
+  try { result = await response.json() } catch {
+    throw new ApiError('Unexpected backend response. Recheck the interview before continuing.', response.status, write)
+  }
+  if (!valid(result)) {
+    throw new ApiError('Unexpected backend response. Recheck the interview before continuing.', response.status, write)
+  }
+  return result
+}
+
+function questionPath(session: InterviewSession): string {
+  return `/api/sessions/${session.id}/questions/${session.current_question_index}`
+}
+function jsonBody(body: unknown): RequestInit {
+  return { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }
+}
+
+export function getSession(id: string): Promise<InterviewSession> {
+  return request(`/api/sessions/${id}`, (value): value is InterviewSession => validSession(value) && value.id === id)
 }
 
 export function startInterview(): Promise<InterviewSession> {
-  return requestSession('/api/sessions', { method: 'POST' })
+  return request('/api/sessions', validSession, { method: 'POST' })
 }
 
-export async function submitAnswer(session: InterviewSession, answer: string, measurementId?: string | null): Promise<InterviewSession> {
-  // Reconcile after a lost response before retrying a write. The server also
-  // rejects stale indices so simultaneous requests cannot skip a question.
-  const current = await requestSession(`/api/sessions/${session.id}`)
-  if (current.current_question_index !== session.current_question_index) return current
-  return requestSession(`/api/sessions/${session.id}/answers`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ question_index: session.current_question_index, answer,
-      ...(measurementId == null ? {} : { measurement_id: measurementId }) }),
+export function submitAttempt(session: InterviewSession, answer: string, measurementId: string | null = null): Promise<AttemptSubmission> {
+  return request(`${questionPath(session)}/attempts`, (value): value is AttemptSubmission =>
+    object(value) && validAttempt(value.attempt) && validSession(value.session) &&
+    value.session.id === session.id && value.session.current_question_index === session.current_question_index &&
+    value.attempt.question_index === session.current_question_index &&
+    value.attempt.attempt_number === session.current_question_latest_attempt_number + 1 &&
+    value.session.current_question_latest_attempt_number === value.attempt.attempt_number &&
+    value.attempt.measurement_id === measurementId,
+  jsonBody({ answer, expected_last_attempt_number: session.current_question_latest_attempt_number, measurement_id: measurementId }))
+}
+
+export function continueQuestion(session: InterviewSession): Promise<InterviewSession> {
+  return request(`${questionPath(session)}/continue`, (value): value is InterviewSession =>
+    validSession(value) && value.id === session.id && value.current_question_index === session.current_question_index + 1,
+  jsonBody({ expected_last_attempt_number: session.current_question_latest_attempt_number }))
+}
+
+export function getAttempts(session: InterviewSession): Promise<Attempt[]> {
+  return request(`${questionPath(session)}/attempts`, (value): value is Attempt[] =>
+    Array.isArray(value) && value.every((attempt, index) => validAttempt(attempt) &&
+      attempt.question_index === session.current_question_index &&
+      (index === 0 || attempt.attempt_number > value[index - 1].attempt_number)))
+}
+
+const metricReasons: readonly unknown[] = ['no_measurement', 'unsupported_language', 'missing_timings', 'timing_coverage_mismatch', 'invalid_timing', 'invalid_timing_order', 'unusable_span']
+const comparisonReasons: readonly unknown[] = ['measurement_version_mismatch', 'measurement_source_incompatible', 'before_unavailable', 'after_unavailable', 'both_unavailable']
+function validMetricChange(value: unknown): value is MetricChange {
+  if (!object(value)) return false
+  const numeric = (number: unknown) => number === null || (typeof number === 'number' && Number.isFinite(number))
+  return numeric(value.before) && numeric(value.after) && numeric(value.delta) &&
+    (value.before_unavailable_reason === null || metricReasons.includes(value.before_unavailable_reason)) &&
+    (value.after_unavailable_reason === null || metricReasons.includes(value.after_unavailable_reason)) &&
+    typeof value.comparable === 'boolean' &&
+    (value.comparison_unavailable_reason === null || comparisonReasons.includes(value.comparison_unavailable_reason)) &&
+    (value.comparable
+      ? value.before !== null && value.after !== null && value.delta !== null &&
+        value.before_unavailable_reason === null && value.after_unavailable_reason === null && value.comparison_unavailable_reason === null
+      : value.delta === null && value.comparison_unavailable_reason !== null)
+}
+function validComparedAttempt(value: unknown): value is ComparedAttempt {
+  return object(value) && typeof value.id === 'string' && nonnegativeInteger(value.attempt_number) && value.attempt_number > 0 &&
+    nullableString(value.measurement_id) && nullableString(value.measurement_version) && nullableString(value.measurement_source)
+}
+
+export function getComparison(session: InterviewSession, before?: number, after?: number): Promise<AttemptComparison> {
+  const selectors = new URLSearchParams()
+  if (before !== undefined) selectors.set('before', String(before))
+  if (after !== undefined) selectors.set('after', String(after))
+  const suffix = selectors.size ? `?${selectors}` : ''
+  return request(`${questionPath(session)}/comparison${suffix}`, (value): value is AttemptComparison => {
+    if (!object(value) || value.session_id !== session.id || value.question_index !== session.current_question_index ||
+        (value.before_attempt !== null && !validComparedAttempt(value.before_attempt)) ||
+        (value.after_attempt !== null && !validComparedAttempt(value.after_attempt))) return false
+    if (value.comparison === null) return value.after_attempt === null
+    const metrics = value.comparison
+    return validComparedAttempt(value.before_attempt) && validComparedAttempt(value.after_attempt) && object(metrics) &&
+      ['recognized_word_count', 'um_count', 'uh_count', 'timed_utterance_span_seconds', 'estimated_words_per_minute']
+        .every((name) => validMetricChange(metrics[name]))
   })
 }
 
@@ -48,37 +211,38 @@ export interface AudioAccepted {
 }
 
 export async function uploadAudio(session: InterviewSession, audio: Blob, signal: AbortSignal): Promise<AudioAccepted> {
-  const body = audioForm(session, audio)
   let response: Response
   try {
     response = await fetch(`/api/sessions/${session.id}/audio`, {
-      method: 'POST', body, signal: AbortSignal.any([signal, AbortSignal.timeout(30000)]),
+      method: 'POST', body: audioForm(session, audio), signal: AbortSignal.any([signal, AbortSignal.timeout(30000)]),
     })
   } catch {
-    throw new Error('Audio upload failed or timed out. Check your connection and try again.')
+    throw new ApiError('Audio upload failed or timed out. Check your connection and try again.')
   }
   if (!response.ok) {
     const messages: Record<number, string> = {
       404: 'Session not found. Start a new interview.',
-      409: 'This question is no longer current. Record an answer for the current question.',
+      409: 'This question is no longer current. Recheck the interview.',
       413: 'Recording is too large. Record a shorter answer (maximum 10 MiB).',
       415: 'This audio format is not supported. Try another browser or type your answer.',
       422: 'The recording was empty or invalid. Please record again.',
     }
-    throw new Error(messages[response.status] || 'Audio upload failed. Please try again.')
+    throw new ApiError(messages[response.status] || 'Audio upload failed. Please try again.', response.status)
   }
-  const result: AudioAccepted = await response.json()
-  if (result.status !== 'accepted' || result.session_id !== session.id || result.question_index !== session.current_question_index) {
-    throw new Error('Unexpected upload confirmation. Please try again.')
+  let result: unknown
+  try { result = await response.json() } catch { throw new ApiError('Unexpected upload confirmation. Please try again.', response.status) }
+  if (!object(result) || result.status !== 'accepted' || result.session_id !== session.id || result.question_index !== session.current_question_index) {
+    throw new ApiError('Unexpected upload confirmation. Please try again.', response.status)
   }
-  return result
+  return result as unknown as AudioAccepted
 }
 
-function audioForm(session: InterviewSession, audio: Blob): FormData {
+function audioForm(session: InterviewSession, audio: Blob, withRevision = false): FormData {
   const extensions: Record<string, string> = { 'audio/webm': 'webm', 'audio/ogg': 'ogg', 'audio/mp4': 'm4a', 'audio/mpeg': 'mp3', 'audio/wav': 'wav', 'audio/x-wav': 'wav' }
   const extension = extensions[audio.type.split(';')[0]] || 'audio'
   const body = new FormData()
   body.append('question_index', String(session.current_question_index))
+  if (withRevision) body.append('expected_last_attempt_number', String(session.current_question_latest_attempt_number))
   body.append('audio', audio, `answer-${session.current_question_index + 1}.${extension}`)
   return body
 }
@@ -91,13 +255,7 @@ export interface SpeakingMetrics {
   filler_unavailable_reason: 'unsupported_language' | null
   timed_utterance_span_seconds: number | null
   estimated_words_per_minute: number | null
-  timing_unavailable_reason:
-    | 'missing_timings'
-    | 'timing_coverage_mismatch'
-    | 'invalid_timing'
-    | 'invalid_timing_order'
-    | 'unusable_span'
-    | null
+  timing_unavailable_reason: TimingUnavailableReason | null
 }
 
 export interface TranscriptionResult {
@@ -111,34 +269,32 @@ export interface TranscriptionResult {
 }
 
 function validSpeakingMetrics(value: unknown): value is SpeakingMetrics {
-  if (typeof value !== 'object' || value === null) return false
-  const metrics = value as Record<string, unknown>
-  const count = (number: unknown) => typeof number === 'number' && Number.isSafeInteger(number) && number >= 0
+  if (!object(value)) return false
   const positive = (number: unknown) => typeof number === 'number' && Number.isFinite(number) && number > 0
   const timingReasons: unknown[] = ['missing_timings', 'timing_coverage_mismatch', 'invalid_timing', 'invalid_timing_order', 'unusable_span']
-  return metrics.source === 'original_transcription' && count(metrics.recognized_word_count) &&
-    (metrics.filler_unavailable_reason === null
-      ? count(metrics.um_count) && count(metrics.uh_count)
-      : metrics.filler_unavailable_reason === 'unsupported_language' && metrics.um_count === null && metrics.uh_count === null) &&
-    (metrics.timing_unavailable_reason === null
-      ? positive(metrics.timed_utterance_span_seconds) && positive(metrics.estimated_words_per_minute)
-      : timingReasons.includes(metrics.timing_unavailable_reason) && metrics.timed_utterance_span_seconds === null && metrics.estimated_words_per_minute === null)
+  return value.source === 'original_transcription' && nonnegativeInteger(value.recognized_word_count) &&
+    (value.filler_unavailable_reason === null
+      ? nonnegativeInteger(value.um_count) && nonnegativeInteger(value.uh_count)
+      : value.filler_unavailable_reason === 'unsupported_language' && value.um_count === null && value.uh_count === null) &&
+    (value.timing_unavailable_reason === null
+      ? positive(value.timed_utterance_span_seconds) && positive(value.estimated_words_per_minute)
+      : timingReasons.includes(value.timing_unavailable_reason) && value.timed_utterance_span_seconds === null && value.estimated_words_per_minute === null)
 }
 
 export async function transcribeAudio(session: InterviewSession, audio: Blob, signal: AbortSignal): Promise<TranscriptionResult> {
   let response: Response
   try {
     response = await fetch(`/api/sessions/${session.id}/transcriptions`, {
-      method: 'POST', body: audioForm(session, audio),
+      method: 'POST', body: audioForm(session, audio, true),
       signal: AbortSignal.any([signal, AbortSignal.timeout(75000)]),
     })
   } catch {
-    throw new Error('Transcription failed or timed out. Check your connection and try again.')
+    throw new ApiError('Transcription failed or timed out. Check your connection and recheck the interview.', null, true)
   }
   if (!response.ok) {
     const messages: Record<number, string> = {
       404: 'Session not found. Start a new interview.',
-      409: 'This question is no longer current. Record an answer for the current question.',
+      409: 'The interview changed. Recheck it before recording another answer.',
       413: 'Recording is too large. Record a shorter answer (maximum 10 MiB).',
       415: 'This audio format is not supported. Try another browser or type your answer.',
       422: 'The recording was empty or invalid. Please record again.',
@@ -146,17 +302,20 @@ export async function transcribeAudio(session: InterviewSession, audio: Blob, si
       503: 'Transcription is not configured on the server. You can still type your answer.',
       504: 'Transcription timed out. Please try again or type your answer.',
     }
-    throw new Error(messages[response.status] || 'Transcription failed. Please try again.')
+    throw new ApiError(messages[response.status] || 'Transcription failed. Please try again.', response.status)
   }
-  const result: TranscriptionResult = await response.json()
-  if (typeof result?.text !== 'string' || !result.text.trim() || result.text.length > 10000 ||
+  let result: unknown
+  try { result = await response.json() } catch {
+    throw new ApiError('No usable transcript was returned. Recheck the interview before continuing.', response.status, true)
+  }
+  if (!object(result) || typeof result.text !== 'string' || !result.text.trim() || result.text.length > 10000 ||
       result.session_id !== session.id || result.question_index !== session.current_question_index ||
       typeof result.measurement_id !== 'string' ||
       !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(result.measurement_id)) {
-    throw new Error('No usable transcript was returned. Please try again or type your answer.')
+    throw new ApiError('No usable transcript was returned. Please try again or type your answer.', response.status, true)
   }
   if (!validSpeakingMetrics(result.metrics)) {
-    throw new Error('No usable speaking measurements were returned. Please try again or type your answer.')
+    throw new ApiError('No usable speaking measurements were returned. Please try again or type your answer.', response.status, true)
   }
-  return result
+  return result as unknown as TranscriptionResult
 }

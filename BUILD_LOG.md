@@ -457,3 +457,74 @@ Verification against local PostgreSQL 18.6 (Postgres.app):
 - `git diff --check` passed. Schema definitions and migration bytes remain unchanged;
   speaking-metrics formulas and provider implementations/configuration are unchanged.
   Zero live provider calls; Issue #9/held-out data untouched. No commit, push, PR or merge.
+
+## Retry + Before/After Comparison — Completed milestone and release audit
+
+The earlier session and measurement entries describe their historical slices. This
+milestone replaces immediate answer advancement with explicit attempt review and
+Continue; it also preserves measurement association through all same-draft edits.
+
+- Architecture: submitting an attempt is not finalizing a question. Attempt 1,
+  retries and later attempts append immutable rows and remain on the same question.
+  Continue requires a saved attempt and is the only operation that advances or
+  completes the interview. The old `/answers` mutation is retired (404).
+- Both mutations require `expected_last_attempt_number` from the backend's
+  `current_question_latest_attempt_number`. The owning session row lock validates
+  the current question and revision; submission assigns `MAX + 1`. Competing
+  submissions, duplicate Continue and Retry-versus-Continue races accept only one
+  mutation for a given revision. Flush/commit failures roll back atomically;
+  different sessions proceed independently without a process-global lock.
+- Transcription checks the revision before inference and again before measurement
+  persistence, including when the question index has not changed. Provider work
+  stays outside database transactions and locks. Each voice draft gets its own
+  immutable measurement; attempts attach only the exact unused UUID for their
+  session/question. Typed attempts have null measurement IDs.
+- Read-only comparison defaults to Attempt 1 versus latest and supports explicit
+  ordered selectors, including Attempt 3+. A single SQL read follows exact
+  attempt-linked measurements. Five metrics use stored unrounded values and
+  `after - before`; unavailable values remain null and measured zero remains zero.
+  Version/source incompatibility prevents comparison. Before / After / Change is
+  neutral numeric information, without scores or quality judgments.
+- The frontend reconstructs composing, review and completion from persisted facts.
+  Retry and Cancel Retry are local transitions; previous attempts remain visible.
+  A fresh draft clears text, measurement UUID, metrics, Blob, errors and recorder
+  resources, and invalidates late asynchronous results. Same-draft edits preserve
+  provenance; replacement recordings and fresh retries cannot reuse it.
+- Session restoration stores only a safe identifier in tab-scoped sessionStorage.
+  HTTP 409 reconciles authoritative state without resending. Uncertain writes or
+  failed review loads block mutations until read-only Recheck saved state; it
+  reconstructs a committed result or permits an explicit manual retry. Pending
+  actions have synchronous duplicate-click guards.
+- No schema/migration, speaking-metric formula, provider configuration, dependency
+  or CI changes. No audio, timing arrays or provider payloads are persisted.
+  Existing session-ID access and retention limitations remain; no auth, semantic
+  scoring or session-history dashboard is introduced.
+
+Implementation commits:
+
+- `d7c6b3a` — append-only attempt lifecycle.
+- `f7f7384` — deterministic persisted comparison.
+- `83af824` — frontend retry/review/comparison flow.
+
+Final verification with PostgreSQL required:
+
+- Focused executable-schema and migration suite, warnings as errors: 80 passed,
+  0 failed, 0 skipped; real upgrade/downgrade and ORM/migration alignment verified.
+- Full backend suite, warnings as errors: 505 passed, 0 failed, 0 skipped. Coverage
+  includes reconstruction, Attempt 3+, observed PostgreSQL lock contention in both
+  Retry/Continue race orders, rollback, stale same-question transcription, exact
+  measurement provenance/reuse rejection, and comparison precision/availability.
+- Frontend: 144 tests passed; build and lint passed. Mocked media/transcription
+  tests cover draft cleanup, late results, revision conflicts, uncertain writes,
+  completed reload and neutral comparison rendering.
+- Real-browser retry E2E: 1 passed using the existing compatible browser outside
+  the repository and the disposable PostgreSQL database. Verified Attempt 1 stays
+  on Question 1, Retry saves Attempt 2, comparison appears, explicit Continue
+  advances through final completion, and reload/restart reconstruct correctly.
+  No audio/transcription route or external browser request was made.
+- Cumulative and documentation `git diff --check` passed. Schema/migration,
+  runtime, test, formula, dependency and CI fingerprints were unchanged during
+  this documentation-only audit. README now describes the completed lifecycle;
+  historical build-log entries are preserved.
+- No release-blocking code defect found. Zero live provider calls; Issue #9 research
+  and held-out data untouched. No new commit, push, PR or merge during this audit.

@@ -35,8 +35,13 @@ def test_accepts_audio_without_mutating_session(client):
         'content_type': 'audio/webm;codecs=opus', 'size_bytes': 11, 'status': 'accepted',
     }
     assert client.get(f"/api/sessions/{session['id']}").json() == session
-    assert client.post(f"/api/sessions/{session['id']}/answers", json={
-        'question_index': 0, 'answer': 'Typed answer still works',
+    submitted = client.post(f"/api/sessions/{session['id']}/questions/0/attempts", json={
+        'expected_last_attempt_number': 0, 'answer': 'Typed answer still works',
+    })
+    assert submitted.status_code == 201
+    assert submitted.json()['session']['current_question_index'] == 0
+    assert client.post(f"/api/sessions/{session['id']}/questions/0/continue", json={
+        'expected_last_attempt_number': 1,
     }).json()['current_question_index'] == 1
 
 
@@ -47,14 +52,24 @@ def test_unknown_session(client):
 @pytest.mark.parametrize('index', [0, 2])
 def test_wrong_question(client, index):
     session = client.post('/api/sessions').json()
-    client.post(f"/api/sessions/{session['id']}/answers", json={'question_index': 0, 'answer': 'First'})
+    assert client.post(f"/api/sessions/{session['id']}/questions/0/attempts", json={
+        'expected_last_attempt_number': 0, 'answer': 'First',
+    }).status_code == 201
+    assert client.post(f"/api/sessions/{session['id']}/questions/0/continue", json={
+        'expected_last_attempt_number': 1,
+    }).status_code == 200
     assert upload(client, session['id'], index=index).status_code == 409
 
 
 def test_completed_session(client):
     session = client.post('/api/sessions').json()
     for index in range(5):
-        client.post(f"/api/sessions/{session['id']}/answers", json={'question_index': index, 'answer': 'Answer'})
+        assert client.post(f"/api/sessions/{session['id']}/questions/{index}/attempts", json={
+            'expected_last_attempt_number': 0, 'answer': 'Answer',
+        }).status_code == 201
+        assert client.post(f"/api/sessions/{session['id']}/questions/{index}/continue", json={
+            'expected_last_attempt_number': 1,
+        }).status_code == 200
     assert upload(client, session['id'], index=5).status_code == 409
 
 
@@ -127,7 +142,7 @@ def test_temporary_files_closed_on_success_and_rejection(client, monkeypatch):
 
 def test_rechecks_current_question_after_transfer(client, monkeypatch):
     import app.session_routes as routes
-    from app.sessions import AnswerRequest
+    from app.sessions import AttemptRequest, ContinueRequest
 
     original = routes.bounded_multipart_request
     service = app.dependency_overrides[get_session_service]()
@@ -135,7 +150,10 @@ def test_rechecks_current_question_after_transfer(client, monkeypatch):
 
     async def advance_during_transfer(request):
         bounded = await original(request)
-        service.submit_answer(session.id, AnswerRequest(question_index=0, answer='Concurrent answer'))
+        service.submit_attempt(session.id, 0, AttemptRequest(
+            expected_last_attempt_number=0, answer='Concurrent answer',
+        ))
+        service.continue_question(session.id, 0, ContinueRequest(expected_last_attempt_number=1))
         return bounded
 
     monkeypatch.setattr(routes, 'bounded_multipart_request', advance_during_transfer)

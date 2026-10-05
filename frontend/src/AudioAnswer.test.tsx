@@ -3,9 +3,9 @@ import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testi
 import { afterEach, beforeEach, expect, test, vi } from 'vitest'
 import AudioAnswer from './AudioAnswer'
 import Interview from './Interview'
-import type { InterviewSession, SpeakingMetrics } from './interviewApi'
+import type { Attempt, InterviewSession, SpeakingMetrics } from './interviewApi'
 
-const session: InterviewSession = { id: 'session-1', status: 'active', current_question_index: 0, current_question: 'Question', questions: ['Question'], answers: [] }
+const session: InterviewSession = { id: 'session-1', status: 'active', current_question_index: 0, current_question: 'Question', current_question_latest_attempt_number: 0, questions: ['Question'], answers: [] }
 let stopTrack: ReturnType<typeof vi.fn>
 let getUserMedia: ReturnType<typeof vi.fn>
 let media: MediaStream
@@ -34,6 +34,7 @@ class Recorder {
 }
 
 beforeEach(() => {
+  sessionStorage.clear()
   Recorder.instances = []
   Recorder.isTypeSupported.mockImplementation((type) => type === 'audio/webm;codecs=opus')
   stopTrack = vi.fn()
@@ -43,7 +44,7 @@ beforeEach(() => {
   vi.stubGlobal('MediaRecorder', Recorder)
   vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new Error('Unmocked network is forbidden in tests')))
 })
-afterEach(() => { cleanup(); vi.unstubAllGlobals(); vi.restoreAllMocks(); vi.useRealTimers() })
+afterEach(() => { cleanup(); sessionStorage.clear(); vi.unstubAllGlobals(); vi.restoreAllMocks(); vi.useRealTimers() })
 
 function show() { return render(<AudioAnswer session={session} disabled={false} hasAnswer={false} onTranscript={vi.fn()} onInvalidateMeasurement={vi.fn()} onTranscribing={vi.fn()} />) }
 async function record() {
@@ -57,6 +58,97 @@ async function finish() {
 function accepted() {
   return new Response(JSON.stringify({ status: 'accepted', session_id: session.id, question_index: 0,
     filename: 'answer-1.webm', content_type: 'audio/webm;codecs=opus', size_bytes: 5 }))
+}
+
+// Deterministic mocked backend: saving appends, while Continue alone advances.
+function interviewFetch({ active = session, transcriptions = [], submissionError = null }: {
+  active?: InterviewSession
+  transcriptions?: (Response | Promise<Response>)[]
+  submissionError?: number | null
+} = {}) {
+  let current = active
+  const histories = new Map<number, Attempt[]>()
+  const persistedMetrics = new Map<string, SpeakingMetrics>()
+  const fetchMock = vi.fn(async (url: string, options?: RequestInit) => {
+    const json = (value: unknown, status = 200) => new Response(JSON.stringify(value), { status })
+    if (url === '/api/sessions') {
+      current = active
+      histories.clear()
+      return json(current, 201)
+    }
+    if (url === `/api/sessions/${active.id}`) return json(current)
+    if (url === `/api/sessions/${active.id}/transcriptions`) {
+      const response = await transcriptions.shift()
+      if (!response) throw new Error('No mocked transcription remains')
+      const result = await response.clone().json().catch(() => null)
+      if (typeof result?.measurement_id === 'string' && result.metrics) persistedMetrics.set(result.measurement_id, result.metrics)
+      return response
+    }
+    const path = `/api/sessions/${active.id}/questions/${current.current_question_index}`
+    if (url === `${path}/attempts`) {
+      const history = histories.get(current.current_question_index) || []
+      if (options?.method !== 'POST') return json(history)
+      if (submissionError !== null) return json({}, submissionError)
+      const body = JSON.parse(options.body as string)
+      expect(body.expected_last_attempt_number).toBe(current.current_question_latest_attempt_number)
+      const attempt: Attempt = {
+        id: `attempt-${current.current_question_index}-${history.length + 1}`,
+        question_index: current.current_question_index, attempt_number: history.length + 1,
+        answer: body.answer, measurement_id: body.measurement_id ?? null, submitted_at: '2026-10-04T12:00:00Z',
+      }
+      histories.set(current.current_question_index, [...history, attempt])
+      current = { ...current, current_question_latest_attempt_number: attempt.attempt_number }
+      return json({ attempt, session: current }, 201)
+    }
+    if (url === `${path}/continue`) {
+      const body = JSON.parse(options?.body as string)
+      expect(body.expected_last_attempt_number).toBe(current.current_question_latest_attempt_number)
+      const latest = histories.get(current.current_question_index)?.at(-1)
+      if (!latest) return json({}, 409)
+      const index = current.current_question_index + 1
+      current = { ...current, current_question_index: index,
+        current_question: current.questions[index] ?? null,
+        status: index === current.questions.length ? 'completed' : 'active',
+        current_question_latest_attempt_number: 0, answers: [...current.answers, latest.answer] }
+      return json(current)
+    }
+    if (url === `${path}/comparison`) {
+      const history = histories.get(current.current_question_index) || []
+      const identity = (attempt: Attempt) => ({ id: attempt.id, attempt_number: attempt.attempt_number,
+        measurement_id: attempt.measurement_id, measurement_version: attempt.measurement_id ? 'speaking-v1' : null,
+        measurement_source: attempt.measurement_id ? 'original_transcription' : null })
+      const metric = (name: 'recognized_word_count' | 'um_count' | 'uh_count' | 'timed_utterance_span_seconds' | 'estimated_words_per_minute') => {
+        const selected = [history[0], history.at(-1)!].map((attempt) => attempt.measurement_id ? persistedMetrics.get(attempt.measurement_id) : undefined)
+        const values = selected.map((metrics) => metrics?.[name] ?? null)
+        const reasons = selected.map((metrics) => !metrics ? 'no_measurement' : name === 'recognized_word_count' ? null
+          : name === 'um_count' || name === 'uh_count' ? metrics.filler_unavailable_reason : metrics.timing_unavailable_reason)
+        const comparable = values[0] !== null && values[1] !== null
+        return { before: values[0], after: values[1], delta: comparable ? values[1]! - values[0]! : null,
+          before_unavailable_reason: reasons[0], after_unavailable_reason: reasons[1], comparable,
+          comparison_unavailable_reason: comparable ? null : values[0] === null && values[1] === null ? 'both_unavailable'
+            : values[0] === null ? 'before_unavailable' : 'after_unavailable' }
+      }
+      return json({ session_id: current.id, question_index: current.current_question_index,
+        before_attempt: identity(history[0]), after_attempt: identity(history.at(-1)!), comparison: {
+          recognized_word_count: metric('recognized_word_count'), um_count: metric('um_count'), uh_count: metric('uh_count'),
+          timed_utterance_span_seconds: metric('timed_utterance_span_seconds'), estimated_words_per_minute: metric('estimated_words_per_minute'),
+        } })
+    }
+    throw new Error('Unmocked route is forbidden')
+  })
+  vi.stubGlobal('fetch', fetchMock)
+  return fetchMock
+}
+
+function attemptWrites(fetchMock: ReturnType<typeof vi.fn>) {
+  return fetchMock.mock.calls.filter(([url, options]) => String(url).endsWith('/attempts') && options?.method === 'POST')
+}
+
+async function submitThenContinue() {
+  fireEvent.click(screen.getByRole('button', { name: 'Submit Attempt' }))
+  const button = await screen.findByRole('button', { name: 'Continue' })
+  await waitFor(() => expect((button as HTMLButtonElement).disabled).toBe(false))
+  fireEvent.click(button)
 }
 
 test('requests permission only on click, prevents duplicate starts, stops tracks, and uploads actual MIME', async () => {
@@ -210,13 +302,9 @@ test('automatically stops after five minutes', async () => {
   expect(screen.getByText('Recording stopped. Ready to send.')).toBeTruthy()
 })
 
-test('typed answer advances and releases a recording for the old question', async () => {
+test('saving a typed attempt releases the old recording and Continue alone advances', async () => {
   const active = { ...session, questions: ['First', 'Second'] }
-  const next = { ...active, current_question_index: 1, current_question: 'Second', answers: ['Typed'] }
-  vi.stubGlobal('fetch', vi.fn()
-    .mockResolvedValueOnce(new Response(JSON.stringify(active)))
-    .mockResolvedValueOnce(new Response(JSON.stringify(active)))
-    .mockResolvedValueOnce(new Response(JSON.stringify(next))))
+  interviewFetch({ active })
   render(<Interview />)
   fireEvent.click(screen.getByRole('button', { name: 'Start Interview' }))
   await screen.findByRole('button', { name: 'Record Answer' })
@@ -225,13 +313,17 @@ test('typed answer advances and releases a recording for the old question', asyn
   expect(oldRecorder.state).toBe('recording')
   expect(stopTrack).not.toHaveBeenCalled()
   fireEvent.change(screen.getByRole('textbox'), { target: { value: 'Typed' } })
-  fireEvent.click(screen.getByRole('button', { name: 'Submit Answer' }))
-  await screen.findByText('Question 2 of 2')
-  // The new DOM can appear before the old recorder's passive unmount cleanup.
+  fireEvent.click(screen.getByRole('button', { name: 'Submit Attempt' }))
+  await screen.findByRole('button', { name: 'Continue' })
+  expect(screen.getByText('Question 1 of 2')).toBeTruthy()
   await waitFor(() => expect(stopTrack).toHaveBeenCalledTimes(1))
   expect(oldRecorder.state).toBe('inactive')
   expect(screen.queryByRole('button', { name: 'Stop Recording' })).toBeNull()
   expect(screen.queryByRole('button', { name: 'Send Recording' })).toBeNull()
+  const button = screen.getByRole('button', { name: 'Continue' }) as HTMLButtonElement
+  await waitFor(() => expect(button.disabled).toBe(false))
+  fireEvent.click(button)
+  await screen.findByText('Question 2 of 2')
 })
 
 test('network failure is shown and allows retry', async () => {
@@ -273,15 +365,10 @@ async function interviewRecording() {
   return view
 }
 
-test('transcribes once, fills editable answer, and advances only after explicit submission', async () => {
+test('transcribes once, preserves original measurements on edits, and advances only after Continue', async () => {
   let resolve!: (response: Response) => void
-  const fetchMock = vi.fn()
-    .mockResolvedValueOnce(new Response(JSON.stringify(session)))
-    .mockImplementationOnce(() => new Promise<Response>((done) => { resolve = done }))
-    .mockResolvedValueOnce(new Response(JSON.stringify(session)))
-    .mockResolvedValueOnce(new Response(JSON.stringify({ ...session, status: 'completed',
-      current_question_index: 1, current_question: null, answers: ['Edited answer'] })))
-  vi.stubGlobal('fetch', fetchMock)
+  const pending = new Promise<Response>((done) => { resolve = done })
+  const fetchMock = interviewFetch({ transcriptions: [pending] })
   await interviewRecording()
   const transcribe = screen.getByRole('button', { name: 'Transcribe Recording' })
   fireEvent.click(transcribe)
@@ -289,12 +376,14 @@ test('transcribes once, fills editable answer, and advances only after explicit 
   expect(fetchMock).toHaveBeenCalledTimes(2)
   expect(screen.getByText('Transcribing recording…')).toBeTruthy()
   expect((screen.getByRole('textbox') as HTMLTextAreaElement).disabled).toBe(true)
-  expect((screen.getByRole('button', { name: 'Submit Answer' }) as HTMLButtonElement).disabled).toBe(true)
+  expect((screen.getByRole('button', { name: 'Submit Attempt' }) as HTMLButtonElement).disabled).toBe(true)
   const [url, options] = fetchMock.mock.calls[1]
   expect(url).toBe('/api/sessions/session-1/transcriptions')
-  expect(options.headers).toBeUndefined()
-  expect(options.body.get('question_index')).toBe('0')
-  expect(options.body.get('audio').type).toBe('audio/webm;codecs=opus')
+  expect(options?.headers).toBeUndefined()
+  const body = options?.body as FormData
+  expect(body.get('question_index')).toBe('0')
+  expect(body.get('expected_last_attempt_number')).toBe('0')
+  expect((body.get('audio') as File).type).toBe('audio/webm;codecs=opus')
   await act(async () => resolve(transcriptResponse()))
   const answer = screen.getByRole('textbox') as HTMLTextAreaElement
   expect(answer.value).toBe('Hello from my recording')
@@ -302,7 +391,6 @@ test('transcribes once, fills editable answer, and advances only after explicit 
   expect(screen.getByText('Question 1 of 1')).toBeTruthy()
   expect(fetchMock).toHaveBeenCalledTimes(2)
   expect(screen.getByText(/Transcript ready/)).toBeTruthy()
-  expect(screen.getByRole('heading', { name: 'Speaking measurements' })).toBeTruthy()
   expect(measurement('Words')).toBe('4')
   expect(measurement('Um')).toBe('0')
   expect(measurement('Uh')).toBe('0')
@@ -314,10 +402,11 @@ test('transcribes once, fills editable answer, and advances only after explicit 
   expect(measurement('Timed speech span')).toBe('2.5 sec')
   expect(measurement('Estimated WPM')).toBe('98 WPM')
   expect(screen.getByText(provenance)).toBeTruthy()
-  fireEvent.click(screen.getByRole('button', { name: 'Submit Answer' }))
+  await submitThenContinue()
   await screen.findByRole('heading', { name: 'Interview Complete' })
-  expect(JSON.parse(fetchMock.mock.calls[3][1].body)).toEqual({
-    question_index: 0, answer: 'Edited answer', measurement_id: measurementId,
+  const [, write] = attemptWrites(fetchMock)[0]
+  expect(JSON.parse(write.body)).toEqual({
+    expected_last_attempt_number: 0, answer: 'Edited answer', measurement_id: measurementId,
   })
   expect(stopTrack).toHaveBeenCalledTimes(1)
   expect(screen.queryByRole('region', { name: 'Speaking measurements' })).toBeNull()
@@ -447,18 +536,12 @@ test.each(['missing_timings', 'timing_coverage_mismatch', 'invalid_timing', 'inv
   },
 )
 
-test('replacement clears original metrics immediately, and its new transcription replaces them', async () => {
+test('replacement clears original metrics immediately, and its new transcription supplies the linked measurement', async () => {
   const replacement: SpeakingMetrics = { ...originalMetrics, recognized_word_count: 1,
     timed_utterance_span_seconds: 2, estimated_words_per_minute: 30 }
   const nextResponse = new Response(JSON.stringify({ session_id: session.id, question_index: 0, measurement_id: replacementMeasurementId,
-    text: 'Replacement', language: 'eng', words: [{ text: 'Replacement', start: 0, end: 2 }],
-    metrics: replacement }))
-  const fetchMock = vi.fn().mockResolvedValueOnce(new Response(JSON.stringify(session)))
-    .mockResolvedValueOnce(transcriptResponse()).mockResolvedValueOnce(nextResponse)
-    .mockResolvedValueOnce(new Response(JSON.stringify(session)))
-    .mockResolvedValueOnce(new Response(JSON.stringify({ ...session, status: 'completed',
-      current_question_index: 1, current_question: null, answers: ['Replacement'] })))
-  vi.stubGlobal('fetch', fetchMock)
+    text: 'Replacement', language: 'eng', words: [{ text: 'Replacement', start: 0, end: 2 }], metrics: replacement }))
+  const fetchMock = interviewFetch({ transcriptions: [transcriptResponse(), nextResponse] })
   await interviewRecording()
   fireEvent.click(screen.getByRole('button', { name: 'Transcribe Recording' }))
   await screen.findByRole('region', { name: 'Speaking measurements' })
@@ -476,10 +559,10 @@ test('replacement clears original metrics immediately, and its new transcription
   expect(measurement('Words')).toBe('1')
   expect(measurement('Timed speech span')).toBe('2 sec')
   expect(measurement('Estimated WPM')).toBe('30 WPM')
-  fireEvent.click(screen.getByRole('button', { name: 'Submit Answer' }))
+  await submitThenContinue()
   await screen.findByRole('heading', { name: 'Interview Complete' })
-  expect(JSON.parse(fetchMock.mock.calls[4][1].body)).toEqual({
-    question_index: 0, answer: 'Replacement', measurement_id: replacementMeasurementId,
+  expect(JSON.parse(attemptWrites(fetchMock)[0][1].body)).toEqual({
+    expected_last_attempt_number: 0, answer: 'Replacement', measurement_id: replacementMeasurementId,
   })
 })
 
@@ -502,13 +585,8 @@ test('failed same-recording transcription retains metrics; failed replacement cr
   expect(screen.queryByRole('region', { name: 'Speaking measurements' })).toBeNull()
 })
 
-test('replacement microphone failure cannot leave old metrics visible', async () => {
-  const fetchMock = vi.fn().mockResolvedValueOnce(new Response(JSON.stringify(session)))
-    .mockResolvedValueOnce(transcriptResponse())
-    .mockResolvedValueOnce(new Response(JSON.stringify(session)))
-    .mockResolvedValueOnce(new Response(JSON.stringify({ ...session, status: 'completed',
-      current_question_index: 1, current_question: null, answers: ['Hello from my recording'] })))
-  vi.stubGlobal('fetch', fetchMock)
+test('replacement microphone failure cannot leave old metrics or measurement ID attached', async () => {
+  const fetchMock = interviewFetch({ transcriptions: [transcriptResponse()] })
   await interviewRecording()
   fireEvent.click(screen.getByRole('button', { name: 'Transcribe Recording' }))
   await screen.findByRole('region', { name: 'Speaking measurements' })
@@ -517,87 +595,60 @@ test('replacement microphone failure cannot leave old metrics visible', async ()
   await screen.findByRole('alert')
   expect(screen.queryByRole('region', { name: 'Speaking measurements' })).toBeNull()
   expect((screen.getByRole('textbox') as HTMLTextAreaElement).value).toBe('Hello from my recording')
-  fireEvent.click(screen.getByRole('button', { name: 'Submit Answer' }))
+  await submitThenContinue()
   await screen.findByRole('heading', { name: 'Interview Complete' })
-  expect(JSON.parse(fetchMock.mock.calls[3][1].body)).toEqual({
-    question_index: 0, answer: 'Hello from my recording',
+  expect(JSON.parse(attemptWrites(fetchMock)[0][1].body)).toEqual({
+    expected_last_attempt_number: 0, answer: 'Hello from my recording', measurement_id: null,
   })
 })
 
 test('question advancement clears measurements rather than carrying them to the next question', async () => {
   const active = { ...session, questions: ['First', 'Second'] }
-  const next = { ...active, current_question_index: 1, current_question: 'Second', answers: ['Hello from my recording'] }
-  const fetchMock = vi.fn().mockResolvedValueOnce(new Response(JSON.stringify(active)))
-    .mockResolvedValueOnce(transcriptResponse()).mockResolvedValueOnce(new Response(JSON.stringify(active)))
-    .mockResolvedValueOnce(new Response(JSON.stringify(next)))
-    .mockResolvedValueOnce(new Response(JSON.stringify(next)))
-    .mockResolvedValueOnce(new Response(JSON.stringify({ ...next, status: 'completed',
-      current_question_index: 2, current_question: null, answers: [...next.answers, 'Second typed answer'] })))
-  vi.stubGlobal('fetch', fetchMock)
+  const fetchMock = interviewFetch({ active, transcriptions: [transcriptResponse()] })
   await interviewRecording()
   fireEvent.click(screen.getByRole('button', { name: 'Transcribe Recording' }))
   await screen.findByRole('region', { name: 'Speaking measurements' })
-  fireEvent.click(screen.getByRole('button', { name: 'Submit Answer' }))
+  await submitThenContinue()
   await screen.findByText('Question 2 of 2')
   expect(screen.queryByRole('region', { name: 'Speaking measurements' })).toBeNull()
   fireEvent.change(screen.getByRole('textbox'), { target: { value: 'Second typed answer' } })
-  fireEvent.click(screen.getByRole('button', { name: 'Submit Answer' }))
+  await submitThenContinue()
   await screen.findByRole('heading', { name: 'Interview Complete' })
-  expect(JSON.parse(fetchMock.mock.calls[3][1].body)).toEqual({
-    question_index: 0, answer: 'Hello from my recording', measurement_id: measurementId,
-  })
-  expect(JSON.parse(fetchMock.mock.calls[5][1].body)).toEqual({ question_index: 1, answer: 'Second typed answer' })
+  expect(attemptWrites(fetchMock).map(([, options]) => JSON.parse(options.body))).toEqual([
+    { expected_last_attempt_number: 0, answer: 'Hello from my recording', measurement_id: measurementId },
+    { expected_last_attempt_number: 0, answer: 'Second typed answer', measurement_id: null },
+  ])
 })
 
 test('failed submission preserves metrics and explicit session restart clears them', async () => {
-  const restarted = { ...session, id: 'session-2' }
-  const fetchMock = vi.fn().mockResolvedValueOnce(new Response(JSON.stringify(session)))
-    .mockResolvedValueOnce(transcriptResponse()).mockResolvedValueOnce(new Response(JSON.stringify(session)))
-    .mockResolvedValueOnce(new Response('{}', { status: 500 }))
-    .mockResolvedValueOnce(new Response(JSON.stringify(restarted)))
-    .mockResolvedValueOnce(new Response(JSON.stringify(restarted)))
-    .mockResolvedValueOnce(new Response(JSON.stringify({ ...restarted, status: 'completed',
-      current_question_index: 1, current_question: null, answers: ['New session typed answer'] })))
-  vi.stubGlobal('fetch', fetchMock)
+  const fetchMock = interviewFetch({ transcriptions: [transcriptResponse()], submissionError: 500 })
   await interviewRecording()
   fireEvent.click(screen.getByRole('button', { name: 'Transcribe Recording' }))
   await screen.findByRole('region', { name: 'Speaking measurements' })
-  fireEvent.click(screen.getByRole('button', { name: 'Submit Answer' }))
+  fireEvent.click(screen.getByRole('button', { name: 'Submit Attempt' }))
   await screen.findByRole('alert')
   expect(measurement('Words')).toBe('4')
-  expect(JSON.parse(fetchMock.mock.calls[3][1].body)).toEqual({
-    question_index: 0, answer: 'Hello from my recording', measurement_id: measurementId,
+  expect(JSON.parse(attemptWrites(fetchMock)[0][1].body)).toEqual({
+    expected_last_attempt_number: 0, answer: 'Hello from my recording', measurement_id: measurementId,
   })
   fireEvent.click(screen.getByRole('button', { name: 'Start New Interview' }))
   await waitFor(() => expect(screen.queryByRole('region', { name: 'Speaking measurements' })).toBeNull())
   expect((screen.getByRole('textbox') as HTMLTextAreaElement).value).toBe('')
-  fireEvent.change(screen.getByRole('textbox'), { target: { value: 'New session typed answer' } })
-  fireEvent.click(screen.getByRole('button', { name: 'Submit Answer' }))
-  await screen.findByRole('heading', { name: 'Interview Complete' })
-  expect(fetchMock.mock.calls[6][0]).toBe('/api/sessions/session-2/answers')
-  expect(JSON.parse(fetchMock.mock.calls[6][1].body)).toEqual({ question_index: 0, answer: 'New session typed answer' })
 })
 
-test('a typed-only answer never creates speaking measurements or requests the microphone', async () => {
-  const completed = { ...session, status: 'completed', current_question_index: 1,
-    current_question: null, answers: ['Typed answer'] }
-  const fetchMock = vi.fn().mockResolvedValueOnce(new Response(JSON.stringify(session)))
-    .mockResolvedValueOnce(new Response(JSON.stringify(session)))
-    .mockResolvedValueOnce(new Response(JSON.stringify(completed)))
-  vi.stubGlobal('fetch', fetchMock)
+test('a typed-only attempt never creates speaking measurements or requests the microphone', async () => {
+  const fetchMock = interviewFetch()
   render(<Interview />)
   fireEvent.click(screen.getByRole('button', { name: 'Start Interview' }))
   await screen.findByRole('textbox')
   fireEvent.change(screen.getByRole('textbox'), { target: { value: 'Typed answer' } })
   expect(screen.queryByRole('region', { name: 'Speaking measurements' })).toBeNull()
-  fireEvent.click(screen.getByRole('button', { name: 'Submit Answer' }))
+  await submitThenContinue()
   await screen.findByRole('heading', { name: 'Interview Complete' })
   expect(screen.queryByRole('region', { name: 'Speaking measurements' })).toBeNull()
   expect(getUserMedia).not.toHaveBeenCalled()
-  expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([
-    '/api/sessions', '/api/sessions/session-1', '/api/sessions/session-1/answers',
-  ])
-  expect(JSON.parse(fetchMock.mock.calls[2][1].body)).toEqual({ question_index: 0, answer: 'Typed answer' })
+  expect(fetchMock.mock.calls.every(([url]) => !String(url).endsWith('/answers'))).toBe(true)
+  expect(JSON.parse(attemptWrites(fetchMock)[0][1].body)).toEqual({ expected_last_attempt_number: 0, answer: 'Typed answer', measurement_id: null })
 })
 
 test.each([
@@ -614,37 +665,26 @@ test.each([
   await interviewRecording()
   fireEvent.click(screen.getByRole('button', { name: 'Transcribe Recording' }))
   const alert = await screen.findByRole('alert')
-  expect(alert.textContent).toBe('No usable speaking measurements were returned. Please try again or type your answer.')
+  expect(alert.textContent).toBe('The transcription result is unknown. Recheck saved state before continuing.')
   expect(alert.textContent).not.toContain('private-provider-message')
   expect((screen.getByRole('textbox') as HTMLTextAreaElement).value).toBe('')
   expect(screen.queryByRole('region', { name: 'Speaking measurements' })).toBeNull()
 })
 
-test.each(['', '   '])('clearing the transcript to %j removes its measurement association from a later typed draft', async (empty) => {
-  const fetchMock = vi.fn().mockResolvedValueOnce(new Response(JSON.stringify(session)))
-    .mockResolvedValueOnce(transcriptResponse())
-    .mockResolvedValueOnce(new Response(JSON.stringify(session)))
-    .mockResolvedValueOnce(new Response(JSON.stringify({ ...session, status: 'completed',
-      current_question_index: 1, current_question: null, answers: ['Typed replacement'] })))
-  vi.stubGlobal('fetch', fetchMock)
+test.each(['', '   '])('deleting and retyping transcript text through %j preserves the same draft measurement association', async (empty) => {
+  const fetchMock = interviewFetch({ transcriptions: [transcriptResponse()] })
   await interviewRecording()
   fireEvent.click(screen.getByRole('button', { name: 'Transcribe Recording' }))
   await screen.findByRole('region', { name: 'Speaking measurements' })
   fireEvent.change(screen.getByRole('textbox'), { target: { value: empty } })
   fireEvent.change(screen.getByRole('textbox'), { target: { value: 'Typed replacement' } })
-  fireEvent.click(screen.getByRole('button', { name: 'Submit Answer' }))
+  await submitThenContinue()
   await screen.findByRole('heading', { name: 'Interview Complete' })
-  expect(JSON.parse(fetchMock.mock.calls[3][1].body)).toEqual({ question_index: 0, answer: 'Typed replacement' })
+  expect(JSON.parse(attemptWrites(fetchMock)[0][1].body)).toEqual({ expected_last_attempt_number: 0, answer: 'Typed replacement', measurement_id: measurementId })
 })
 
-test('failed replacement transcription leaves no old measurement ID on a later typed answer', async () => {
-  const fetchMock = vi.fn().mockResolvedValueOnce(new Response(JSON.stringify(session)))
-    .mockResolvedValueOnce(transcriptResponse())
-    .mockResolvedValueOnce(new Response('{}', { status: 502 }))
-    .mockResolvedValueOnce(new Response(JSON.stringify(session)))
-    .mockResolvedValueOnce(new Response(JSON.stringify({ ...session, status: 'completed',
-      current_question_index: 1, current_question: null, answers: ['Typed after failure'] })))
-  vi.stubGlobal('fetch', fetchMock)
+test('failed replacement transcription leaves no old measurement ID on a later typed attempt', async () => {
+  const fetchMock = interviewFetch({ transcriptions: [transcriptResponse(), new Response('{}', { status: 502 })] })
   await interviewRecording()
   fireEvent.click(screen.getByRole('button', { name: 'Transcribe Recording' }))
   await screen.findByRole('region', { name: 'Speaking measurements' })
@@ -653,9 +693,9 @@ test('failed replacement transcription leaves no old measurement ID on a later t
   fireEvent.click(screen.getByRole('button', { name: 'Transcribe Recording' }))
   await screen.findByRole('alert')
   fireEvent.change(screen.getByRole('textbox'), { target: { value: 'Typed after failure' } })
-  fireEvent.click(screen.getByRole('button', { name: 'Submit Answer' }))
+  await submitThenContinue()
   await screen.findByRole('heading', { name: 'Interview Complete' })
-  expect(JSON.parse(fetchMock.mock.calls[4][1].body)).toEqual({ question_index: 0, answer: 'Typed after failure' })
+  expect(JSON.parse(attemptWrites(fetchMock)[0][1].body)).toEqual({ expected_last_attempt_number: 0, answer: 'Typed after failure', measurement_id: null })
 })
 
 test.each([undefined, null, '', 'not-a-uuid', 123, `${measurementId}-extra`])(
@@ -668,7 +708,7 @@ test.each([undefined, null, '', 'not-a-uuid', 123, `${measurementId}-extra`])(
     await interviewRecording()
     fireEvent.click(screen.getByRole('button', { name: 'Transcribe Recording' }))
     const alert = await screen.findByRole('alert')
-    expect(alert.textContent).toBe('No usable transcript was returned. Please try again or type your answer.')
+    expect(alert.textContent).toBe('The transcription result is unknown. Recheck saved state before continuing.')
     expect((screen.getByRole('textbox') as HTMLTextAreaElement).value).toBe('')
     expect(screen.queryByRole('region', { name: 'Speaking measurements' })).toBeNull()
     expect(fetchMock).toHaveBeenCalledTimes(2)
@@ -686,4 +726,152 @@ test('hands the successful transcript and its exact opaque ID to the draft owner
   await screen.findByText(/Transcript ready/)
   expect(onTranscript).toHaveBeenCalledExactlyOnceWith('Hello from my recording', measurementId)
   expect(onInvalidateMeasurement).toHaveBeenCalledTimes(2)
+})
+
+test('Retry clears the recorded draft and a typed retry explicitly carries no original measurement ID', async () => {
+  const fetchMock = interviewFetch({ transcriptions: [transcriptResponse()] })
+  await interviewRecording()
+  fireEvent.click(screen.getByRole('button', { name: 'Transcribe Recording' }))
+  await screen.findByRole('region', { name: 'Speaking measurements' })
+  fireEvent.click(screen.getByRole('button', { name: 'Submit Attempt' }))
+  const retry = await screen.findByRole('button', { name: 'Retry' })
+  await waitFor(() => expect((retry as HTMLButtonElement).disabled).toBe(false))
+  fireEvent.click(retry)
+  const textbox = await screen.findByRole('textbox') as HTMLTextAreaElement
+  expect(textbox.value).toBe('')
+  expect(screen.queryByRole('region', { name: 'Speaking measurements' })).toBeNull()
+  expect(screen.queryByRole('button', { name: 'Send Recording' })).toBeNull()
+  expect(screen.queryByRole('button', { name: 'Transcribe Recording' })).toBeNull()
+  expect(screen.queryByRole('alert')).toBeNull()
+  fireEvent.change(textbox, { target: { value: 'Typed retry' } })
+  fireEvent.click(screen.getByRole('button', { name: 'Submit Attempt' }))
+  await screen.findByRole('button', { name: 'Retry Again' })
+  expect(attemptWrites(fetchMock).map(([, options]) => JSON.parse(options.body))).toEqual([
+    { answer: 'Hello from my recording', expected_last_attempt_number: 0, measurement_id: measurementId },
+    { answer: 'Typed retry', expected_last_attempt_number: 1, measurement_id: null },
+  ])
+  expect(getUserMedia).toHaveBeenCalledTimes(1)
+  expect(stopTrack).toHaveBeenCalledTimes(1)
+})
+
+test('a newly recorded retry transcribes with revision one and links only its new measurement', async () => {
+  const replacement = await transcriptResponse('Recorded retry').json()
+  replacement.measurement_id = replacementMeasurementId
+  const fetchMock = interviewFetch({ transcriptions: [transcriptResponse(), new Response(JSON.stringify(replacement))] })
+  await interviewRecording()
+  fireEvent.click(screen.getByRole('button', { name: 'Transcribe Recording' }))
+  await screen.findByRole('region', { name: 'Speaking measurements' })
+  fireEvent.click(screen.getByRole('button', { name: 'Submit Attempt' }))
+  const retry = await screen.findByRole('button', { name: 'Retry' })
+  await waitFor(() => expect((retry as HTMLButtonElement).disabled).toBe(false))
+  fireEvent.click(retry)
+  await record(); await finish()
+  fireEvent.click(screen.getByRole('button', { name: 'Transcribe Recording' }))
+  await screen.findByRole('region', { name: 'Speaking measurements' })
+  expect((screen.getByRole('textbox') as HTMLTextAreaElement).value).toBe('Recorded retry')
+  fireEvent.change(screen.getByRole('textbox'), { target: { value: 'Edited recorded retry' } })
+  fireEvent.click(screen.getByRole('button', { name: 'Submit Attempt' }))
+  await screen.findByRole('button', { name: 'Retry Again' })
+  const transcriptions = fetchMock.mock.calls.filter(([url]) => url.endsWith('/transcriptions'))
+  expect(transcriptions.map(([, options]) => {
+    if (!options || !(options.body instanceof FormData)) throw new Error('Expected mocked transcription multipart body')
+    return options.body.get('expected_last_attempt_number')
+  })).toEqual(['0', '1'])
+  expect(JSON.parse(attemptWrites(fetchMock)[1][1].body)).toEqual({
+    answer: 'Edited recorded retry', expected_last_attempt_number: 1, measurement_id: replacementMeasurementId,
+  })
+  expect(getUserMedia).toHaveBeenCalledTimes(2)
+  expect(stopTrack).toHaveBeenCalledTimes(2)
+})
+
+test('cancelling Retry stops its live microphone and discards the unsaved recording and text', async () => {
+  interviewFetch()
+  render(<Interview />)
+  fireEvent.click(screen.getByRole('button', { name: 'Start Interview' }))
+  await screen.findByRole('textbox')
+  fireEvent.change(screen.getByRole('textbox'), { target: { value: 'Saved typed answer' } })
+  fireEvent.click(screen.getByRole('button', { name: 'Submit Attempt' }))
+  const retry = await screen.findByRole('button', { name: 'Retry' })
+  await waitFor(() => expect((retry as HTMLButtonElement).disabled).toBe(false))
+  fireEvent.click(retry)
+  await record()
+  fireEvent.change(screen.getByRole('textbox'), { target: { value: 'Discard this retry' } })
+  fireEvent.click(screen.getByRole('button', { name: 'Cancel Retry' }))
+  expect(stopTrack).toHaveBeenCalledTimes(1)
+  expect(Recorder.instances[0].state).toBe('inactive')
+  expect(screen.queryByRole('textbox')).toBeNull()
+  expect(screen.getByText('Saved typed answer')).toBeTruthy()
+  fireEvent.click(screen.getByRole('button', { name: 'Retry' }))
+  expect((screen.getByRole('textbox') as HTMLTextAreaElement).value).toBe('')
+  expect(screen.queryByRole('button', { name: 'Send Recording' })).toBeNull()
+})
+
+test('transcription 409 clears stale recording state and reloads the current server question without replay', async () => {
+  const active = { ...session, questions: ['First', 'Second'] }
+  const changed: InterviewSession = { ...active, current_question_index: 1, current_question: 'Second', answers: ['Other tab answer'] }
+  const fetchMock = vi.fn(async (url: string) => {
+    if (url === '/api/sessions') return new Response(JSON.stringify(active))
+    if (url.endsWith('/transcriptions')) return new Response('private conflict details', { status: 409 })
+    if (url === '/api/sessions/session-1') return new Response(JSON.stringify(changed))
+    if (url === '/api/sessions/session-1/questions/1/attempts') return new Response('[]')
+    throw new Error('Unmocked route')
+  })
+  vi.stubGlobal('fetch', fetchMock)
+  await interviewRecording()
+  fireEvent.click(screen.getByRole('button', { name: 'Transcribe Recording' }))
+  await screen.findByText('Question 2 of 2')
+  expect((screen.getByRole('textbox') as HTMLTextAreaElement).value).toBe('')
+  expect(screen.queryByRole('button', { name: 'Send Recording' })).toBeNull()
+  expect(screen.queryByRole('region', { name: 'Speaking measurements' })).toBeNull()
+  expect(screen.getByRole('alert').textContent).not.toContain('private conflict details')
+  expect(fetchMock.mock.calls.filter(([url]) => url.endsWith('/transcriptions'))).toHaveLength(1)
+  expect(fetchMock.mock.calls.some(([url]) => url === '/api/sessions/session-1/questions/1/attempts')).toBe(true)
+})
+
+test('an uncertain transcription blocks the draft until explicit read-only recheck and never replays audio', async () => {
+  const fetchMock = vi.fn(async (url: string) => {
+    if (url === '/api/sessions' || url === '/api/sessions/session-1') return new Response(JSON.stringify(session))
+    if (url.endsWith('/transcriptions')) throw new Error('private network error')
+    if (url.endsWith('/attempts')) return new Response('[]')
+    throw new Error('Unmocked route')
+  })
+  vi.stubGlobal('fetch', fetchMock)
+  await interviewRecording()
+  fireEvent.click(screen.getByRole('button', { name: 'Transcribe Recording' }))
+  const recheck = await screen.findByRole('button', { name: 'Recheck saved state' })
+  expect((screen.getByRole('textbox') as HTMLTextAreaElement).disabled).toBe(true)
+  expect(screen.queryByRole('button', { name: 'Send Recording' })).toBeNull()
+  expect(screen.getByRole('alert').textContent).not.toContain('private network error')
+  fireEvent.click(recheck)
+  await waitFor(() => expect((screen.getByRole('textbox') as HTMLTextAreaElement).disabled).toBe(false))
+  expect((screen.getByRole('textbox') as HTMLTextAreaElement).value).toBe('')
+  expect(fetchMock.mock.calls.filter(([url]) => url.endsWith('/transcriptions'))).toHaveLength(1)
+  expect(fetchMock.mock.calls.filter(([url]) => url === '/api/sessions/session-1')).toHaveLength(2)
+})
+
+test('an audio generation remount cancels pending transcription and excludes late original measurements', async () => {
+  let resolve!: (response: Response) => void
+  const fetchMock = vi.fn().mockImplementationOnce(() => new Promise<Response>((done) => { resolve = done }))
+    .mockResolvedValueOnce(new Response('{}', { status: 502 }))
+  vi.stubGlobal('fetch', fetchMock)
+  const onTranscript = vi.fn()
+  const props = { disabled: false, hasAnswer: false, onTranscript, onInvalidateMeasurement: vi.fn(), onTranscribing: vi.fn() }
+  const view = render(<AudioAnswer key="draft-0" session={session} {...props} />)
+  await record(); await finish()
+  fireEvent.click(screen.getByRole('button', { name: 'Transcribe Recording' }))
+  const signal = fetchMock.mock.calls[0][1].signal as AbortSignal
+  view.rerender(<AudioAnswer key="draft-1" session={{ ...session, current_question_latest_attempt_number: 1 }} {...props} />)
+  expect(signal.aborted).toBe(true)
+  expect(screen.queryByRole('button', { name: 'Send Recording' })).toBeNull()
+  expect(screen.queryByRole('region', { name: 'Speaking measurements' })).toBeNull()
+  expect(screen.queryByRole('alert')).toBeNull()
+  await act(async () => resolve(transcriptResponse()))
+  expect(onTranscript).not.toHaveBeenCalled()
+  await record(); await finish()
+  fireEvent.click(screen.getByRole('button', { name: 'Transcribe Recording' }))
+  await screen.findByRole('alert')
+  expect((fetchMock.mock.calls[1][1].body as FormData).get('expected_last_attempt_number')).toBe('1')
+  view.rerender(<AudioAnswer key="draft-2" session={{ ...session, current_question_latest_attempt_number: 1 }} {...props} />)
+  expect(screen.queryByRole('alert')).toBeNull()
+  expect(screen.queryByRole('button', { name: 'Send Recording' })).toBeNull()
 })
