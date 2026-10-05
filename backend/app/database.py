@@ -5,6 +5,7 @@ runtime storage fallback, or automatic migrations are introduced here.
 """
 import os
 from collections.abc import Mapping
+from urllib.parse import parse_qsl, urlsplit
 
 from sqlalchemy import Engine, create_engine
 from sqlalchemy.engine import URL, make_url
@@ -24,12 +25,16 @@ def _read_url(name: str, environment: Mapping[str, str]) -> URL:
         url = make_url(raw)
         # Accessing port also validates a malformed numeric port.
         _ = url.port
+        query_parameters = parse_qsl(urlsplit(raw).query, keep_blank_values=True)
     except (ArgumentError, ValueError, TypeError):
         raise DatabaseConfigurationError(f"{name} is not a valid PostgreSQL URL.") from None
     if url.drivername not in {"postgres", "postgresql", "postgresql+psycopg"}:
         raise DatabaseConfigurationError(f"{name} must use PostgreSQL with psycopg 3.")
     if not url.database:
         raise DatabaseConfigurationError(f"{name} must name a database.")
+    # SQLAlchemy drops empty query values; reject those dbname parameters too.
+    if "dbname" in url.query or any(key == "dbname" for key, _ in query_parameters):
+        raise DatabaseConfigurationError(f"{name} must not contain a dbname query parameter.")
     return url.set(drivername="postgresql+psycopg")
 
 

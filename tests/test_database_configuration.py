@@ -38,6 +38,57 @@ def test_configuration_errors_do_not_expose_urls_or_parser_details(raw, caplog):
     assert not caplog.records
 
 
+@pytest.mark.parametrize("name, base, reader", [
+    ("DATABASE_URL", APPLICATION, get_database_url),
+    ("TEST_DATABASE_URL", TEST, get_test_database_url),
+])
+@pytest.mark.parametrize("query", [
+    "dbname=rehearse_test",
+    "dbname=production",
+    "db%6eame=rehearse_test",
+    "dbname=rehearse_dev&dbname=rehearse_test",
+    "dbname=",
+    "dbname",
+])
+def test_database_name_query_parameters_are_rejected(name, base, reader, query, caplog):
+    raw = base + "?" + query
+    with pytest.raises(DatabaseConfigurationError) as caught:
+        reader({name: raw})
+    assert str(caught.value) == f"{name} must not contain a dbname query parameter."
+    assert raw not in str(caught.value)
+    assert "PRIVATE_SENTINEL" not in str(caught.value)
+    assert not caplog.records
+
+
+def test_disguised_application_database_is_rejected_before_isolation_comparison():
+    with pytest.raises(DatabaseConfigurationError, match="DATABASE_URL must not contain a dbname"):
+        get_test_database_url({
+            "TEST_DATABASE_URL": TEST,
+            "DATABASE_URL": APPLICATION + "?dbname=rehearse_test",
+        })
+
+
+@pytest.mark.parametrize("query, expected", [
+    ("sslmode=require", {"sslmode": "require"}),
+    (
+        "sslmode=verify-full&sslrootcert=%2Ftmp%2Fca.pem",
+        {"sslmode": "verify-full", "sslrootcert": "/tmp/ca.pem"},
+    ),
+])
+def test_application_ssl_query_options_remain_supported(query, expected):
+    environment = {"DATABASE_URL": APPLICATION + "?" + query, "TEST_DATABASE_URL": TEST}
+    application = get_database_url(environment)
+    assert application.database == "rehearse_dev"
+    assert dict(application.query) == expected
+    assert get_test_database_url(environment).database == "rehearse_test"
+
+
+@pytest.mark.parametrize("query", ["sslmode=require", "sslrootcert=%2Ftmp%2Fca.pem"])
+def test_test_database_ssl_query_options_remain_forbidden(query):
+    with pytest.raises(DatabaseConfigurationError, match="must not contain connection overrides"):
+        get_test_database_url({"TEST_DATABASE_URL": TEST + "?" + query})
+
+
 def test_test_configuration_never_defaults_to_application_url():
     with pytest.raises(DatabaseConfigurationError, match="TEST_DATABASE_URL must be explicitly configured"):
         get_test_database_url({"DATABASE_URL": APPLICATION})
