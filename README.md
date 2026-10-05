@@ -4,13 +4,15 @@ Rehearse is a communication practice platform in development for interviews,
 public speaking, negotiations, and presentations. The current prototype supports
 interviews with five fixed questions, typed or transcribed drafts, append-only attempts,
 Retry, deterministic Before/After comparison, explicit Continue to completion,
-browser-local History, and an objective Progress dashboard.
+browser-local History, an objective Progress dashboard, and deterministic delivery
+timing facts.
 
 Current product loop: **Speak → Transcribe → Measure → Persist → Retry → Compare
-→ History → Progress**. Typed practice is also supported. Transcription creates
-an immutable measurement; Submit Attempt saves reviewed text and optionally links
+→ History → Progress → Delivery timing facts**. Typed practice is also supported.
+Transcription creates an immutable measurement; Submit Attempt saves reviewed text and optionally links
 that exact measurement. Continue finalizes the question. History and Progress read
-persisted facts without making provider requests.
+persisted facts without making provider requests. Delivery v1 adds timed word-gap
+aggregates, with no AI delivery scoring or personalized diagnosis/coaching.
 
 ## Current architecture
 
@@ -83,8 +85,8 @@ There is no authentication, expiry, or scoring.
 Anyone with a session ID can access that session. This is a local development prototype.
 
 Retry and Cancel Retry are frontend-only transitions. Retry clears draft text,
-measurement ID, metrics, recording Blob, errors, and recorder resources through a new
-draft generation while retaining persisted attempts. Same-draft text edits, including
+measurement ID, speaking/delivery metrics, recording Blob, errors, and recorder
+resources through a new draft generation while retaining persisted attempts. Same-draft text edits, including
 delete/retype, preserve the original measurement association; new recording/transcription
 and fresh drafts invalidate it. A successful voice retry gets its own measurement UUID.
 
@@ -111,8 +113,8 @@ rehearse.history.v1:<canonical lowercase session UUID> = "1"
 ```
 
 The registry stores opaque session UUID capability keys only: no answers, questions,
-measurements, measurement IDs, summaries, recordings, or provider content. The
-current Practice ID remains separately in `sessionStorage`. Successful session
+measurements (including delivery facts), measurement IDs, summaries, recordings,
+or provider content. The current Practice ID remains separately in `sessionStorage`. Successful session
 creation and verified Practice restoration register the session. Removing or clearing
 remembered History removes local discovery keys; it does not delete PostgreSQL records,
 clear the active Practice restoration ID, or discard its safe draft.
@@ -138,8 +140,11 @@ browser yet,” without implying that no server sessions exist.
 | GET | `/api/sessions/{session_id}/history-detail` | One explicitly supplied session UUID. Returns its summary and question overview; answer text is returned only for an explicitly selected question's bounded attempt page. |
 
 There is no `GET /api/sessions` list or wildcard History read. Summaries omit answer
-and question text. The new History/Progress measurement DTOs expose nine persisted
-scalar/provenance/availability fields, with no measurement UUID or raw provider data.
+and question text. History/Progress measurement DTOs preserve their nine speaking
+scalar/provenance/availability fields and add nullable nested `delivery_metrics`.
+That object contains delivery version, source, three aggregate values and an
+unavailable reason; `null` means delivery was not recorded historically. No measurement
+UUID, word timings, pause events or raw provider data is exposed in these DTOs.
 Detail without `question_index` returns no attempt text. Its optional zero-based
 `question_index` selects one question; `limit` defaults to 10 and is bounded to 1–20.
 The positive `after_attempt_number` cursor requires a selected question and returns
@@ -215,6 +220,19 @@ coverage as available values out of all finalized points in that cohort, includi
 unavailable points; zero is available. The separate no-measurement group reports
 zero available out of its typed/unmeasured final points.
 
+Delivery adds three chronological tables: **Pause count**, **Total pause time
+(seconds)** and **Longest pause (seconds)**. These use separate cohorts for exact
+`(delivery_measurement_version, measurement_source)` pairs, projected as nested
+delivery `version`/`source`; speaking provenance does not determine delivery
+compatibility. The current delivery version is `pause-metrics-v1`. Only the exact
+linked final attempt supplies delivery facts, including finalized earlier questions
+in active sessions. Open questions, superseded retries, typed finals and historical
+measurements without delivery facts do not enter delivery cohorts. Recorded
+unavailable points count in their cohort's coverage denominator, and measured zero
+counts as available. The existing measured-final-answer count still counts linked
+speaking measurements, including historical ones without delivery. Chronology and
+all five speaking tables retain their existing semantics.
+
 There are no averages, medians, trend slopes, charts, communication/confidence/
 readiness/answer-quality scores, semantic improvement claims, or better/worse
 judgments. Metric magnitude has no quality color coding. Tables have captions,
@@ -237,8 +255,10 @@ Reads resume on safe History/Progress navigation, without polling or background
 timers. Unlinked transcription alone changes no History DTO and does not invalidate
 it. Writes elsewhere that emit no History storage event require explicit Reload
 history. Clearing discards in-memory reads even if local storage fails; retained IDs
-then reload safely. This milestone requires no schema change or migration and adds
-no provider requests or provider persistence.
+then reload safely. The History/Progress read-model milestone required no schema
+change. The delivery extension uses migration `0002_pause_delivery_metrics` described
+below; its reads add no provider requests or provider persistence. Hydrated delivery
+facts stay in memory and are never written to the browser-local registry.
 
 ## Local frontend setup
 
@@ -264,13 +284,16 @@ npm run test:integration
 ```
 
 Alternatively, set `PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH` to an installed Chrome
-executable. These tests make real localhost API requests and create sessions in the
-configured isolated database. They cover retry/completion/reload, browser-local History
-and paginated detail, and typed-final Progress with preserved Practice state. External
-page requests are blocked; no audio/transcription route or provider call is required.
+executable. Four tests make real localhost API requests and create/read sessions in
+the configured isolated database. They cover retry/completion/reload, browser-local
+History and paginated detail, typed-final Progress with preserved Practice state,
+and an exact linked measured-final fixture. The fifth uses mocked API responses and
+synthetic microphone data to cover delivery transcription, retry comparison, History
+and Progress. External page requests are blocked; none of the five tests calls an
+external provider.
 Failure traces are written to ignored `test-results/`.
 
-The fourth configured test requires `REHEARSE_E2E_MEASURED_SESSION_ID`: an opaque UUID
+The measured-final fixture test requires `REHEARSE_E2E_MEASURED_SESSION_ID`: an opaque UUID
 of a provider-free fixture in that same isolated database. It expects active Question 2,
 two saved attempts (finalized Question 1 plus open Question 2), and Question 1's exact
 linked `speaking-metrics-v1` / `original_transcription` values: 12 recognized words,
@@ -364,7 +387,13 @@ Migration `0001_database_foundation` creates the three tables below, their const
 the measurement creation-time index and two immutability triggers. Its DDL is
 self-contained. Downgrade removes attempts, measurements, sessions, then trigger
 functions; it destroys stored data and must only be run intentionally on an appropriate
-database. Changing initial Compose credentials does not change an existing volume's
+database. Migration `0001_database_foundation` remains unchanged. The current head,
+`0002_pause_delivery_metrics`, extends the measurement table with five nullable scalar
+columns and eight checks; it performs no backfill and leaves historical delivery
+fields all-null. It adds no table or delivery-source column. Its downgrade removes
+only those checks and columns, retaining the foundation schema and existing
+measurements, IDs, links and immutability trigger. Changing initial Compose
+credentials does not change an existing volume's
 database roles/passwords. `docker compose down` retains the named volume.
 
 ### Schema and enforcement boundary
@@ -376,7 +405,7 @@ All IDs are application-generated UUID primary keys. Required timestamps are
 | --- | --- |
 | `interview_sessions` | `id UUID`, `questions JSONB NOT NULL`, `current_question_index INTEGER NOT NULL` (default 0), `status TEXT NOT NULL` (default active), `created_at TIMESTAMPTZ NOT NULL`, `completed_at TIMESTAMPTZ NULL` |
 | `question_attempts` | `id UUID`, `session_id UUID NOT NULL`, `question_index INTEGER NOT NULL`, `attempt_number INTEGER NOT NULL` (ORM default 1), `answer_text TEXT NOT NULL`, `submitted_at TIMESTAMPTZ NOT NULL`, `measurement_id UUID NULL` |
-| `transcription_measurements` | `id UUID`, `session_id UUID NOT NULL`, `question_index INTEGER NOT NULL`, `created_at TIMESTAMPTZ NOT NULL`, `measurement_version TEXT NOT NULL`, `measurement_source TEXT NOT NULL`, `recognized_word_count INTEGER NOT NULL`, `um_count INTEGER NULL`, `uh_count INTEGER NULL`, `filler_unavailable_reason TEXT NULL`, `timed_utterance_span_seconds DOUBLE PRECISION NULL`, `estimated_words_per_minute DOUBLE PRECISION NULL`, `timing_unavailable_reason TEXT NULL` |
+| `transcription_measurements` | `id UUID`, `session_id UUID NOT NULL`, `question_index INTEGER NOT NULL`, `created_at TIMESTAMPTZ NOT NULL`, `measurement_version TEXT NOT NULL`, `measurement_source TEXT NOT NULL`, `recognized_word_count INTEGER NOT NULL`, `um_count INTEGER NULL`, `uh_count INTEGER NULL`, `filler_unavailable_reason TEXT NULL`, `timed_utterance_span_seconds DOUBLE PRECISION NULL`, `estimated_words_per_minute DOUBLE PRECISION NULL`, `timing_unavailable_reason TEXT NULL`; migration 0002 adds nullable `delivery_measurement_version TEXT`, `pause_count INTEGER`, `total_pause_duration_seconds DOUBLE PRECISION`, `longest_pause_seconds DOUBLE PRECISION`, `pause_unavailable_reason TEXT` |
 
 PostgreSQL enforces:
 
@@ -394,7 +423,14 @@ PostgreSQL enforces:
   and infinity, with no unavailable reason. Unavailable values are both null with one
   of `missing_timings`, `timing_coverage_mismatch`, `invalid_timing`,
   `invalid_timing_order`, or `unusable_span`. Double-precision values are not rounded.
-  A trigger rejects updates to persisted measurement snapshots.
+  A trigger rejects updates to the whole persisted measurement snapshot, including
+  the delivery extension.
+- Delivery is either historical all-null, available with version/three numeric
+  values/no reason, or unavailable with version/null numeric values/a timing reason.
+  Counts are nonnegative and bounded by recognized words minus one; durations are
+  finite and nonnegative. Zero pauses requires zero total/longest duration; positive
+  counts require positive durations with longest no greater than total. The existing
+  `measurement_source` supplies provenance for both independently versioned families.
 - Foreign keys from attempts/measurements to their session. A composite foreign key
   makes a linked measurement match the attempt's session and question. Unique
   `measurement_id` permits only one attachment; null permits typed-only attempts.
@@ -416,8 +452,10 @@ Async audio/transcription routes perform session checks in the thread pool and c
 their database operation before awaiting upload/provider work.
 
 Successful transcription creates an immutable measurement in its own transaction after
-the provider call and deterministic metric calculation. The service reopens a database
-operation, locks/revalidates the authoritative current session/question and stores only
+the provider call and both deterministic speaking/delivery calculations. These run
+before insertion into one measurement row with one UUID, without another provider
+request. Provider or calculation failure creates no measurement. The service reopens
+a database operation, locks/revalidates the authoritative current session/question and stores only
 the scalar metrics, version, source and context. Transcription checks the expected
 revision before provider inference and again under that lock before persistence.
 Advancement or a new attempt on the same question rejects a stale result without
@@ -454,16 +492,18 @@ The comparison endpoint is read-only:
 Optional positive integer selectors `before` and `after` choose attempt numbers for
 that exact session/question. `before` defaults to 1; `after` defaults to the latest
 persisted attempt, including attempts 3 and beyond. Both selectors omitted with
-fewer than two attempts returns 200 with `comparison: null`, `after_attempt: null`,
-and Attempt 1 as `before_attempt` if it exists. Supplying either selector requires
+fewer than two attempts returns 200 with `comparison: null`,
+`delivery_comparison: null`, `after_attempt: null`, and Attempt 1 as `before_attempt`
+if it exists. Supplying either selector requires
 both selected resources to exist: an unknown session, question or selected attempt
 returns 404. Invalid selector shapes return 422. Existing selections must satisfy
 `before < after`; equal or reversed numbers return 422. Partial selectors use the
 same defaults; for example `before=2` compares Attempt 2 with the latest attempt.
 
 The response has `session_id`, `question_index`, `before_attempt`, `after_attempt`
-and `comparison`. Each selected attempt exposes only `id`, `attempt_number`,
-`measurement_id`, `measurement_version` and `measurement_source`. The comparison
+and `comparison`, plus additive `delivery_comparison`. Each selected attempt exposes
+only `id`, `attempt_number`, `measurement_id`, `measurement_version` and
+`measurement_source`. The comparison
 contains `recognized_word_count`, `um_count`, `uh_count`,
 `timed_utterance_span_seconds` and `estimated_words_per_minute`. Each metric has
 `before`, `after`, `delta`, `before_unavailable_reason`, `after_unavailable_reason`,
@@ -482,6 +522,18 @@ sources yield `measurement_source_incompatible`. These take precedence over
 `before_unavailable`, `after_unavailable` or `both_unavailable`, while per-side
 reasons remain visible. Comparisons report neutral facts and never score quality
 or label a change as improvement.
+
+The separate `delivery_comparison` preserves speaking comparison behavior. It
+contains `before_version`, `after_version`, `before_source`, `after_source` and
+changes for `pause_count`, `total_pause_duration_seconds` and `longest_pause_seconds`.
+Each change has the same seven before/after/delta/availability fields described
+above. Delivery requires exact matching delivery versions and sources independently
+of speaking compatibility; incompatible or unavailable sides never yield a numeric
+delta. Typed sides use `no_measurement`; historical measured sides use `not_recorded`.
+Recorded unavailable sides retain their timing reason and delivery provenance.
+Compatible available sides use unrounded persisted `after - before`. The UI presents
+neutral Before / After / Change facts, with **Not recorded**, **Unavailable**, and
+visible measured zero distinguished.
 
 ### Real PostgreSQL verification
 
@@ -686,8 +738,8 @@ leading/trailing recording silence and is not full recording duration. Estimated
 WPM is recognized word count × 60 / timed speech span, calculated only when that
 timing evidence is valid. The UI rounds span to one decimal place and WPM to a whole
 number in the original-recording panel; the comparison table displays both span and
-WPM to one decimal place. Response values retain their precision. No pause diagnosis is
-implemented.
+WPM to one decimal place. Response values retain their precision. These speaking
+calculations, filler rules and timing-reason precedence remain unchanged by delivery v1.
 
 The panel states: “Based on your original recording. Editing the transcript won’t
 change these measurements.” Measurements describe the original transcribed recording;
@@ -703,7 +755,53 @@ Retry clears the text,
 ID, metrics and audio through a fresh draft generation; its new transcription receives
 a new UUID. A typed retry therefore cannot inherit a previous attempt's measurement.
 Explicit submission of an edited transcript links the original measurement without
-recalculation.
+recalculation. The same lifecycle applies to the separate delivery facts on that
+measurement.
+
+### Deterministic Delivery Metrics v1
+
+The **Timed pauses** section shows **Pause count**, **Total pause time** and
+**Longest pause**, tagged `pause-metrics-v1` with source `original_transcription`.
+Speaking and delivery retain separate versions and compatibility checks, sharing
+the source and UUID of one immutable original-recording measurement.
+
+For consecutive validated lexical words, the engine computes:
+
+```python
+gap = Decimal(str(next_word.start)) - Decimal(str(previous_word.end))
+qualifying_pause = gap >= Decimal("0.50")
+```
+
+The 0.50-second boundary is inclusive. There is no epsilon or rounding before
+classification: the full qualifying gap contributes to the total and longest
+duration. An isolated Decimal context preserves this arithmetic independently of
+the caller's context. The linear-time scan uses the same lexical eligibility,
+coverage, interval/order checks and timing-reason precedence as speaking metrics.
+One valid timed word with a usable positive span yields measured zero pauses.
+No pause-event array is created or persisted. Duration display rounding happens
+only after calculation; persisted scalar values stay unrounded.
+
+The three approved aggregate fields are `pause_count`,
+`total_pause_duration_seconds` and `longest_pause_seconds`. Estimated WPM remains
+the existing pacing fact; no additional pacing metric is calculated. Timed gaps
+between recognized words are **not necessarily acoustic silence**. They do not
+establish hesitation, confidence, fluency, answer quality, emotion, pronunciation,
+pitch, loudness, vocal variety or energy. There is no AI delivery score, pause
+diagnosis or personalized coaching.
+
+Three states remain distinct across Practice, comparison, History and Progress:
+
+- **Measured zero:** count `0`, total `0.0`, longest `0.0`, reason `null`.
+- **Recorded unavailable:** delivery version/source are present, all three numeric
+  values are `null`, and the timing reason explains the unavailable evidence.
+- **Not recorded:** historical rows have all five delivery columns `null`; History
+  exposes `delivery_metrics: null`. This is different from recorded unavailable
+  and from a typed attempt with no measurement at all.
+
+Practice explains that editing the transcript does not change original-recording
+measurements. Retry clears both metric families; a successful new transcription
+produces one new measurement UUID. History includes delivery on selected saved
+attempts, while Progress uses only exact linked final attempts, as described above.
 
 ### Server configuration
 
@@ -762,11 +860,22 @@ HTTP 200 returns only application metadata, for example:
     "timed_utterance_span_seconds": 1.0,
     "estimated_words_per_minute": 120.0,
     "timing_unavailable_reason": null
+  },
+  "delivery_metrics": {
+    "version": "pause-metrics-v1",
+    "source": "original_transcription",
+    "pause_count": 0,
+    "total_pause_duration_seconds": 0.0,
+    "longest_pause_seconds": 0.0,
+    "unavailable_reason": null
   }
 }
 ```
 
-The `metrics` object and UUID `measurement_id` are required. Unavailable numeric measurements use `null`;
+The existing `text`, `language`, `words`, `metrics` and UUID `measurement_id`
+fields remain unchanged; `delivery_metrics` is an additive, required scalar-only
+sibling. The same UUID identifies both metric families. Word timing entries remain
+transient HTTP data and are not persisted. Unavailable numeric measurements use `null`;
 zero remains a real word/filler count when applicable. Available measurements have
 a `null` unavailable reason. `filler_unavailable_reason` is `unsupported_language`
 when both filler counts are unavailable. `timing_unavailable_reason` identifies
@@ -774,7 +883,10 @@ when both filler counts are unavailable. `timing_unavailable_reason` identifies
 `invalid_timing_order`, or `unusable_span` when both timing values are unavailable.
 A successful transcription can still return HTTP 200 with unavailable measurements;
 the UI shows “Unavailable” with an explanation. Existing transcription errors below
-remain unchanged.
+remain unchanged. Recorded unavailable delivery uses the same five timing reasons
+in `delivery_metrics.unavailable_reason`, with all three numeric values `null`;
+available delivery uses a null reason. Neither this object nor any delivery UI
+causes an extra provider request.
 
 Existing validation statuses remain: 400 malformed multipart/parser limits, 404 unknown
 session, 409 completed/stale question or attempt revision, 413 oversized upload,
@@ -795,8 +907,12 @@ Transcribe Recording sends the recording to ElevenLabs. Rehearse does not perman
 store audio, log raw audio/keys/provider responses, or persist transcripts separately.
 Temporary upload files close after success or failure. Draft transcripts stay in the
 browser; explicitly submitted text and its optional original measurement association
-are stored in PostgreSQL. No separate original-transcript copy or word timing arrays
-are stored; raw timings are used transiently for deterministic calculations.
+are stored in PostgreSQL. No separate original-transcript copy, word timing arrays
+or pause-event arrays are stored; raw timings are used transiently for deterministic
+calculations. The delivery extension persists only five scalar/version/reason
+columns on the existing immutable measurement. There is no new behavioral-content
+logging, and delivery facts are never written to localStorage; the History registry
+retains opaque IDs only.
 ElevenLabs processing/retention is governed by your provider account and policies;
 Rehearse's lack of permanent audio storage is not a promise of provider-side deletion.
 Aborting a browser request does not guarantee cancellation of provider work already
@@ -804,8 +920,9 @@ started. The backend deadline bounds how long Rehearse waits.
 
 This remains a local prototype without authentication or rate limits. Keep the
 key-enabled backend local. Speaking Metrics v1 adds no semantic scoring, coaching
-judgments, adaptive interviewing, or pause diagnosis. Browser-local History and
-Progress now display persisted facts over time without semantic interpretation.
+judgments, adaptive interviewing, or pause diagnosis. Delivery v1 adds timed-gap
+aggregates, with no acoustic-silence or qualitative interpretation. Browser-local
+History and Progress now display persisted facts over time without semantic interpretation.
 Immutable measurement snapshots and all saved attempts are persistent. Timing remains unavailable
 when evidence is insufficient. Realtime transcription, Nemotron, AI follow-ups, TTS,
 and authentication remain absent.

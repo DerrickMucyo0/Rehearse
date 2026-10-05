@@ -618,3 +618,145 @@ Final verification (2026-10-05):
 - Provider calls: **0** (Nemotron 0, ElevenLabs 0, other external providers 0).
   `feat/nemotron-interviewer` remains unchanged; Issue #9 remains open/frozen and
   held-out research sealed/uninspected. No commit, push, PR or merge during this audit.
+
+## Pause / Pacing / Delivery — Completed implementation and release audit
+
+- Branch: `feat/pause-pacing-delivery`, based on `bc2b4e3` after Session History +
+  Progress Dashboard. Earlier milestone records retain their historical scope and
+  verification results. This milestone adds only deterministic delivery timing
+  facts; existing `speaking-metrics-v1`, filler counts and estimated WPM retain
+  their prior meaning.
+
+| Slice | Commit | Subject / scope |
+| --- | --- | --- |
+| 1 — Pure pause engine | `a385310a6c11c8ccb52eebe94af5d8a5ac32eeb4` | `feat(delivery): add deterministic pause metrics engine` |
+| 2 — Persistence/transcription | `977ee1606f499b6e2ab9624d4cd7ab25ec58a009` | `feat(delivery): persist pause metrics with transcription` |
+| 3 — Comparison/History/Progress/UI | `a39edb7e4f89659c1c9e0d9ca7587ed8e073cb8c` | `feat(delivery): integrate pause metrics across product` |
+| 4 — Documentation/release audit | Not committed | README and this record; final verification results follow below. |
+
+- Pure engine: `pause-metrics-v1` defines a pause as the gap between consecutive
+  validated recognized lexical words, `next.start - previous.end`, qualifying
+  inclusively at `Decimal("0.50")`. Endpoints use `Decimal(str(timestamp))`; no
+  epsilon or rounding changes boundary classification. The full qualifying gap
+  contributes to `pause_count`, `total_pause_duration_seconds` and
+  `longest_pause_seconds`. Calculation is linear, shares lexical/timing validation
+  with speaking metrics, and uses an independent Decimal context. One valid word
+  yields measured zero pauses. No per-pause events are produced.
+- Meaning: these facts describe timed gaps in the original transcription, not
+  verified acoustic silence. They do not establish hesitation, confidence, fluency,
+  answer quality, emotion, pronunciation, pitch, loudness, vocal variety or energy.
+  Existing estimated WPM remains the only pacing calculation. No AI delivery
+  judgment, quality score or personalized coaching is added.
+- Schema decision: **MIGRATION_0002_ONLY**. Migration
+  `0002_pause_delivery_metrics`, parent `0001_database_foundation`, adds exactly five
+  nullable scalar columns to the existing immutable measurement:
+  `delivery_measurement_version`, `pause_count`, `total_pause_duration_seconds`,
+  `longest_pause_seconds` and `pause_unavailable_reason`. Delivery reuses the existing
+  measurement source; no delivery-source column, new table or migration after 0002
+  is added. Migration 0001 remains unchanged. Constraints distinguish historical
+  all-null legacy rows, recorded available facts and recorded unavailable facts;
+  the immutable lifecycle covers the new fields.
+- Persistence/transcription: speaking and delivery calculations precede the single
+  immutable measurement insertion and share its UUID. Provider inference remains
+  outside database transactions/locks; subsequent session/question/revision
+  revalidation remains authoritative. Provider/calculation/transaction failures
+  cannot leave a partially saved measurement. No extra provider request is added.
+  Transcription adds the scalar `delivery_metrics` sibling. A compatibility audit
+  found an intermediate exclusion of the preexisting `words` response; that
+  regression was corrected before the Slice 2 commit. Original `words` serialization
+  and schema were restored, with regression coverage; transient HTTP timing records
+  remain available exactly as before.
+- Three states remain distinct throughout API/UI: legacy `delivery_metrics = null`
+  means **Not recorded**; a recorded version with an approved timing reason and
+  three null values means **Unavailable**; numeric zero means a measured zero.
+  Available zero renders `0`, `0.0 s`, `0.0 s`. Timing reasons use factual mapped
+  wording, without reconstructing unavailable values or exposing internal codes.
+- Comparison: the existing five speaking metrics retain their contract. The
+  additive `delivery_comparison` sibling compares exact stored values as
+  `after - before` only for available, recorded sides with matching delivery version
+  and source. Speaking compatibility uses its own version/source; delivery uses
+  `(delivery_measurement_version, measurement_source)`. Incompatibility in one
+  family does not disable the other. Legacy, unavailable or incompatible delivery
+  sides have no numeric delta. Presentation remains neutral Before / After / Change;
+  duration rounding is display-only and does not modify stored values or subtraction.
+- History remains capability-scoped to explicit supplied session IDs. Its existing
+  explicit measurement projection adds delivery facts without measurement UUIDs,
+  timing arrays, pause events or provider payloads. Selected-attempt detail preserves
+  original-transcription provenance and distinguishes typed no-measurement answers
+  from legacy delivery that was not recorded.
+- Progress continues reusing History `finalized_points` and the shared memory-only
+  hydration cache. Only exact final linked attempts count: finalized earlier
+  questions of active sessions are included, open questions and superseded retries
+  are excluded, and typed finals have no voice measurement. Delivery cohorts use
+  their own version/source independently of speaking cohorts. Recorded unavailable
+  rows count in their cohort's coverage denominator; measured zero counts as
+  available. Legacy null delivery is excluded from recorded delivery cohorts.
+  Chronology, timestamp precision, partial-load safeguards and
+  `measured_final_answer_count` retain their existing semantics. No averages, charts
+  or trend interpretations are introduced.
+- Frontend: live review, comparison, selected History attempt and Progress tables
+  present **Timed pauses**, **Pause count**, **Total pause time** and **Longest pause**.
+  The factual explanation states the inclusive 0.50-second recognized-word gap
+  definition and acoustic-silence limitation. Original-recording/edit provenance,
+  Retry cleanup and accessible semantic tables are preserved. Delivery fields do
+  not change shared-cache invalidation; an unlinked transcription alone still does
+  not invalidate finalized History facts.
+- Privacy: no raw audio, timing arrays, pause-event arrays, provider payloads or new
+  transcript duplicates enter PostgreSQL. Delivery facts are not written to browser
+  storage; History localStorage remains opaque session capability IDs only.
+  Existing HTTP `words` remain transient. No sensitive model/user-content logging
+  is added. Issue #9 artifacts and the frozen `feat/nemotron-interviewer` branch
+  remain untouched; held-out research remains sealed and uninspected.
+
+Historical slice verification:
+
+- Slice 1: 97 delivery tests and 58 speaking tests passed with warnings as errors.
+  Database-free backend verification: 444 passed, 365 PostgreSQL-dependent skips;
+  this run did not claim PostgreSQL coverage. 5,000 differential comparisons
+  preserved prior speaking results. Provider calls: **0**.
+- Slice 2, after the response-compatibility correction: focused backend 507 passed;
+  full backend 919 passed, with warnings as errors, PostgreSQL required and
+  0 PostgreSQL skips. Covers migration/ORM integrity, populated upgrade/downgrade,
+  immutable scalar snapshots, zero/unavailable states, failure atomicity and the
+  restored words contract. Provider calls: **0**.
+- Slice 3: focused backend 751 passed; full backend 1024 passed, with warnings as
+  errors, PostgreSQL required and 0 skips. Focused and full frontend verification
+  each passed 589 tests; build and lint passed. The new provider-free delivery E2E
+  passed 1 test, covering live facts, Retry comparison and finalized History.
+  This slice result is distinct from the complete configured E2E release audit.
+  Provider calls: **0**.
+
+Slice 4 final release verification (2026-10-05):
+
+- Focused backend: 960 passed in 22.90 seconds. Full backend: 1024 passed in
+  22.75 seconds. Both runs used warnings as errors and
+  `REHEARSE_REQUIRE_POSTGRES_TESTS=1`; 0 failed, 0 skipped, with the dedicated
+  PostgreSQL database and isolation guards preserved. No SQLite substitution.
+- Focused frontend: 548 passed. Full frontend: 589 passed across 16 files.
+  TypeScript/Vite build and frontend lint passed.
+- All five configured provider-free E2E tests passed in 25.5 seconds, with
+  0 failed and 0 skipped. Coverage includes the mocked-transcription/synthetic-
+  microphone delivery flow, isolated-PostgreSQL typed History, typed Retry and
+  completion, typed-final Progress, and exact linked measured-final fixtures.
+  The live review fixture uses mocked HTTP responses, not a live provider.
+- Independent backend/frontend audits found no correctness defect. Threshold,
+  Decimal boundary behavior, shared validation precedence, original speaking/WPM
+  formulas, additive response compatibility, immutable atomic persistence,
+  independent comparison/cohort provenance, finalized-point selection and privacy
+  boundaries remain as approved. Migration 0001 is byte-identical to `main`;
+  migration 0002 is byte-identical to committed Slice 2 and remains the only new
+  migration. No schema/runtime/test correction was required.
+- Cumulative `git diff main...HEAD --check` and working-tree `git diff --check`
+  passed. Fingerprints across 93 tracked files confirm only `README.md` and
+  `BUILD_LOG.md` changed during this slice; runtime, tests, migrations, dependencies
+  and CI remain unchanged. Historical build-log bytes are preserved as an unchanged
+  prefix. The milestone diff contains no credentials, provider payloads, recordings,
+  database dumps or generated dependency/build artifacts.
+- **RELEASE_CLASSIFICATION: READY_FOR_PR**. No unresolved release blocker was found.
+  Timed gaps still depend on validated recognized-word timing and are not verified
+  acoustic silence; browser-local capability ownership and existing persistence
+  retention limitations remain. No diagnosis or personalized coaching is claimed.
+- Provider calls: **0** (ElevenLabs 0, Nemotron 0, other external providers 0).
+  Issue #9 and `feat/nemotron-interviewer` remain unchanged; research remains frozen
+  and held-out sealed/uninspected. Documentation remains unstaged for owner review.
+  No commit, push, PR or merge was performed during this audit.
