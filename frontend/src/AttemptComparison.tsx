@@ -1,5 +1,6 @@
 import { useId } from 'react'
-import type { AttemptComparison as Comparison, ComparisonMetrics, MetricChange } from './interviewApi'
+import type { AttemptComparison as Comparison, ComparisonMetrics, DeliveryComparison, DeliverySideReason, MetricChange } from './interviewApi'
+import { deliveryUnavailableText, formatDeliveryDuration, TIMED_PAUSES_EXPLANATION, TIMED_PAUSES_LIMITATION } from './deliveryMetrics'
 
 type SideReason = NonNullable<MetricChange['before_unavailable_reason']>
 type ComparisonReason = NonNullable<MetricChange['comparison_unavailable_reason']>
@@ -53,6 +54,24 @@ function MeasurementCell({ value, reason, decimals }: {
   </td>
 }
 
+const deliveryMetrics: { key: keyof Pick<DeliveryComparison, 'pause_count' | 'total_pause_duration_seconds' | 'longest_pause_seconds'>; label: string; duration: boolean }[] = [
+  { key: 'pause_count', label: 'Pause count', duration: false },
+  { key: 'total_pause_duration_seconds', label: 'Total pause time', duration: true },
+  { key: 'longest_pause_seconds', label: 'Longest pause', duration: true },
+]
+
+function DeliveryCell({ value, reason, duration }: { value: number | null; reason: DeliverySideReason | null; duration: boolean }) {
+  return <td>{value !== null ? duration ? formatDeliveryDuration(value) : value : reason === 'not_recorded' ? 'Not recorded' : <>
+    Unavailable
+    {reason !== null && <small>{reason === 'no_measurement' ? 'No linked measurement.' : deliveryUnavailableText(reason)}</small>}
+  </>}</td>
+}
+
+function deliveryDelta(value: number, duration: boolean): string {
+  if (value === 0) return duration ? '0.0 s' : '0'
+  return `${value > 0 ? '+' : '-'}${duration ? formatDeliveryDuration(Math.abs(value)) : Math.abs(value)}`
+}
+
 export default function AttemptComparison({ comparison }: { comparison: Comparison }) {
   const headingId = useId()
   const data = comparison.comparison
@@ -87,5 +106,26 @@ export default function AttemptComparison({ comparison }: { comparison: Comparis
         </tr>
       })}</tbody>
     </table>
+    {comparison.delivery_comparison !== null && <section aria-label="Timed pauses comparison">
+      <h4>Timed pauses</h4>
+      <p>{TIMED_PAUSES_EXPLANATION}</p>
+      <p>{TIMED_PAUSES_LIMITATION}</p>
+      <table className="comparison-table">
+        <caption>Timed pauses: durations are shown in seconds.</caption>
+        <thead><tr><th scope="col">Metric</th><th scope="col">Before</th><th scope="col">After</th><th scope="col">Change</th></tr></thead>
+        <tbody>{deliveryMetrics.map(({ key, label, duration }) => {
+          const metric = comparison.delivery_comparison![key]
+          return <tr key={key}>
+            <th scope="row">{label}</th>
+            <DeliveryCell value={metric.before} reason={metric.before_unavailable_reason} duration={duration} />
+            <DeliveryCell value={metric.after} reason={metric.after_unavailable_reason} duration={duration} />
+            <td>{metric.comparable && metric.delta !== null ? deliveryDelta(metric.delta, duration) : <>
+              Unavailable
+              {metric.comparison_unavailable_reason !== null && <small>{comparisonReasons[metric.comparison_unavailable_reason]}</small>}
+            </>}</td>
+          </tr>
+        })}</tbody>
+      </table>
+    </section>}
   </section>
 }

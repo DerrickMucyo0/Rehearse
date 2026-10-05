@@ -1,6 +1,8 @@
 import { afterEach, expect, test, vi } from 'vitest'
 import { ApiError, continueQuestion, getAttempts, getComparison, getSession, isConflictError, startInterview, submitAttempt, transcribeAudio, uploadAudio } from './interviewApi'
-import type { Attempt, InterviewSession, MetricChange } from './interviewApi'
+import type { Attempt, DeliveryComparison, DeliveryMetricChange, InterviewSession, MetricChange } from './interviewApi'
+import { DELIVERY_TIMING_REASONS } from './deliveryMetrics'
+import type { DeliveryMetrics } from './deliveryMetrics'
 
 const session: InterviewSession = {
   id: 'session-1', status: 'active', current_question_index: 2, current_question: 'Third',
@@ -11,6 +13,15 @@ const attempt: Attempt = {
   submitted_at: '2026-10-04T12:00:00Z', measurement_id: null,
 }
 const measurementId = 'aed74a31-ddc3-4e0a-b2aa-b98ad52f7b61'
+const zeroDelivery: DeliveryMetrics = { version: 'pause-metrics-v1', source: 'original_transcription',
+  pause_count: 0, total_pause_duration_seconds: 0, longest_pause_seconds: 0, unavailable_reason: null }
+function legacyDelivery(): DeliveryComparison {
+  const unavailable: DeliveryMetricChange = { before: null, after: null, delta: null,
+    before_unavailable_reason: 'not_recorded', after_unavailable_reason: 'not_recorded', comparable: false,
+    comparison_unavailable_reason: 'both_unavailable' }
+  return { before_version: null, after_version: null, before_source: null, after_source: null,
+    pause_count: unavailable, total_pause_duration_seconds: unavailable, longest_pause_seconds: unavailable }
+}
 function json(value: unknown, status = 200) { return new Response(JSON.stringify(value), { status }) }
 function mockResponse(response: Response) {
   const fetchMock = vi.fn().mockResolvedValue(response)
@@ -68,7 +79,7 @@ test.each([null, [{ ...attempt, question_index: 1 }], [{ ...attempt, attempt_num
 )
 
 test('reads the nullable comparison without inventing values', async () => {
-  const result = { session_id: session.id, question_index: 2, before_attempt: null, after_attempt: null, comparison: null }
+  const result = { session_id: session.id, question_index: 2, before_attempt: null, after_attempt: null, comparison: null, delivery_comparison: null }
   const fetchMock = mockResponse(json(result))
   expect(await getComparison(session)).toEqual(result)
   expect(fetchMock.mock.calls[0][0]).toBe('/api/sessions/session-1/questions/2/comparison')
@@ -84,7 +95,7 @@ test('requests explicit comparison selectors and preserves unrounded signed delt
     after_attempt: { ...identity, id: 'attempt-3', attempt_number: 3 }, comparison: {
       recognized_word_count: metric, um_count: metric, uh_count: metric,
       timed_utterance_span_seconds: metric, estimated_words_per_minute: metric,
-    } }
+    }, delivery_comparison: legacyDelivery() }
   const fetchMock = mockResponse(json(result))
   expect(await getComparison(session, 1, 3)).toEqual(result)
   expect(fetchMock.mock.calls[0][0]).toBe('/api/sessions/session-1/questions/2/comparison?before=1&after=3')
@@ -126,7 +137,7 @@ const metrics = {
   filler_unavailable_reason: null, timed_utterance_span_seconds: 2, estimated_words_per_minute: 30, timing_unavailable_reason: null,
 }
 test('transcription sends the exact attempt revision without JSON headers', async () => {
-  const result = { session_id: session.id, question_index: 2, measurement_id: measurementId, text: 'Hello', language: 'eng', words: [], metrics }
+  const result = { session_id: session.id, question_index: 2, measurement_id: measurementId, text: 'Hello', language: 'eng', words: [], metrics, delivery_metrics: zeroDelivery }
   const fetchMock = mockResponse(json(result))
   expect(await transcribeAudio(session, new Blob(['audio'], { type: 'audio/webm' }), new AbortController().signal)).toEqual(result)
   const options = fetchMock.mock.calls[0][1] as RequestInit
@@ -151,4 +162,132 @@ test('lost transcription response is uncertain while HTTP errors retain their st
   const audio = new Blob(['audio'], { type: 'audio/webm' })
   await expect(transcribeAudio(session, audio, new AbortController().signal)).rejects.toMatchObject({ ambiguousWrite: true, status: null })
   await expect(transcribeAudio(session, audio, new AbortController().signal)).rejects.toMatchObject({ ambiguousWrite: false, status: 409 })
+})
+
+function transcription(delivery: unknown = zeroDelivery) {
+  return { session_id: session.id, question_index: 2, measurement_id: measurementId,
+    text: 'Hello', language: 'eng', words: [{ text: 'Hello', start: 0, end: 2 }], metrics, delivery_metrics: delivery }
+}
+function transcribe() {
+  return transcribeAudio(session, new Blob(['audio'], { type: 'audio/webm' }), new AbortController().signal)
+}
+
+test('accepts the unchanged words contract and preserves unrounded delivery values', async () => {
+  const result = { ...transcription({ ...zeroDelivery, pause_count: 1, total_pause_duration_seconds: 0.56789123, longest_pause_seconds: 0.56789123 }),
+    text: 'Hello there', words: [{ text: 'Hello', start: 0, end: 0.2 }, { text: 'there', start: 0.76789123, end: 2 }],
+    metrics: { ...metrics, recognized_word_count: 2 } }
+  mockResponse(json(result))
+  expect(await transcribe()).toEqual(result)
+})
+
+test.each(DELIVERY_TIMING_REASONS)('accepts recorded unavailable delivery (%s) without invented numeric values', async (reason) => {
+  const delivery = { ...zeroDelivery, pause_count: null, total_pause_duration_seconds: null, longest_pause_seconds: null, unavailable_reason: reason }
+  const result = transcription(delivery)
+  mockResponse(json(result))
+  expect(await transcribe()).toEqual(result)
+})
+
+test.each([
+  undefined, null, {}, { ...zeroDelivery, version: '' }, { ...zeroDelivery, version: 'pause-metrics-v2' },
+  { ...zeroDelivery, source: 'edited_answer' }, { ...zeroDelivery, extra: 'private marker' },
+  { ...zeroDelivery, pause_count: null }, { ...zeroDelivery, pause_count: false },
+  { ...zeroDelivery, pause_count: -1 }, { ...zeroDelivery, pause_count: 0.5 },
+  { ...zeroDelivery, pause_count: Number.MAX_SAFE_INTEGER + 1 },
+  { ...zeroDelivery, total_pause_duration_seconds: -0.5 }, { ...zeroDelivery, longest_pause_seconds: NaN },
+  { ...zeroDelivery, total_pause_duration_seconds: Infinity },
+  { ...zeroDelivery, pause_count: 1, total_pause_duration_seconds: 0.6, longest_pause_seconds: 0.6 },
+  { ...zeroDelivery, pause_count: 0, total_pause_duration_seconds: 0.6, longest_pause_seconds: 0.6 },
+  { ...zeroDelivery, unavailable_reason: 'provider-private-marker' },
+  { ...zeroDelivery, unavailable_reason: 'missing_timings' },
+])('rejects malformed live delivery without leaking values or accepting legacy form (case %#)', async (delivery) => {
+  const result = transcription(delivery)
+  result.delivery_metrics = delivery
+  const fetchMock = mockResponse(json(result))
+  const error = await transcribe().catch((cause: unknown) => cause)
+  expect(error).toBeInstanceOf(ApiError)
+  expect(error).toMatchObject({ ambiguousWrite: true })
+  expect((error as Error).message).not.toMatch(/private|pause_count|Infinity|NaN/)
+  expect(fetchMock).toHaveBeenCalledTimes(1)
+})
+
+function deliveryComparison(): DeliveryComparison {
+  const change = (before: number, after: number): DeliveryMetricChange => ({ before, after, delta: after - before,
+    before_unavailable_reason: null, after_unavailable_reason: null, comparable: true, comparison_unavailable_reason: null })
+  return { before_version: 'pause-metrics-v1', after_version: 'pause-metrics-v1',
+    before_source: 'original_transcription', after_source: 'original_transcription',
+    pause_count: change(1, 2), total_pause_duration_seconds: change(0.57891234, 1.57891234), longest_pause_seconds: change(0.57891234, 1) }
+}
+function pairedComparison(delivery: unknown = deliveryComparison()) {
+  const metric: MetricChange = { before: 4, after: 6, delta: 2, before_unavailable_reason: null,
+    after_unavailable_reason: null, comparable: true, comparison_unavailable_reason: null }
+  const identity = { id: 'before', attempt_number: 1, measurement_id: measurementId,
+    measurement_version: 'speaking-v1', measurement_source: 'original_transcription' }
+  return { session_id: session.id, question_index: 2, before_attempt: identity,
+    after_attempt: { ...identity, id: 'after', attempt_number: 2 }, comparison: {
+      recognized_word_count: metric, um_count: metric, uh_count: metric,
+      timed_utterance_span_seconds: metric, estimated_words_per_minute: metric,
+    }, delivery_comparison: delivery }
+}
+
+test('validates delivery comparison independently and retains unrounded deltas', async () => {
+  const result = pairedComparison()
+  mockResponse(json(result))
+  expect(await getComparison(session)).toEqual(result)
+})
+
+test.each(['measurement_version_mismatch', 'measurement_source_incompatible'] as const)(
+  'accepts %s delivery without disabling compatible speaking values', async (reason) => {
+    const delivery = deliveryComparison()
+    if (reason === 'measurement_version_mismatch') delivery.after_version = 'pause-metrics-v2'
+    else delivery.after_source = 'another_transcription_source'
+    for (const key of ['pause_count', 'total_pause_duration_seconds', 'longest_pause_seconds'] as const) {
+      delivery[key] = { ...delivery[key], delta: null, comparable: false, comparison_unavailable_reason: reason }
+    }
+    const result = pairedComparison(delivery)
+    mockResponse(json(result))
+    expect(await getComparison(session)).toEqual(result)
+    expect(result.comparison.recognized_word_count.comparable).toBe(true)
+  },
+)
+
+test('compatible delivery remains independent of a speaking version mismatch', async () => {
+  const result = pairedComparison()
+  result.after_attempt.measurement_version = 'speaking-v2'
+  for (const key of Object.keys(result.comparison) as (keyof typeof result.comparison)[]) {
+    result.comparison[key] = { ...result.comparison[key], delta: null, comparable: false,
+      comparison_unavailable_reason: 'measurement_version_mismatch' }
+  }
+  mockResponse(json(result))
+  expect(await getComparison(session)).toEqual(result)
+})
+
+test.each(['not_recorded', 'no_measurement', ...DELIVERY_TIMING_REASONS] as const)(
+  'accepts a factual unavailable delivery side (%s) separately from numeric speaking comparison', async (reason) => {
+    const delivery = deliveryComparison()
+    if (reason === 'not_recorded' || reason === 'no_measurement') { delivery.before_version = null; delivery.before_source = null }
+    for (const key of ['pause_count', 'total_pause_duration_seconds', 'longest_pause_seconds'] as const) {
+      delivery[key] = { ...delivery[key], before: null, before_unavailable_reason: reason, delta: null,
+        comparable: false, comparison_unavailable_reason: 'before_unavailable' }
+    }
+    const result = pairedComparison(delivery)
+    mockResponse(json(result))
+    expect(await getComparison(session)).toEqual(result)
+  },
+)
+
+test.each([
+  undefined, null, {}, { ...deliveryComparison(), extra: [] }, { ...deliveryComparison(), before_version: ' ' },
+  { ...deliveryComparison(), before_source: null }, { ...deliveryComparison(), after_version: 'pause-metrics-v2' },
+  { ...deliveryComparison(), pause_count: { ...deliveryComparison().pause_count, before: 0.5 } },
+  { ...deliveryComparison(), pause_count: { ...deliveryComparison().pause_count, extra: 'private-value' } },
+  { ...deliveryComparison(), longest_pause_seconds: { ...deliveryComparison().longest_pause_seconds, before: 2 } },
+  { ...deliveryComparison(), pause_count: { ...deliveryComparison().pause_count, before_unavailable_reason: 'private-value' } },
+  { ...deliveryComparison(), pause_count: { ...deliveryComparison().pause_count, comparable: false, delta: null, comparison_unavailable_reason: 'both_unavailable' } },
+])('rejects malformed delivery comparisons while preserving sanitized read errors (case %#)', async (delivery) => {
+  const result = pairedComparison(delivery)
+  result.delivery_comparison = delivery
+  mockResponse(json(result))
+  const error = await getComparison(session).catch((cause: unknown) => cause)
+  expect(error).toMatchObject({ name: 'ApiError', ambiguousWrite: false })
+  expect((error as Error).message).not.toContain('private-value')
 })

@@ -2,7 +2,8 @@
 import { cleanup, render, screen, within } from '@testing-library/react'
 import { afterEach, expect, test } from 'vitest'
 import AttemptComparison from './AttemptComparison'
-import type { AttemptComparison as Comparison, ComparisonMetrics, MetricChange } from './interviewApi'
+import type { AttemptComparison as Comparison, ComparisonMetrics, DeliveryComparison, DeliveryMetricChange, MetricChange } from './interviewApi'
+import { DELIVERY_TIMING_REASONS, deliveryUnavailableText } from './deliveryMetrics'
 
 afterEach(cleanup)
 
@@ -12,6 +13,25 @@ function metric(before: number, after: number): MetricChange {
     after_unavailable_reason: null, comparable: true, comparison_unavailable_reason: null,
   }
 }
+
+function legacyDelivery(): DeliveryComparison {
+  const unavailable: DeliveryMetricChange = { before: null, after: null, delta: null,
+    before_unavailable_reason: 'not_recorded', after_unavailable_reason: 'not_recorded',
+    comparable: false, comparison_unavailable_reason: 'both_unavailable' }
+  return { before_version: null, after_version: null, before_source: null, after_source: null,
+    pause_count: unavailable, total_pause_duration_seconds: unavailable, longest_pause_seconds: unavailable }
+}
+
+function recordedDelivery(): DeliveryComparison {
+  const deliveryMetric = (before: number, after: number): DeliveryMetricChange => ({
+    ...metric(before, after), before_unavailable_reason: null, after_unavailable_reason: null,
+  })
+  return { before_version: 'pause-metrics-v1', after_version: 'pause-metrics-v1',
+    before_source: 'original_transcription', after_source: 'original_transcription',
+    pause_count: deliveryMetric(2, 1), total_pause_duration_seconds: deliveryMetric(1.456789, 0.55555), longest_pause_seconds: deliveryMetric(0.95555, 0.55555) }
+}
+
+function speakingTable() { return screen.getByRole('table', { name: 'Speaking duration is shown in seconds.' }) }
 
 function comparison(overrides: Partial<ComparisonMetrics> = {}): Comparison {
   return {
@@ -29,6 +49,7 @@ function comparison(overrides: Partial<ComparisonMetrics> = {}): Comparison {
       timed_utterance_span_seconds: metric(31.234, 34.789),
       estimated_words_per_minute: metric(92.123, 108.456), ...overrides,
     },
+    delivery_comparison: legacyDelivery(),
   }
 }
 
@@ -44,8 +65,8 @@ test('renders a semantic neutral comparison table with all five metric labels', 
   render(<AttemptComparison comparison={comparison()} />)
   expect(screen.getByRole('region', { name: 'Before / After comparison' })).toBeTruthy()
   expect(screen.getByRole('heading', { name: 'Before / After comparison' })).toBeTruthy()
-  expect(screen.getAllByRole('columnheader').map(cell => cell.textContent)).toEqual(['Metric', 'Before', 'After', 'Change'])
-  expect(screen.getAllByRole('rowheader').map(cell => cell.textContent)).toEqual([
+  expect(within(speakingTable()).getAllByRole('columnheader').map(cell => cell.textContent)).toEqual(['Metric', 'Before', 'After', 'Change'])
+  expect(within(speakingTable()).getAllByRole('rowheader').map(cell => cell.textContent)).toEqual([
     'Recognized words', 'Um', 'Uh', 'Speaking duration', 'Words per minute',
   ])
   expect(screen.getByText('Before: Attempt 1. After: Attempt 2.')).toBeTruthy()
@@ -96,6 +117,7 @@ test('displays an exactly zero decimal delta as zero', () => {
 test('hides the entire card when the backend comparison is null', () => {
   const data = comparison()
   data.comparison = null
+  data.delivery_comparison = null
   data.after_attempt = null
   const { container } = render(<AttemptComparison comparison={data} />)
   expect(container.textContent).toBe('')
@@ -114,14 +136,16 @@ test('keeps a non-null comparison visible even when both attempts have no measur
   })
   data.before_attempt = { ...data.before_attempt!, measurement_id: null, measurement_version: null, measurement_source: null }
   data.after_attempt = { ...data.after_attempt!, measurement_id: null, measurement_version: null, measurement_source: null }
+  const unmeasured = { ...legacyDelivery().pause_count, before_unavailable_reason: 'no_measurement', after_unavailable_reason: 'no_measurement' } as const
+  data.delivery_comparison = { ...legacyDelivery(), pause_count: unmeasured, total_pause_duration_seconds: unmeasured, longest_pause_seconds: unmeasured }
   render(<AttemptComparison comparison={data} />)
-  expect(screen.getByRole('table')).toBeTruthy()
-  for (const cell of screen.getAllByRole('cell')) {
+  expect(speakingTable()).toBeTruthy()
+  for (const cell of within(speakingTable()).getAllByRole('cell')) {
     expect(cell.textContent?.startsWith('Unavailable')).toBe(true)
     expect(cell.textContent).not.toMatch(/^0$/)
   }
   expect(screen.getAllByText('No linked speaking measurement.')).toHaveLength(10)
-  expect(screen.getAllByText('Both measurements are unavailable.')).toHaveLength(5)
+  expect(within(speakingTable()).getAllByText('Both measurements are unavailable.')).toHaveLength(5)
 })
 
 test('unavailable filler counts remain null while recognized words remain available', () => {
@@ -184,4 +208,87 @@ test('contains no quality judgments, score, arrows, or raw measurement identitie
   expect(container.textContent).not.toContain('measurement-id')
   expect(container.textContent).not.toContain('speaking-metrics-v1')
   expect(container.querySelectorAll('[style]')).toHaveLength(0)
+})
+
+test('renders a separate factual delivery Before/After/Change table with backend deltas and display-only rounding', () => {
+  const data = comparison()
+  const delivery = recordedDelivery()
+  const original = structuredClone(delivery)
+  data.delivery_comparison = delivery
+  render(<AttemptComparison comparison={data} />)
+  const table = screen.getByRole('table', { name: 'Timed pauses: durations are shown in seconds.' })
+  expect(within(table).getAllByRole('columnheader').map(cell => cell.textContent)).toEqual(['Metric', 'Before', 'After', 'Change'])
+  expect(within(table).getAllByRole('rowheader').map(cell => cell.textContent)).toEqual(['Pause count', 'Total pause time', 'Longest pause'])
+  expect(values('Pause count')).toEqual(['2', '1', '-1'])
+  expect(values('Total pause time')).toEqual(['1.5 s', '0.6 s', '-0.9 s'])
+  expect(values('Longest pause')).toEqual(['1.0 s', '0.6 s', '-0.4 s'])
+  expect(values('Recognized words')).toEqual(['92', '108', '+16'])
+  expect(delivery).toEqual(original)
+  expect(screen.getByText(/gaps of at least 0.50 seconds/)).toBeTruthy()
+  expect(screen.getByText('These gaps are not necessarily acoustic silence.')).toBeTruthy()
+})
+
+test('measured delivery zeros stay numeric and signed tiny duration changes keep their backend sign', () => {
+  const data = comparison()
+  const delivery = recordedDelivery()
+  delivery.pause_count = { ...delivery.pause_count, before: 0, after: 0, delta: 0 }
+  delivery.total_pause_duration_seconds = { ...delivery.total_pause_duration_seconds, before: 0, after: 0, delta: 0 }
+  delivery.longest_pause_seconds = { ...delivery.longest_pause_seconds, before: 1.14, after: 1.15, delta: 0.01 }
+  data.delivery_comparison = delivery
+  render(<AttemptComparison comparison={data} />)
+  expect(values('Pause count')).toEqual(['0', '0', '0'])
+  expect(values('Total pause time')).toEqual(['0.0 s', '0.0 s', '0.0 s'])
+  expect(values('Longest pause')).toEqual(['1.1 s', '1.1 s', '+0.0 s'])
+})
+
+test('legacy delivery is Not recorded and does not receive numeric zeros or fabricated provenance', () => {
+  render(<AttemptComparison comparison={comparison()} />)
+  expect(values('Pause count')).toEqual(['Not recorded', 'Not recorded', 'UnavailableBoth measurements are unavailable.'])
+  expect(values('Total pause time')).toEqual(['Not recorded', 'Not recorded', 'UnavailableBoth measurements are unavailable.'])
+  expect(screen.queryByText('pause-metrics-v1')).toBeNull()
+})
+
+test.each(DELIVERY_TIMING_REASONS)('delivery unavailable (%s) remains factual without erasing speaking comparisons', (reason) => {
+  const data = comparison()
+  const delivery = recordedDelivery()
+  for (const key of ['pause_count', 'total_pause_duration_seconds', 'longest_pause_seconds'] as const) {
+    delivery[key] = { ...delivery[key], before: null, before_unavailable_reason: reason,
+      delta: null, comparable: false, comparison_unavailable_reason: 'before_unavailable' }
+  }
+  data.delivery_comparison = delivery
+  render(<AttemptComparison comparison={data} />)
+  expect(values('Pause count')).toEqual([`Unavailable${deliveryUnavailableText(reason)}`, '1', 'UnavailableThe before measurement is unavailable.'])
+  expect(values('Recognized words')).toEqual(['92', '108', '+16'])
+  expect(screen.getByRole('region', { name: 'Timed pauses comparison' }).textContent).not.toContain(reason)
+})
+
+test.each([
+  ['measurement_version_mismatch', 'Measurement versions differ.'],
+  ['measurement_source_incompatible', 'Measurement sources are incompatible.'],
+] as const)('independent delivery %s suppresses only delivery deltas', (reason, message) => {
+  const data = comparison()
+  const delivery = recordedDelivery()
+  if (reason === 'measurement_version_mismatch') delivery.after_version = 'pause-metrics-v2'
+  else delivery.after_source = 'other_source'
+  for (const key of ['pause_count', 'total_pause_duration_seconds', 'longest_pause_seconds'] as const) {
+    delivery[key] = { ...delivery[key], delta: null, comparable: false, comparison_unavailable_reason: reason }
+  }
+  data.delivery_comparison = delivery
+  render(<AttemptComparison comparison={data} />)
+  expect(values('Pause count')).toEqual(['2', '1', `Unavailable${message}`])
+  expect(values('Recognized words')).toEqual(['92', '108', '+16'])
+  expect(within(row('Pause count')).queryByText('-1')).toBeNull()
+})
+
+test('independent available delivery survives unavailable speaking comparisons without a quality interpretation', () => {
+  const data = comparison()
+  for (const key of Object.keys(data.comparison!) as (keyof ComparisonMetrics)[]) {
+    data.comparison![key] = { ...data.comparison![key], delta: null, comparable: false,
+      comparison_unavailable_reason: 'measurement_version_mismatch' }
+  }
+  data.delivery_comparison = recordedDelivery()
+  const { container } = render(<AttemptComparison comparison={data} />)
+  expect(values('Pause count')).toEqual(['2', '1', '-1'])
+  expect(values('Recognized words')).toEqual(['92', '108', 'UnavailableMeasurement versions differ.'])
+  expect(container.textContent).not.toMatch(/\b(improved|better|worse|score|quality|confidence|fluency|ideal)\b/i)
 })

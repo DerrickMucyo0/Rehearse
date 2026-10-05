@@ -127,6 +127,53 @@ class TranscriptionMeasurement(Base):
             "AND estimated_words_per_minute IS NULL)",
             name="ck_measurements_timing_state",
         ),
+        CheckConstraint(
+            "CASE WHEN delivery_measurement_version IS NULL THEN "
+            "(pause_count IS NULL AND total_pause_duration_seconds IS NULL "
+            "AND longest_pause_seconds IS NULL AND pause_unavailable_reason IS NULL) "
+            "WHEN pause_unavailable_reason IS NULL THEN "
+            "(pause_count IS NOT NULL AND total_pause_duration_seconds IS NOT NULL "
+            "AND longest_pause_seconds IS NOT NULL) ELSE "
+            "(pause_count IS NULL AND total_pause_duration_seconds IS NULL "
+            "AND longest_pause_seconds IS NULL) END",
+            name="ck_measurements_delivery_state",
+        ),
+        CheckConstraint(
+            "delivery_measurement_version IS NULL OR "
+            "delivery_measurement_version ~ '[^[:space:]]'",
+            name="ck_measurements_delivery_version",
+        ),
+        CheckConstraint(
+            "pause_unavailable_reason IS NULL OR pause_unavailable_reason IN "
+            "('missing_timings', 'timing_coverage_mismatch', 'invalid_timing', "
+            "'invalid_timing_order', 'unusable_span')",
+            name="ck_measurements_pause_reason",
+        ),
+        CheckConstraint("pause_count IS NULL OR pause_count >= 0", name="ck_measurements_pause_count"),
+        CheckConstraint(
+            "total_pause_duration_seconds IS NULL OR (total_pause_duration_seconds >= 0 "
+            "AND total_pause_duration_seconds < 'Infinity'::double precision)",
+            name="ck_measurements_finite_pause_total",
+        ),
+        CheckConstraint(
+            "longest_pause_seconds IS NULL OR (longest_pause_seconds >= 0 "
+            "AND longest_pause_seconds < 'Infinity'::double precision)",
+            name="ck_measurements_finite_pause_longest",
+        ),
+        CheckConstraint(
+            "CASE WHEN pause_count IS NULL THEN true ELSE "
+            "(total_pause_duration_seconds IS NOT NULL AND longest_pause_seconds IS NOT NULL AND "
+            "((pause_count = 0 AND total_pause_duration_seconds = 0 AND longest_pause_seconds = 0) OR "
+            "(pause_count > 0 AND total_pause_duration_seconds > 0 AND longest_pause_seconds > 0 "
+            "AND longest_pause_seconds <= total_pause_duration_seconds))) END",
+            name="ck_measurements_pause_durations",
+        ),
+        CheckConstraint(
+            "CASE WHEN pause_count IS NULL THEN true "
+            "WHEN recognized_word_count >= 1 THEN pause_count <= recognized_word_count - 1 "
+            "ELSE false END",
+            name="ck_measurements_pause_word_bound",
+        ),
     )
 
     id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
@@ -142,6 +189,12 @@ class TranscriptionMeasurement(Base):
     timed_utterance_span_seconds: Mapped[float | None] = mapped_column(Double)
     estimated_words_per_minute: Mapped[float | None] = mapped_column(Double)
     timing_unavailable_reason: Mapped[str | None] = mapped_column(Text)
+    # No defaults: older snapshots truthfully retain an unrecorded delivery extension.
+    delivery_measurement_version: Mapped[str | None] = mapped_column(Text, nullable=True)
+    pause_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    total_pause_duration_seconds: Mapped[float | None] = mapped_column(Double, nullable=True)
+    longest_pause_seconds: Mapped[float | None] = mapped_column(Double, nullable=True)
+    pause_unavailable_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     def unlinked_deletion_eligible(self, *, linked: bool, now: datetime) -> bool:
         """Pure policy helper; a future cleanup transaction must recheck linkage."""

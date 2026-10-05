@@ -9,7 +9,7 @@ from fastapi.testclient import TestClient
 from pydantic import ValidationError
 from sqlalchemy.exc import SQLAlchemyError
 
-from app import history_routes
+from app import history, history_routes
 from app.database import DatabaseConfigurationError
 from app.history import (
     FinalizedPoint, HistoryAttempt, HistoryBatchRequest, HistoryDetail,
@@ -49,6 +49,7 @@ MEASUREMENT_FIELDS = {
     "um_count", "uh_count", "filler_unavailable_reason",
     "timed_utterance_span_seconds", "estimated_words_per_minute",
     "timing_unavailable_reason",
+    "delivery_metrics",
 }
 TIMING_REASONS = (
     "missing_timings", "timing_coverage_mismatch", "invalid_timing",
@@ -235,6 +236,7 @@ def test_measurement_is_a_closed_non_sensitive_projection_preserving_precision()
     assert payload["filler_unavailable_reason"] is None
     assert not any(isinstance(value, UUID) for value in measurement.model_dump().values())
     assert str(FIRST_ID) not in measurement.model_dump_json()
+    assert payload["delivery_metrics"] is None
 
 
 @pytest.mark.parametrize("field", [
@@ -612,3 +614,87 @@ def test_unsupported_history_methods_preserve_allow_and_no_store(offline_client,
     assert response.headers["Cache-Control"] == "no-store"
     assert PRIVATE_MARKER not in response.text
     assert service.calls == []
+
+
+DELIVERY_FIELDS = {"version", "source", "pause_count", "total_pause_duration_seconds",
+                   "longest_pause_seconds", "unavailable_reason"}
+
+
+def delivery_values(**changes):
+    values = {"version": "pause-metrics-v1", "source": "original_transcription", "pause_count": 2,
+              "total_pause_duration_seconds": 1.234567890123, "longest_pause_seconds": 0.734567890123,
+              "unavailable_reason": None}
+    values.update(changes)
+    return values
+
+
+@pytest.mark.parametrize("values", [
+    delivery_values(),
+    delivery_values(pause_count=0, total_pause_duration_seconds=0.0, longest_pause_seconds=0.0),
+    *(delivery_values(pause_count=None, total_pause_duration_seconds=None, longest_pause_seconds=None,
+                      unavailable_reason=reason) for reason in TIMING_REASONS),
+    delivery_values(version="historical-delivery"),
+])
+def test_history_nested_delivery_preserves_recorded_states_and_exact_scalar_values(values):
+    snapshot = HistoryMeasurement(**measurement_values(delivery_metrics=values))
+    payload = snapshot.model_dump(mode="json")
+    assert set(payload) == MEASUREMENT_FIELDS
+    assert payload["delivery_metrics"] == values
+    assert set(payload["delivery_metrics"]) == DELIVERY_FIELDS
+    with pytest.raises(ValidationError):
+        snapshot.delivery_metrics.pause_count = 99
+
+
+@pytest.mark.parametrize("changes", [
+    {"pause_count": None}, {"total_pause_duration_seconds": None}, {"longest_pause_seconds": None},
+    {"unavailable_reason": "invalid_timing"}, {"unavailable_reason": "unknown"},
+    {"version": "\t\n"}, {"source": " "}, {"pause_count": True}, {"pause_count": -1},
+    {"total_pause_duration_seconds": float("inf")}, {"longest_pause_seconds": float("nan")},
+    {"pause_count": 0}, {"longest_pause_seconds": 9.0},
+    {"measurement_id": str(MEASUREMENT_ID)}, {"words": []}, {"pause_events": []},
+    {"provider_response": PRIVATE_MARKER}, {"audio": PRIVATE_MARKER}, {"answer_text": PRIVATE_MARKER},
+])
+def test_history_nested_delivery_rejects_mixed_states_and_sensitive_content(changes):
+    with pytest.raises(ValidationError):
+        HistoryMeasurement(**measurement_values(delivery_metrics=delivery_values(**changes)))
+
+
+def persisted_projection(**changes):
+    values = {
+        "measurement_id": MEASUREMENT_ID, "linked_measurement_id": MEASUREMENT_ID,
+        **measurement_values(), "delivery_measurement_version": None, "pause_count": None,
+        "total_pause_duration_seconds": None, "longest_pause_seconds": None, "pause_unavailable_reason": None,
+    }
+    values.update(changes)
+    return values
+
+
+def test_history_selects_only_explicit_persisted_columns_and_projects_legacy_truthfully():
+    names = {column.name for column in history._measurement_columns()}
+    assert names == {
+        "linked_measurement_id", *(MEASUREMENT_FIELDS - {"delivery_metrics"}),
+        "delivery_measurement_version", "pause_count", "total_pause_duration_seconds",
+        "longest_pause_seconds", "pause_unavailable_reason",
+    }
+    assert history._measurement(persisted_projection()).delivery_metrics is None
+    assert history._measurement(persisted_projection(measurement_id=None, linked_measurement_id=None)) is None
+    projected = history._measurement(persisted_projection(
+        delivery_measurement_version="pause-metrics-v1", pause_count=0,
+        total_pause_duration_seconds=0.0, longest_pause_seconds=0.0,
+    ))
+    assert projected.delivery_metrics.model_dump() == delivery_values(
+        pause_count=0, total_pause_duration_seconds=0.0, longest_pause_seconds=0.0,
+    )
+
+
+@pytest.mark.parametrize("changes", [
+    {"pause_count": 0}, {"total_pause_duration_seconds": 0.0}, {"longest_pause_seconds": 0.0},
+    {"pause_unavailable_reason": "missing_timings"}, {"delivery_measurement_version": "pause-metrics-v1"},
+    {"delivery_measurement_version": "pause-metrics-v1", "pause_count": 0,
+     "total_pause_duration_seconds": 0.0, "longest_pause_seconds": 0.0,
+     "pause_unavailable_reason": "missing_timings"},
+])
+def test_malformed_delivery_projection_raises_sanitized_history_integrity_error(changes):
+    with pytest.raises(HistoryIntegrityError) as caught:
+        history._measurement(persisted_projection(**changes))
+    assert str(caught.value) == ""

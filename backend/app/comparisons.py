@@ -9,6 +9,7 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from app.delivery_metrics import DeliveryMetrics
 from app.speaking_metrics import TimingUnavailableReason
 
 MetricUnavailableReason = Literal["no_measurement", "unsupported_language"] | TimingUnavailableReason
@@ -16,6 +17,39 @@ ComparisonUnavailableReason = Literal[
     "measurement_version_mismatch", "measurement_source_incompatible",
     "before_unavailable", "after_unavailable", "both_unavailable",
 ]
+
+
+class DeliverySnapshot(DeliveryMetrics):
+    """Exact persisted delivery facts, with independently versioned provenance."""
+
+    version: str = Field(...)
+    source: str
+
+    @field_validator("version", "source")
+    @classmethod
+    def nonblank_provenance(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("Delivery provenance must not be blank.")
+        return value
+
+
+def delivery_snapshot(
+    version: str | None, source: str, pause_count: int | None,
+    total_pause_duration_seconds: float | None, longest_pause_seconds: float | None,
+    unavailable_reason: TimingUnavailableReason | None,
+) -> DeliverySnapshot | None:
+    """Project the closed legacy/recorded states without inventing provenance."""
+    if version is None:
+        if any(value is not None for value in (
+            pause_count, total_pause_duration_seconds, longest_pause_seconds, unavailable_reason,
+        )):
+            raise ValueError("Inconsistent legacy delivery facts.")
+        return None
+    return DeliverySnapshot(
+        version=version, source=source, pause_count=pause_count,
+        total_pause_duration_seconds=total_pause_duration_seconds,
+        longest_pause_seconds=longest_pause_seconds, unavailable_reason=unavailable_reason,
+    )
 
 
 class MeasurementSnapshot(BaseModel):
@@ -32,6 +66,7 @@ class MeasurementSnapshot(BaseModel):
     timed_utterance_span_seconds: Annotated[float, Field(gt=0)] | None
     estimated_words_per_minute: Annotated[float, Field(gt=0)] | None
     timing_unavailable_reason: TimingUnavailableReason | None
+    delivery_metrics: DeliverySnapshot | None = None
 
     @field_validator("measurement_version")
     @classmethod
@@ -63,6 +98,26 @@ class ComparisonMetrics(BaseModel):
     estimated_words_per_minute: MetricChange
 
 
+DeliveryUnavailableReason = Literal["no_measurement", "not_recorded"] | TimingUnavailableReason
+
+
+class DeliveryMetricChange(MetricChange):
+    before_unavailable_reason: DeliveryUnavailableReason | None
+    after_unavailable_reason: DeliveryUnavailableReason | None
+
+
+class DeliveryComparison(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    before_version: str | None
+    after_version: str | None
+    before_source: str | None
+    after_source: str | None
+    pause_count: DeliveryMetricChange
+    total_pause_duration_seconds: DeliveryMetricChange
+    longest_pause_seconds: DeliveryMetricChange
+
+
 class ComparedAttempt(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -81,6 +136,60 @@ class AttemptComparison(BaseModel):
     before_attempt: ComparedAttempt | None
     after_attempt: ComparedAttempt | None
     comparison: ComparisonMetrics | None
+    delivery_comparison: DeliveryComparison | None = None
+
+
+def compare_delivery_measurements(
+    before: MeasurementSnapshot | None, after: MeasurementSnapshot | None,
+) -> DeliveryComparison:
+    """Compare delivery provenance independently of the speaking version."""
+    before_delivery = before.delivery_metrics if before is not None else None
+    after_delivery = after.delivery_metrics if after is not None else None
+    compatibility_reason: ComparisonUnavailableReason | None = None
+    if before_delivery is not None and after_delivery is not None:
+        if before_delivery.version != after_delivery.version:
+            compatibility_reason = "measurement_version_mismatch"
+        elif before_delivery.source != after_delivery.source:
+            compatibility_reason = "measurement_source_incompatible"
+    return DeliveryComparison(
+        before_version=before_delivery.version if before_delivery is not None else None,
+        after_version=after_delivery.version if after_delivery is not None else None,
+        before_source=before_delivery.source if before_delivery is not None else None,
+        after_source=after_delivery.source if after_delivery is not None else None,
+        **{name: _delivery_metric_change(before, after, name, compatibility_reason) for name in (
+            "pause_count", "total_pause_duration_seconds", "longest_pause_seconds",
+        )},
+    )
+
+
+def _delivery_metric_change(
+    before: MeasurementSnapshot | None, after: MeasurementSnapshot | None,
+    value_field: str, compatibility_reason: ComparisonUnavailableReason | None,
+) -> DeliveryMetricChange:
+    def side(measurement: MeasurementSnapshot | None):
+        if measurement is None:
+            return None, "no_measurement"
+        if measurement.delivery_metrics is None:
+            return None, "not_recorded"
+        return (getattr(measurement.delivery_metrics, value_field),
+                measurement.delivery_metrics.unavailable_reason)
+
+    before_value, before_reason = side(before)
+    after_value, after_reason = side(after)
+    unavailable = compatibility_reason
+    if unavailable is None:
+        if before_value is None and after_value is None:
+            unavailable = "both_unavailable"
+        elif before_value is None:
+            unavailable = "before_unavailable"
+        elif after_value is None:
+            unavailable = "after_unavailable"
+    return DeliveryMetricChange(
+        before=before_value, after=after_value,
+        delta=after_value - before_value if unavailable is None else None,
+        before_unavailable_reason=before_reason, after_unavailable_reason=after_reason,
+        comparable=unavailable is None, comparison_unavailable_reason=unavailable,
+    )
 
 
 def compare_measurements(

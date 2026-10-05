@@ -4,8 +4,8 @@ import pytest
 from pydantic import ValidationError
 
 from app.comparisons import (
-    AttemptComparison, ComparedAttempt, ComparisonMetrics, MeasurementSnapshot,
-    compare_measurements,
+    AttemptComparison, ComparedAttempt, ComparisonMetrics, DeliveryMetricChange, DeliverySnapshot,
+    MeasurementSnapshot, compare_delivery_measurements, compare_measurements, delivery_snapshot,
 )
 
 
@@ -257,6 +257,7 @@ def test_response_contains_only_neutral_explicit_identity_and_metric_fields():
     ).model_dump(mode="json")
     assert set(response) == {
         "session_id", "question_index", "before_attempt", "after_attempt", "comparison",
+        "delivery_comparison",
     }
     assert set(response["before_attempt"]) == {
         "id", "attempt_number", "measurement_id", "measurement_version", "measurement_source",
@@ -268,6 +269,7 @@ def test_response_contains_only_neutral_explicit_identity_and_metric_fields():
     assert response["after_attempt"]["measurement_id"] is None
     assert response["after_attempt"]["measurement_version"] is None
     assert response["after_attempt"]["measurement_source"] is None
+    assert response["delivery_comparison"] is None
 
 
 @pytest.mark.parametrize(("field", "value"), [
@@ -288,3 +290,174 @@ def test_snapshots_and_output_reject_mutation_or_semantic_enrichment():
         snapshot.recognized_word_count = 99
     with pytest.raises(ValidationError):
         ComparisonMetrics(**compare_measurements(snapshot, snapshot).model_dump(), score=100)
+
+
+DELIVERY_METRICS = ("pause_count", "total_pause_duration_seconds", "longest_pause_seconds")
+DELIVERY_FIELDS = {*DELIVERY_METRICS, "version", "source", "unavailable_reason"}
+
+
+def delivery(**changes):
+    values = {
+        "version": "pause-metrics-v1", "source": "original_transcription", "pause_count": 2,
+        "total_pause_duration_seconds": 1.234567890123, "longest_pause_seconds": 0.734567890123,
+        "unavailable_reason": None,
+    }
+    values.update(changes)
+    return DeliverySnapshot(**values)
+
+
+def delivery_side(state):
+    if state == "typed":
+        return None
+    if state == "legacy":
+        return measurement()
+    if state == "unavailable":
+        return measurement(delivery_metrics=delivery(
+            pause_count=None, total_pause_duration_seconds=None, longest_pause_seconds=None,
+            unavailable_reason="invalid_timing",
+        ))
+    return measurement(delivery_metrics=delivery())
+
+
+@pytest.mark.parametrize(("before_zero", "after_zero"), [(True, True), (True, False), (False, True), (False, False)])
+def test_delivery_exact_available_values_and_signed_unrounded_deltas(before_zero, after_zero):
+    zero = delivery(pause_count=0, total_pause_duration_seconds=0.0, longest_pause_seconds=0.0)
+    before = zero if before_zero else delivery()
+    after = zero if after_zero else delivery(
+        pause_count=3, total_pause_duration_seconds=1.234567890789, longest_pause_seconds=0.734567890789,
+    )
+    result = compare_delivery_measurements(measurement(delivery_metrics=before), measurement(delivery_metrics=after))
+    for name in DELIVERY_METRICS:
+        change = getattr(result, name)
+        assert change.model_dump() == {
+            "before": getattr(before, name), "after": getattr(after, name),
+            "delta": getattr(after, name) - getattr(before, name), "before_unavailable_reason": None,
+            "after_unavailable_reason": None, "comparable": True, "comparison_unavailable_reason": None,
+        }
+    assert type(result.pause_count.before) is int
+    if not before_zero and not after_zero:
+        assert result.total_pause_duration_seconds.delta != 0
+        assert round(before.total_pause_duration_seconds, 3) == round(after.total_pause_duration_seconds, 3)
+
+
+@pytest.mark.parametrize("before_state", ["typed", "legacy", "available", "unavailable"])
+@pytest.mark.parametrize("after_state", ["typed", "legacy", "available", "unavailable"])
+def test_delivery_distinguishes_typed_legacy_recorded_unavailable_and_available(before_state, after_state):
+    before, after = delivery_side(before_state), delivery_side(after_state)
+    result = compare_delivery_measurements(before, after)
+    reasons = {"typed": "no_measurement", "legacy": "not_recorded", "available": None,
+               "unavailable": "invalid_timing"}
+    before_available, after_available = before_state == "available", after_state == "available"
+    unavailable = (
+        None if before_available and after_available else "after_unavailable" if before_available else
+        "before_unavailable" if after_available else "both_unavailable"
+    )
+    for name in DELIVERY_METRICS:
+        change = getattr(result, name)
+        assert change.before == (getattr(delivery(), name) if before_available else None)
+        assert change.after == (getattr(delivery(), name) if after_available else None)
+        assert change.before_unavailable_reason == reasons[before_state]
+        assert change.after_unavailable_reason == reasons[after_state]
+        assert change.delta == (0 if unavailable is None else None)
+        assert change.comparable == (unavailable is None)
+        assert change.comparison_unavailable_reason == unavailable
+    for side, state in (("before", before_state), ("after", after_state)):
+        recorded = state in {"available", "unavailable"}
+        assert getattr(result, f"{side}_version") == ("pause-metrics-v1" if recorded else None)
+        assert getattr(result, f"{side}_source") == ("original_transcription" if recorded else None)
+
+
+@pytest.mark.parametrize("reason", TIMING_REASONS)
+def test_delivery_preserves_each_approved_unavailable_reason(reason):
+    unavailable = delivery(pause_count=None, total_pause_duration_seconds=None, longest_pause_seconds=None,
+                           unavailable_reason=reason)
+    result = compare_delivery_measurements(measurement(delivery_metrics=unavailable),
+                                          measurement(delivery_metrics=delivery()))
+    for name in DELIVERY_METRICS:
+        assert getattr(result, name).before_unavailable_reason == reason
+        assert getattr(result, name).delta is None
+
+
+@pytest.mark.parametrize(("changes", "reason"), [
+    ({"version": "pause-metrics-v2"}, "measurement_version_mismatch"),
+    ({"source": "another_source"}, "measurement_source_incompatible"),
+    ({"version": "pause-metrics-v2", "source": "another_source"}, "measurement_version_mismatch"),
+])
+def test_delivery_incompatibility_preserves_values_and_does_not_disable_speaking(changes, reason):
+    before = measurement(delivery_metrics=delivery())
+    after = measurement(delivery_metrics=delivery(**changes))
+    assert compare_measurements(before, after) == compare_measurements(measurement(), measurement())
+    result = compare_delivery_measurements(before, after)
+    for name in DELIVERY_METRICS:
+        change = getattr(result, name)
+        assert change.before == change.after == getattr(delivery(), name)
+        assert change.delta is None
+        assert change.comparison_unavailable_reason == reason
+        assert change.before_unavailable_reason is change.after_unavailable_reason is None
+
+
+def test_speaking_version_mismatch_does_not_disable_compatible_delivery():
+    before = measurement(delivery_metrics=delivery())
+    after = measurement(measurement_version="speaking-metrics-historical", delivery_metrics=delivery())
+    assert all(change.comparison_unavailable_reason == "measurement_version_mismatch"
+               for change in changes(compare_measurements(before, after)))
+    assert all(getattr(compare_delivery_measurements(before, after), name).comparable for name in DELIVERY_METRICS)
+
+
+def test_equal_nonblank_delivery_sources_are_compatible_independently_of_speaking():
+    before = measurement(measurement_source="other_source", delivery_metrics=delivery(source="other_source"))
+    after = measurement(measurement_source="other_source", delivery_metrics=delivery(source="other_source"))
+    assert all(change.comparison_unavailable_reason == "measurement_source_incompatible"
+               for change in changes(compare_measurements(before, after)))
+    assert all(getattr(compare_delivery_measurements(before, after), name).delta == 0 for name in DELIVERY_METRICS)
+
+
+def test_delivery_compatibility_precedes_unavailable_sides_without_erasing_reason():
+    before = measurement(delivery_metrics=delivery(
+        version="historical", source="other_source", pause_count=None,
+        total_pause_duration_seconds=None, longest_pause_seconds=None, unavailable_reason="missing_timings",
+    ))
+    result = compare_delivery_measurements(before, measurement(delivery_metrics=delivery()))
+    for name in DELIVERY_METRICS:
+        change = getattr(result, name)
+        assert change.comparison_unavailable_reason == "measurement_version_mismatch"
+        assert change.before_unavailable_reason == "missing_timings"
+        assert change.before is change.delta is None
+
+
+@pytest.mark.parametrize("values", [
+    {"version": " \t"}, {"source": "\n"}, {"pause_count": True}, {"pause_count": -1},
+    {"pause_count": None}, {"total_pause_duration_seconds": None}, {"longest_pause_seconds": None},
+    {"unavailable_reason": "invalid_timing"}, {"unavailable_reason": "unsupported_language"},
+    {"total_pause_duration_seconds": float("nan")}, {"longest_pause_seconds": float("inf")},
+    {"total_pause_duration_seconds": -1.0}, {"longest_pause_seconds": 9.0},
+    {"pause_count": 0}, {"total_pause_duration_seconds": 0.0}, {"longest_pause_seconds": 0.0},
+    {"words": []}, {"pause_events": []}, {"measurement_id": str(uuid4())}, {"score": 100},
+])
+def test_delivery_snapshot_rejects_mixed_states_nonfinite_values_and_sensitive_enrichment(values):
+    with pytest.raises(ValidationError):
+        delivery(**values)
+
+
+def test_delivery_projection_is_frozen_explicit_and_preserves_exact_provenance():
+    snapshot = delivery(version=" historical ", source=" original_transcription ")
+    assert set(snapshot.model_dump()) == DELIVERY_FIELDS
+    assert snapshot.version == " historical "
+    assert snapshot.source == " original_transcription "
+    with pytest.raises(ValidationError):
+        snapshot.pause_count = 0
+    result = compare_delivery_measurements(measurement(delivery_metrics=snapshot), measurement(delivery_metrics=snapshot))
+    assert set(result.model_dump()) == {*DELIVERY_METRICS, "before_version", "after_version", "before_source", "after_source"}
+    for name in DELIVERY_METRICS:
+        assert set(getattr(result, name).model_dump()) == CHANGE_FIELDS
+    with pytest.raises(ValidationError):
+        DeliveryMetricChange(**result.pause_count.model_dump(), better=True)
+
+
+@pytest.mark.parametrize("index", range(4))
+def test_scalar_projector_rejects_partial_legacy_rows(index):
+    values = [None, None, None, None]
+    values[index] = [0, 0.0, 0.0, "missing_timings"][index]
+    with pytest.raises(ValueError):
+        delivery_snapshot(None, "original_transcription", *values)
+    assert delivery_snapshot(None, "original_transcription", None, None, None, None) is None

@@ -13,6 +13,8 @@ const questions = ['First interview question', 'Second interview question', 'Thi
 const submittedAt = '2026-10-05T12:00:00Z'
 const metrics: SpeakingMetrics = { source: 'original_transcription', recognized_word_count: 3, um_count: 0, uh_count: 0,
   filler_unavailable_reason: null, timed_utterance_span_seconds: 1.5, estimated_words_per_minute: 120, timing_unavailable_reason: null }
+const deliveryMetrics = { version: 'pause-metrics-v1', source: 'original_transcription', pause_count: 2,
+  total_pause_duration_seconds: 1.5, longest_pause_seconds: 0.8, unavailable_reason: null }
 function response(value: unknown, status = 200) { return new Response(JSON.stringify(value), { status }) }
 function initialSession(id = SESSION_ID): InterviewSession {
   return { id, status: 'active', current_question_index: 0, current_question: questions[0],
@@ -91,12 +93,19 @@ function mockAppApi(initial = initialSession()) {
     known.set(session.id, session)
     return session
   }
+  function linkedMeasurement(attempt: Attempt | undefined) {
+    return attempt?.measurement_id ? { measurement_version: 'speaking-metrics-v1', measurement_source: metrics.source,
+      recognized_word_count: metrics.recognized_word_count, um_count: metrics.um_count, uh_count: metrics.uh_count,
+      filler_unavailable_reason: metrics.filler_unavailable_reason, timed_utterance_span_seconds: metrics.timed_utterance_span_seconds,
+      estimated_words_per_minute: metrics.estimated_words_per_minute, timing_unavailable_reason: metrics.timing_unavailable_reason,
+      delivery_metrics: deliveryMetrics } : null
+  }
   function summary(forSession: InterviewSession) {
     const list = forSession.id === session.id ? [...attempts.values()].flat() : []
     const points = Array.from({ length: forSession.current_question_index }, (_, questionIndex) => {
       const attempt = saved(questionIndex).at(-1)
       return { question_index: questionIndex, attempt_id: attempt?.id ?? '55555555-5555-4555-8555-555555555555',
-        attempt_number: attempt?.attempt_number ?? 1, submitted_at: submittedAt, measurement: null }
+        attempt_number: attempt?.attempt_number ?? 1, submitted_at: submittedAt, measurement: linkedMeasurement(attempt) }
     })
     return { session_id: forSession.id, status: forSession.status, created_at: submittedAt,
       completed_at: forSession.status === 'completed' ? submittedAt : null,
@@ -104,7 +113,7 @@ function mockAppApi(initial = initialSession()) {
       total_questions: questions.length, finalized_question_count: forSession.current_question_index,
       questions_practiced_count: new Set(list.map((attempt) => attempt.question_index)).size,
       total_attempt_count: list.length, total_retry_count: list.length - new Set(list.map((attempt) => attempt.question_index)).size,
-      measured_final_answer_count: 0, last_submitted_at: list.length ? submittedAt : null,
+      measured_final_answer_count: points.filter((point) => point.measurement !== null).length, last_submitted_at: list.length ? submittedAt : null,
       last_saved_activity_at: submittedAt, finalized_points: points }
   }
   function detail(questionIndex: number | null) {
@@ -117,7 +126,7 @@ function mockAppApi(initial = initialSession()) {
     }), selected_question: questionIndex === null ? null : { question_index: questionIndex,
       attempts: saved(questionIndex).map((attempt) => ({ attempt_id: attempt.id, attempt_number: attempt.attempt_number,
         answer_text: attempt.answer, submitted_at: attempt.submitted_at,
-        is_final: questionIndex < session.current_question_index && attempt === saved(questionIndex).at(-1), measurement: null })),
+        is_final: questionIndex < session.current_question_index && attempt === saved(questionIndex).at(-1), measurement: linkedMeasurement(attempt) })),
       has_more: false, next_after_attempt_number: null } }
   }
   const fetchMock = vi.fn(async (input: RequestInfo | URL, options?: RequestInit): Promise<Response> => {
@@ -164,12 +173,14 @@ function mockAppApi(initial = initialSession()) {
         return response({ session_id: session.id, question_index: index, before_attempt: list[0] ? identity(list[0]) : null,
           after_attempt: list.length > 1 ? identity(list.at(-1)!) : null, comparison: list.length > 1 ? {
             recognized_word_count: unavailable, um_count: unavailable, uh_count: unavailable,
-            timed_utterance_span_seconds: unavailable, estimated_words_per_minute: unavailable } : null })
+            timed_utterance_span_seconds: unavailable, estimated_words_per_minute: unavailable } : null,
+          delivery_comparison: list.length > 1 ? { before_version: null, after_version: null, before_source: null, after_source: null,
+            pause_count: unavailable, total_pause_duration_seconds: unavailable, longest_pause_seconds: unavailable } : null })
       }
     }
     if (url.endsWith('/transcriptions') && options?.method === 'POST') {
       return response({ session_id: session.id, question_index: session.current_question_index,
-        measurement_id: MEASUREMENT_ID, text: 'Original recorded words', language: 'eng', words: [], metrics })
+        measurement_id: MEASUREMENT_ID, text: 'Original recorded words', language: 'eng', words: [], metrics, delivery_metrics: deliveryMetrics })
     }
     if (url.endsWith('/audio') && options?.method === 'POST') {
       return response({ session_id: session.id, question_index: session.current_question_index,
@@ -483,6 +494,8 @@ test('safe Progress navigation preserves measured draft identity without transcr
   go('Practice'); await record(); await finishRecording()
   fireEvent.click(screen.getByRole('button', { name: 'Transcribe Recording' }))
   await screen.findByRole('region', { name: 'Speaking measurements' })
+  expect(screen.getByRole('region', { name: 'Timed pauses' })).toBeTruthy()
+  expect(screen.getByText('Editing the transcript won’t change these measurements.', { exact: false })).toBeTruthy()
   const editor = screen.getByRole('textbox')
   fireEvent.change(editor, { target: { value: 'Edited recorded draft' } })
   await openLoadedProgress()
@@ -514,6 +527,53 @@ test('review and retry-draft identity survive both shared read-only history view
   expect(api.posts('/attempts')).toHaveLength(1)
 })
 
+test('linked delivery reaches History and Progress only after finalization without storing measurement facts', async () => {
+  const api = mockAppApi(); render(<App />); await start(); await record(); await finishRecording()
+  fireEvent.click(screen.getByRole('button', { name: 'Transcribe Recording' }))
+  await screen.findByRole('region', { name: 'Timed pauses' })
+  fireEvent.change(screen.getByRole('textbox'), { target: { value: 'Edited delivery review answer' } })
+  fireEvent.click(screen.getByRole('button', { name: 'Submit Attempt' }))
+  await screen.findByRole('button', { name: 'Continue' })
+  await openLoadedProgress()
+  expect(overviewValue('Finalized questions').querySelector('dd')?.textContent).toBe('0')
+  expect(within(progress()).queryByRole('region', { name: 'Pause count' })).toBeNull()
+  go('Practice')
+  fireEvent.click(screen.getByRole('button', { name: 'Continue' }))
+  await screen.findByText('Question 2 of 5')
+  await openLoadedProgress()
+  expect(overviewValue('Measured final answers').querySelector('dd')?.textContent).toBe('1')
+  const pauseCount = within(progress()).getByRole('region', { name: 'Pause count' })
+  expect(within(pauseCount).getByRole('cell', { name: '2' })).toBeTruthy()
+  expect(pauseCount.textContent).toContain('available for 1 of 1')
+  await openLoadedHistory()
+  fireEvent.click(screen.getByRole('button', { name: 'Open session' }))
+  await screen.findByRole('heading', { name: 'Session detail' })
+  fireEvent.click(screen.getByRole('button', { name: 'Question 1' }))
+  await screen.findByText('Edited delivery review answer')
+  expect(screen.getByRole('region', { name: 'Timed pauses' }).textContent).toContain('Pause count')
+  expect(api.posts('/transcriptions')).toHaveLength(1)
+  expect(JSON.stringify(Object.entries(localStorage))).not.toMatch(/pause_count|pause-metrics|Edited delivery|total_pause/)
+})
+
+test('a typed final retry excludes superseded voice delivery from longitudinal groups', async () => {
+  const api = mockAppApi(); render(<App />); await start(); await record(); await finishRecording()
+  fireEvent.click(screen.getByRole('button', { name: 'Transcribe Recording' }))
+  await screen.findByRole('region', { name: 'Timed pauses' })
+  fireEvent.click(screen.getByRole('button', { name: 'Submit Attempt' }))
+  await screen.findByRole('button', { name: 'Retry' })
+  fireEvent.click(screen.getByRole('button', { name: 'Retry' }))
+  expect(screen.queryByRole('region', { name: 'Timed pauses' })).toBeNull()
+  await submit('Typed final retry')
+  fireEvent.click(screen.getByRole('button', { name: 'Continue' }))
+  await screen.findByText('Question 2 of 5')
+  await openLoadedProgress()
+  expect(overviewValue('Measured final answers').querySelector('dd')?.textContent).toBe('0')
+  expect(within(progress()).queryByRole('region', { name: 'Pause count' })).toBeNull()
+  const bodies = api.posts('/attempts').map((call) => JSON.parse(call[1]!.body as string) as { measurement_id: string | null })
+  expect(bodies.map((body) => body.measurement_id)).toEqual([MEASUREMENT_ID, null])
+  expect(api.posts('/transcriptions')).toHaveLength(1)
+})
+
 test('Progress navigation remains blocked during microphone permission, recording and finalization', async () => {
   const pending = deferred<MediaStream>(); getUserMedia.mockReturnValue(pending.promise)
   mockAppApi(); render(<App />); await start()
@@ -538,7 +598,7 @@ test.each(['audio', 'transcriptions'] as const)('Progress navigation remains blo
   const result = operation === 'audio' ? { session_id: SESSION_ID, question_index: 0, status: 'accepted',
     filename: 'answer.webm', content_type: 'audio/webm;codecs=opus', size_bytes: 21 }
     : { session_id: SESSION_ID, question_index: 0, measurement_id: MEASUREMENT_ID,
-      text: 'Original recorded words', language: 'eng', words: [], metrics }
+      text: 'Original recorded words', language: 'eng', words: [], metrics, delivery_metrics: deliveryMetrics }
   await act(async () => pending.resolve(response(result)))
   await waitFor(() => expect((nav('Progress') as HTMLButtonElement).disabled).toBe(false))
 })

@@ -13,6 +13,8 @@ const questions = ['First interview question', 'Second interview question', 'Thi
 const submittedAt = '2026-10-05T12:00:00Z'
 const metrics: SpeakingMetrics = { source: 'original_transcription', recognized_word_count: 3, um_count: 0, uh_count: 0,
   filler_unavailable_reason: null, timed_utterance_span_seconds: 1.5, estimated_words_per_minute: 120, timing_unavailable_reason: null }
+const deliveryMetrics = { version: 'pause-metrics-v1', source: 'original_transcription', pause_count: 2,
+  total_pause_duration_seconds: 1.5, longest_pause_seconds: 0.8, unavailable_reason: null }
 function response(value: unknown, status = 200) { return new Response(JSON.stringify(value), { status }) }
 function initialSession(id = SESSION_ID): InterviewSession {
   return { id, status: 'active', current_question_index: 0, current_question: questions[0],
@@ -164,12 +166,14 @@ function mockAppApi(initial = initialSession()) {
         return response({ session_id: session.id, question_index: index, before_attempt: list[0] ? identity(list[0]) : null,
           after_attempt: list.length > 1 ? identity(list.at(-1)!) : null, comparison: list.length > 1 ? {
             recognized_word_count: unavailable, um_count: unavailable, uh_count: unavailable,
-            timed_utterance_span_seconds: unavailable, estimated_words_per_minute: unavailable } : null })
+            timed_utterance_span_seconds: unavailable, estimated_words_per_minute: unavailable } : null,
+          delivery_comparison: list.length > 1 ? { before_version: null, after_version: null, before_source: null, after_source: null,
+            pause_count: unavailable, total_pause_duration_seconds: unavailable, longest_pause_seconds: unavailable } : null })
       }
     }
     if (url.endsWith('/transcriptions') && options?.method === 'POST') {
       return response({ session_id: session.id, question_index: session.current_question_index,
-        measurement_id: MEASUREMENT_ID, text: 'Original recorded words', language: 'eng', words: [], metrics })
+        measurement_id: MEASUREMENT_ID, text: 'Original recorded words', language: 'eng', words: [], metrics, delivery_metrics: deliveryMetrics })
     }
     if (url.endsWith('/audio') && options?.method === 'POST') {
       return response({ session_id: session.id, question_index: session.current_question_index,
@@ -441,7 +445,7 @@ test.each(['audio', 'transcriptions'] as const)('navigation is blocked while %s 
   const result = operation === 'audio' ? { session_id: SESSION_ID, question_index: 0, status: 'accepted',
     filename: 'answer.webm', content_type: 'audio/webm;codecs=opus', size_bytes: 21 }
     : { session_id: SESSION_ID, question_index: 0, measurement_id: MEASUREMENT_ID,
-      text: 'Original recorded words', language: 'eng', words: [], metrics }
+      text: 'Original recorded words', language: 'eng', words: [], metrics, delivery_metrics: deliveryMetrics }
   await act(async () => pending.resolve(response(result)))
   await waitFor(() => expect((nav('History') as HTMLButtonElement).disabled).toBe(false))
 })

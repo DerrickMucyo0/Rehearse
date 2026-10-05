@@ -1,6 +1,7 @@
 import { afterEach, expect, test, vi } from 'vitest'
 import { getHistoryDetail, getHistorySummaries, HistoryApiError } from './historyApi'
 import type { HistoryDetail, HistoryMeasurement, HistorySummary } from './historyApi'
+import type { DeliveryMetrics } from './deliveryMetrics'
 
 const id = 'aabbccdd-0011-2233-4455-66778899aabb'
 const other = 'aabbccdd-0011-2233-4455-66778899aabc'
@@ -15,7 +16,7 @@ function summary(): HistorySummary {
 function measured(): HistoryMeasurement {
   return { measurement_version: 'speaking-metrics-v1', measurement_source: 'original_transcription', recognized_word_count: 4,
     um_count: 0, uh_count: 0, filler_unavailable_reason: null, timed_utterance_span_seconds: 1.234567890123,
-    estimated_words_per_minute: 194.40000174967392, timing_unavailable_reason: null }
+    estimated_words_per_minute: 194.40000174967392, timing_unavailable_reason: null, delivery_metrics: null }
 }
 function detail(): HistoryDetail {
   return { summary: summary(), questions: Array.from({ length: 5 }, (_, question_index) => ({ question_index,
@@ -144,4 +145,79 @@ test('aborted reads are distinct and late responses cannot be accepted', async (
   expect(fetchMock.mock.calls[0][1].signal.aborted).toBe(true)
   await expect(getHistoryDetail(id, { signal: controller.signal })).rejects.toMatchObject({ cancelled: true })
   expect(fetchMock).toHaveBeenCalledTimes(1)
+})
+
+function delivery(changes: Partial<DeliveryMetrics> = {}): DeliveryMetrics {
+  return { version: 'pause-metrics-v1', source: 'original_transcription', pause_count: 2,
+    total_pause_duration_seconds: 1.100000000009, longest_pause_seconds: 0.600000000006,
+    unavailable_reason: null, ...changes }
+}
+function summaryWithMeasurement(measurement: HistoryMeasurement): HistorySummary {
+  return { ...finalDetail().summary, finalized_points: [{ ...finalDetail().summary.finalized_points[0], measurement }] }
+}
+
+test.each([
+  null,
+  delivery(),
+  delivery({ pause_count: 0, total_pause_duration_seconds: 0, longest_pause_seconds: 0 }),
+  ...(['missing_timings', 'timing_coverage_mismatch', 'invalid_timing', 'invalid_timing_order', 'unusable_span'] as const)
+    .map((unavailable_reason) => delivery({ pause_count: null, total_pause_duration_seconds: null, longest_pause_seconds: null, unavailable_reason })),
+])('history preserves exact legacy, available, zero and unavailable delivery state (case %#)', async (delivery_metrics) => {
+  const value = { summaries: [summaryWithMeasurement({ ...measured(), delivery_metrics })], missing_session_ids: [] }
+  const calls = mock(value)
+  const result = await getHistorySummaries([id])
+  expect(result).toEqual(value)
+  expect(result.summaries[0].finalized_points[0].measurement!.delivery_metrics).toEqual(delivery_metrics)
+  expect(calls).toHaveBeenCalledOnce()
+  expect(calls.mock.calls[0][1].cache).toBe('no-store')
+})
+
+test('selected persisted attempt retains exact delivery facts without exposing a measurement UUID', async () => {
+  const value = finalDetail()
+  value.selected_question!.attempts[0].measurement!.delivery_metrics = delivery()
+  value.summary.finalized_points[0].measurement!.delivery_metrics = delivery()
+  mock(value)
+  const returned = await getHistoryDetail(id, { questionIndex: 0 })
+  expect(returned.selected_question!.attempts[0].measurement!.delivery_metrics).toEqual(delivery())
+  expect(returned.selected_question!.attempts[0].measurement).not.toHaveProperty('measurement_id')
+})
+
+test.each([
+  { version: '' }, { version: ' \t\n ' }, { source: '' }, { source: 'future_source' },
+  { pause_count: -1 }, { pause_count: 0.5 }, { pause_count: null },
+  { total_pause_duration_seconds: null }, { longest_pause_seconds: null },
+  { total_pause_duration_seconds: -1 }, { longest_pause_seconds: -1 },
+  { total_pause_duration_seconds: '1.1' }, { longest_pause_seconds: '0.6' },
+  { pause_count: 0 }, { total_pause_duration_seconds: 0 }, { longest_pause_seconds: 0 },
+  { longest_pause_seconds: 1.2 }, { pause_count: 4 },
+  { unavailable_reason: 'missing_timings' }, { unavailable_reason: 'delivery_error' },
+  { measurement_id: other }, { words: [] }, { pause_events: [] }, { provider_payload: 'PRIVATE-MARKER' },
+])('malformed delivery values and private extra fields reject the entire safe history response (case %#)', async (changes) => {
+  const invalid = { ...delivery(), ...changes }
+  mock({ summaries: [summaryWithMeasurement({ ...measured(), delivery_metrics: invalid as DeliveryMetrics })], missing_session_ids: [] })
+  const error = await getHistorySummaries([id]).catch((cause: unknown) => cause)
+  expect(error).toMatchObject({ status: 200, message: 'Unexpected history response. Please try again.' })
+  expect((error as Error).message).not.toContain('PRIVATE')
+})
+
+test.each(['version', 'source', 'pause_count', 'total_pause_duration_seconds', 'longest_pause_seconds', 'unavailable_reason'] as const)(
+  'delivery key %s is required, not interpreted as historical absence', async (field) => {
+    const invalid: Record<string, unknown> = { ...delivery() }
+    delete invalid[field]
+    mock({ summaries: [summaryWithMeasurement({ ...measured(), delivery_metrics: invalid as unknown as DeliveryMetrics })], missing_session_ids: [] })
+    await expect(getHistorySummaries([id])).rejects.toMatchObject({ status: 200 })
+  },
+)
+
+test('missing delivery_metrics key is rejected while an explicit historical null remains valid', async () => {
+  const invalid: Record<string, unknown> = { ...measured() }
+  delete invalid.delivery_metrics
+  mock({ summaries: [summaryWithMeasurement(invalid as unknown as HistoryMeasurement)], missing_session_ids: [] })
+  await expect(getHistorySummaries([id])).rejects.toMatchObject({ status: 200 })
+})
+
+test('available pause count cannot exceed the recorded lexical word prerequisite', async () => {
+  const zero = delivery({ pause_count: 0, total_pause_duration_seconds: 0, longest_pause_seconds: 0 })
+  mock({ summaries: [summaryWithMeasurement({ ...measured(), recognized_word_count: 0, delivery_metrics: zero })], missing_session_ids: [] })
+  await expect(getHistorySummaries([id])).rejects.toMatchObject({ status: 200 })
 })

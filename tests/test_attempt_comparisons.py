@@ -14,6 +14,7 @@ from sqlalchemy import event, select
 
 from app.database import create_database_engine, create_session_factory
 from app.database_models import MEASUREMENT_VERSION, QuestionAttempt, TranscriptionMeasurement
+from app.delivery_metrics import DeliveryMetrics
 from app.main import app
 from app.session_routes import get_session_service
 from app.sessions import AttemptRequest, ContinueRequest, InterviewSessionService
@@ -83,9 +84,9 @@ def submit(sessions, identifier, *, question=0, revision=0, measurement=None, an
     )).attempt
 
 
-def measured_attempt(sessions, identifier, values=None, *, question=0, revision=0, answer="Answer"):
+def measured_attempt(sessions, identifier, values=None, *, question=0, revision=0, answer="Answer", delivery=None):
     identifier_of_measurement = sessions.create_measurement(
-        identifier, question, values or metrics(), expected_last_attempt_number=revision,
+        identifier, question, values or metrics(), expected_last_attempt_number=revision, delivery_metrics=delivery,
     )
     return submit(
         sessions, identifier, question=question, revision=revision,
@@ -135,6 +136,7 @@ def test_zero_attempts_default_is_successful_null_comparison(client, sessions):
     assert response.json() == {
         "session_id": str(created.id), "question_index": 0,
         "before_attempt": None, "after_attempt": None, "comparison": None,
+        "delivery_comparison": None,
     }
 
 
@@ -146,6 +148,7 @@ def test_one_attempt_default_exposes_identity_without_inventing_after(client, se
     assert response.json() == {
         "session_id": str(created.id), "question_index": 0,
         "before_attempt": identity(first), "after_attempt": None, "comparison": None,
+        "delivery_comparison": None,
     }
 
 
@@ -156,7 +159,7 @@ def test_two_attempts_default_selects_first_and_latest(client, sessions):
     response = client.get(comparison_url(created.id))
     assert response.status_code == 200
     result = response.json()
-    assert set(result) == {"session_id", "question_index", "before_attempt", "after_attempt", "comparison"}
+    assert set(result) == {"session_id", "question_index", "before_attempt", "after_attempt", "comparison", "delivery_comparison"}
     assert result["before_attempt"] == identity(first)
     assert result["after_attempt"] == identity(second)
     assert set(result["before_attempt"]) == set(result["after_attempt"]) == IDENTITY_FIELDS
@@ -530,3 +533,137 @@ def test_comparison_is_read_only_and_leaves_attempts_and_measurements_unchanged(
     assert UUID(result["before_attempt"]["measurement_id"]) != UUID(result["after_attempt"]["measurement_id"])
     assert rows() == before
     assert sessions.get(created.id) == session_before
+
+
+DELIVERY_METRICS = ("pause_count", "total_pause_duration_seconds", "longest_pause_seconds")
+
+
+def delivery(**changes):
+    values = {"pause_count": 2, "total_pause_duration_seconds": 1.234567890123,
+              "longest_pause_seconds": 0.734567890123, "unavailable_reason": None}
+    values.update(changes)
+    return DeliveryMetrics(**values)
+
+
+def test_default_and_explicit_delivery_comparisons_use_exact_linked_attempts_in_one_read(
+        client, sessions, postgres_engine):
+    owner, unrelated = sessions.start(), sessions.start()
+    before = delivery(pause_count=0, total_pause_duration_seconds=0.0, longest_pause_seconds=0.0)
+    after = delivery(pause_count=3, total_pause_duration_seconds=1.234567890789,
+                     longest_pause_seconds=0.734567890789)
+    first = measured_attempt(sessions, owner.id, delivery=before, answer="Edited original answer")
+    second = measured_attempt(sessions, owner.id, revision=1, delivery=delivery())
+    third = measured_attempt(sessions, owner.id, revision=2, delivery=after)
+    sessions.create_measurement(owner.id, 0, metrics(recognized_word_count=999),
+                                expected_last_attempt_number=3, delivery_metrics=delivery(pause_count=100,
+                                total_pause_duration_seconds=100.0, longest_pause_seconds=1.0))
+    measured_attempt(sessions, unrelated.id, metrics(recognized_word_count=999), delivery=delivery())
+    statements = []
+
+    def observe(connection, cursor, statement, parameters, context, executemany):
+        if statement.lstrip().upper().startswith("SELECT"):
+            statements.append(statement)
+
+    event.listen(postgres_engine, "before_cursor_execute", observe)
+    try:
+        response = client.get(comparison_url(owner.id))
+    finally:
+        event.remove(postgres_engine, "before_cursor_execute", observe)
+    assert response.status_code == 200
+    assert len(statements) == 1
+    result = response.json()
+    assert result["before_attempt"] == identity(first)
+    assert result["after_attempt"] == identity(third)
+    assert str(unrelated.id) not in response.text
+    assert "Edited original answer" not in response.text
+    sibling = result["delivery_comparison"]
+    assert sibling["before_version"] == sibling["after_version"] == "pause-metrics-v1"
+    assert sibling["before_source"] == sibling["after_source"] == "original_transcription"
+    for name in DELIVERY_METRICS:
+        assert sibling[name] == {
+            "before": getattr(before, name), "after": getattr(after, name),
+            "delta": getattr(after, name) - getattr(before, name),
+            "before_unavailable_reason": None, "after_unavailable_reason": None,
+            "comparable": True, "comparison_unavailable_reason": None,
+        }
+    selected = client.get(comparison_url(owner.id), params={"before": 2, "after": 3}).json()
+    assert selected["before_attempt"] == identity(second)
+    assert selected["delivery_comparison"]["total_pause_duration_seconds"]["delta"] == (
+        after.total_pause_duration_seconds - delivery().total_pause_duration_seconds
+    ) != 0
+    assert set(sibling) == {*DELIVERY_METRICS, "before_version", "after_version", "before_source", "after_source"}
+    assert all(set(sibling[name]) == METRIC_FIELDS for name in DELIVERY_METRICS)
+
+
+@pytest.mark.parametrize(("before_state", "after_state"), [
+    ("legacy", "legacy"), ("legacy", "available"), ("available", "legacy"),
+    ("typed", "available"), ("available", "typed"), ("typed", "legacy"), ("typed", "typed"),
+    ("available", "unavailable"), ("unavailable", "available"), ("unavailable", "unavailable"),
+])
+def test_persisted_delivery_states_keep_typed_legacy_and_unavailable_distinct(
+        client, sessions, before_state, after_state):
+    created = sessions.start()
+    state_values = {
+        "legacy": None, "available": delivery(pause_count=0, total_pause_duration_seconds=0.0,
+                                              longest_pause_seconds=0.0),
+        "unavailable": delivery(pause_count=None, total_pause_duration_seconds=None,
+                                longest_pause_seconds=None, unavailable_reason="missing_timings"),
+    }
+    for revision, state in enumerate((before_state, after_state)):
+        if state == "typed":
+            submit(sessions, created.id, revision=revision)
+        else:
+            measured_attempt(sessions, created.id, revision=revision, delivery=state_values[state])
+    response = client.get(comparison_url(created.id))
+    assert response.status_code == 200
+    result = response.json()
+    reasons = {"typed": "no_measurement", "legacy": "not_recorded", "available": None,
+               "unavailable": "missing_timings"}
+    sibling = result["delivery_comparison"]
+    for name in DELIVERY_METRICS:
+        change = sibling[name]
+        assert change["before"] == (0 if before_state == "available" else None)
+        assert change["after"] == (0 if after_state == "available" else None)
+        assert change["before_unavailable_reason"] == reasons[before_state]
+        assert change["after_unavailable_reason"] == reasons[after_state]
+        assert change["delta"] is None
+        assert change["comparable"] is False
+    # Delivery unavailability and legacy state do not change existing speaking availability.
+    assert result["comparison"]["recognized_word_count"]["comparable"] == (
+        before_state != "typed" and after_state != "typed"
+    )
+
+
+@pytest.mark.parametrize(("speaking_version", "delivery_version"), [
+    (MEASUREMENT_VERSION, "pause-metrics-historical"), ("speaking-metrics-historical", "pause-metrics-v1"),
+])
+def test_persisted_speaking_and_delivery_versions_are_compared_independently(
+        sessions, postgres_session_factory, speaking_version, delivery_version):
+    created = sessions.start()
+    measured_attempt(sessions, created.id, delivery=delivery())
+    values, pauses = metrics(), delivery()
+    with postgres_session_factory.begin() as database:
+        row = TranscriptionMeasurement(
+            session_id=created.id, question_index=0, measurement_version=speaking_version,
+            measurement_source=values.source, **values.model_dump(exclude={"source"}),
+            delivery_measurement_version=delivery_version, pause_count=pauses.pause_count,
+            total_pause_duration_seconds=pauses.total_pause_duration_seconds,
+            longest_pause_seconds=pauses.longest_pause_seconds, pause_unavailable_reason=None,
+        )
+        database.add(row)
+        database.flush()
+        identifier = row.id
+    submit(sessions, created.id, revision=1, measurement=identifier)
+    result = payload(sessions, created.id)
+    speaking_compatible = speaking_version == MEASUREMENT_VERSION
+    delivery_compatible = delivery_version == "pause-metrics-v1"
+    for name in METRICS:
+        assert result["comparison"][name]["comparable"] is speaking_compatible
+        assert result["comparison"][name]["comparison_unavailable_reason"] == (
+            None if speaking_compatible else "measurement_version_mismatch"
+        )
+    for name in DELIVERY_METRICS:
+        assert result["delivery_comparison"][name]["comparable"] is delivery_compatible
+        assert result["delivery_comparison"][name]["comparison_unavailable_reason"] == (
+            None if delivery_compatible else "measurement_version_mismatch"
+        )

@@ -7,12 +7,14 @@ from sqlalchemy import and_, func, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.comparisons import (
-    AttemptComparison, ComparedAttempt, MeasurementSnapshot, compare_measurements,
+    AttemptComparison, ComparedAttempt, MeasurementSnapshot, compare_delivery_measurements,
+    compare_measurements, delivery_snapshot,
 )
 from app.database_models import (
     MEASUREMENT_VERSION, QuestionAttempt, StoredInterviewSession,
     TranscriptionMeasurement, validate_submitted_answer_text,
 )
+from app.delivery_metrics import DeliveryMetrics
 from app.speaking_metrics import SpeakingMetrics
 
 QUESTIONS = (
@@ -168,14 +170,14 @@ class InterviewSessionService:
                 raise InvalidComparisonSelection("before must be less than after.")
             before_attempt, before_measurement = attempts[before_number]
             after_attempt, after_measurement = attempts[after_number]
+            before_snapshot = self._measurement_snapshot(before_measurement)
+            after_snapshot = self._measurement_snapshot(after_measurement)
             return AttemptComparison(
                 session_id=session_id, question_index=question_index,
                 before_attempt=self._compared_attempt(before_attempt, before_measurement),
                 after_attempt=self._compared_attempt(after_attempt, after_measurement),
-                comparison=compare_measurements(
-                    self._measurement_snapshot(before_measurement),
-                    self._measurement_snapshot(after_measurement),
-                ),
+                comparison=compare_measurements(before_snapshot, after_snapshot),
+                delivery_comparison=compare_delivery_measurements(before_snapshot, after_snapshot),
             )
 
     def submit_attempt(
@@ -237,13 +239,22 @@ class InterviewSessionService:
 
     def create_measurement(
         self, session_id: UUID, question_index: int, metrics: SpeakingMetrics,
-        *, expected_last_attempt_number: int,
+        *, expected_last_attempt_number: int, delivery_metrics: DeliveryMetrics | None = None,
     ) -> UUID:
         """Persist only original metrics after inference, in a new transaction.
 
         The session lock closes the revalidation/insert race with answer submission.
         No provider call, audio, transcript text or word timing array enters here.
+        Legacy callers may omit delivery facts; transcription always supplies the
+        calculated family, including explicit unavailability, before this insert.
         """
+        delivery_fields = {} if delivery_metrics is None else {
+            "delivery_measurement_version": delivery_metrics.version,
+            "pause_count": delivery_metrics.pause_count,
+            "total_pause_duration_seconds": delivery_metrics.total_pause_duration_seconds,
+            "longest_pause_seconds": delivery_metrics.longest_pause_seconds,
+            "pause_unavailable_reason": delivery_metrics.unavailable_reason,
+        }
         with self._session_factory.begin() as database:
             stored = self._locked_session(database, session_id)
             self._check_question(stored, question_index)
@@ -260,6 +271,7 @@ class InterviewSessionService:
                 timed_utterance_span_seconds=metrics.timed_utterance_span_seconds,
                 estimated_words_per_minute=metrics.estimated_words_per_minute,
                 timing_unavailable_reason=metrics.timing_unavailable_reason,
+                **delivery_fields,
             )
             database.add(measurement)
             database.flush()
@@ -335,6 +347,11 @@ class InterviewSessionService:
             timed_utterance_span_seconds=measurement.timed_utterance_span_seconds,
             estimated_words_per_minute=measurement.estimated_words_per_minute,
             timing_unavailable_reason=measurement.timing_unavailable_reason,
+            delivery_metrics=delivery_snapshot(
+                measurement.delivery_measurement_version, measurement.measurement_source,
+                measurement.pause_count, measurement.total_pause_duration_seconds,
+                measurement.longest_pause_seconds, measurement.pause_unavailable_reason,
+            ),
         )
 
     @staticmethod

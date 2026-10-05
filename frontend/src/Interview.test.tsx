@@ -2,7 +2,7 @@
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { afterEach, beforeEach, expect, test, vi } from 'vitest'
 import Interview from './Interview'
-import type { Attempt, AttemptComparison, InterviewSession, MetricChange } from './interviewApi'
+import type { Attempt, AttemptComparison, DeliveryMetricChange, InterviewSession, MetricChange } from './interviewApi'
 
 const storageKey = 'rehearse.session_id'
 const questions = ['Question one', 'Question two', 'Question three', 'Question four', 'Question five']
@@ -12,6 +12,9 @@ type Comparison = AttemptComparison
 const unavailable: Metric = {
   before: null, after: null, delta: null, before_unavailable_reason: 'no_measurement',
   after_unavailable_reason: 'no_measurement', comparable: false, comparison_unavailable_reason: 'both_unavailable',
+}
+const deliveryUnavailable: DeliveryMetricChange = {
+  ...unavailable, before_unavailable_reason: 'no_measurement', after_unavailable_reason: 'no_measurement',
 }
 function metric(before: number, after: number): Metric {
   return { before, after, delta: after - before, before_unavailable_reason: null, after_unavailable_reason: null,
@@ -53,7 +56,9 @@ function mockSessionApi(initial = freshSession()) {
     return comparisons.get(questionIndex) ?? { session_id: session.id, question_index: questionIndex,
       before_attempt: list[0] ? identity(list[0]) : null, after_attempt: list.length > 1 ? identity(list.at(-1)!) : null,
       comparison: list.length > 1 ? { recognized_word_count: { ...unavailable }, um_count: { ...unavailable },
-        uh_count: { ...unavailable }, timed_utterance_span_seconds: { ...unavailable }, estimated_words_per_minute: { ...unavailable } } : null }
+        uh_count: { ...unavailable }, timed_utterance_span_seconds: { ...unavailable }, estimated_words_per_minute: { ...unavailable } } : null,
+      delivery_comparison: list.length > 1 ? { before_version: null, after_version: null, before_source: null, after_source: null,
+        pause_count: { ...deliveryUnavailable }, total_pause_duration_seconds: { ...deliveryUnavailable }, longest_pause_seconds: { ...deliveryUnavailable } } : null }
   }
   const fetchMock = vi.fn(async (input: RequestInfo | URL, options?: RequestInit) => {
     const url = String(input)
@@ -177,7 +182,7 @@ test('Attempt 2 and Attempt 3 use authoritative revisions, preserve history, and
   expect(postedBody(api, '/attempts', 1)).toEqual({ expected_last_attempt_number: 1, answer: 'Attempt two text', measurement_id: null })
   expect(screen.getByRole('heading', { name: 'Attempt 1' })).toBeTruthy()
   expect(screen.getByRole('heading', { name: 'Attempt 2' })).toBeTruthy()
-  await screen.findByRole('table')
+  await screen.findByRole('table', { name: 'Speaking duration is shown in seconds.' })
   expect(api.gets('/comparison')).toHaveLength(1)
   expect(screen.getByText(/Attempt 1.*Attempt 2/)).toBeTruthy()
   await retry(); await submit('Attempt three text')
@@ -267,7 +272,7 @@ test.each([0, 1, 3])('page reload reconstructs %i saved attempts without persist
     await screen.findByRole('button', { name: 'Continue' })
     expect(screen.queryByRole('textbox')).toBeNull()
     for (let index = 0; index < count; index += 1) expect(screen.getByText(`Saved ${index + 1}`)).toBeTruthy()
-    if (count > 1) await screen.findByRole('table')
+    if (count > 1) await screen.findByRole('table', { name: 'Speaking duration is shown in seconds.' })
   }
   expect(api.creations()).toBe(0)
   expect(api.gets(`/api/sessions/${api.session().id}`)).toHaveLength(2)
@@ -427,13 +432,13 @@ test('neutral comparison displays backend deltas, measured zero and display-only
     timed_utterance_span_seconds: { ...metric(1.24, 2.26), delta: 1.02 },
     estimated_words_per_minute: { ...metric(92.04, 108.06), delta: 16.02 } }
   api.setComparison(comparison)
-  await restore(api); await screen.findByRole('table')
+  await restore(api); await screen.findByRole('table', { name: 'Speaking duration is shown in seconds.' })
   expect(comparisonRow('Recognized words')).toEqual(['8', '24', '+16'])
   expect(comparisonRow('Um')).toEqual(['3', '0', '-3'])
   expect(comparisonRow('Uh')).toEqual(['0', '0', '0'])
   expect(comparisonRow('Speaking duration')).toEqual(['1.2', '2.3', '+1.0'])
   expect(comparisonRow('Words per minute')).toEqual(['92.0', '108.1', '+16.0'])
-  const table = screen.getByRole('table')
+  const table = screen.getByRole('table', { name: 'Speaking duration is shown in seconds.' })
   for (const label of ['Before', 'After', 'Change']) expect(within(table).getByRole('columnheader', { name: label })).toBeTruthy()
   expect(table.textContent).not.toMatch(/\b(improved|better|worse|strong|weak|good|bad|score)\b/i)
 })
@@ -441,11 +446,11 @@ test('neutral comparison displays backend deltas, measured zero and display-only
 test('typed comparisons show unavailable rather than fabricated zero', async () => {
   const api = mockSessionApi()
   api.append('Typed before'); api.append('Typed after')
-  await restore(api); await screen.findByRole('table')
+  await restore(api); await screen.findByRole('table', { name: 'Speaking duration is shown in seconds.' })
   for (const label of ['Recognized words', 'Um', 'Uh', 'Speaking duration', 'Words per minute']) {
     for (const cell of comparisonRow(label)) expect(cell).toContain('Unavailable')
   }
-  expect(screen.getByRole('table').textContent).not.toMatch(/\b0\b/)
+  expect(screen.getByRole('table', { name: 'Speaking duration is shown in seconds.' }).textContent).not.toMatch(/\b0\b/)
 })
 
 test.each(['unsupported_language', 'missing_timings', 'timing_coverage_mismatch', 'invalid_timing', 'invalid_timing_order', 'unusable_span'] as const)('comparison preserves neutral unavailability for %s', async (reason) => {
@@ -456,7 +461,7 @@ test.each(['unsupported_language', 'missing_timings', 'timing_coverage_mismatch'
   comparison.comparison = { recognized_word_count: metric(4, 4), um_count: changed, uh_count: changed,
     timed_utterance_span_seconds: changed, estimated_words_per_minute: changed }
   api.setComparison(comparison)
-  await restore(api); await screen.findByRole('table')
+  await restore(api); await screen.findByRole('table', { name: 'Speaking duration is shown in seconds.' })
   const row = comparisonRow(reason === 'unsupported_language' ? 'Um' : 'Speaking duration')
   for (const cell of row) expect(cell).toContain('Unavailable')
   expect(comparisonRow('Recognized words')).toEqual(['4', '4', '0'])
@@ -470,10 +475,10 @@ test.each(['measurement_version_mismatch', 'measurement_source_incompatible'] as
   comparison.comparison = { recognized_word_count: changed, um_count: changed, uh_count: changed,
     timed_utterance_span_seconds: changed, estimated_words_per_minute: changed }
   api.setComparison(comparison)
-  await restore(api); await screen.findByRole('table')
+  await restore(api); await screen.findByRole('table', { name: 'Speaking duration is shown in seconds.' })
   expect(comparisonRow('Recognized words').slice(0, 2)).toEqual(['4', '8'])
   expect(comparisonRow('Recognized words')[2]).toContain('Unavailable')
-  expect(screen.getByRole('table').textContent).not.toContain('+4')
+  expect(screen.getByRole('table', { name: 'Speaking duration is shown in seconds.' }).textContent).not.toContain('+4')
 })
 
 test.each(['attempts', 'continue'] as const)('acknowledged %s followed by a read failure remains guarded until reconciliation', async (operation) => {
@@ -521,7 +526,7 @@ test('tiny nonzero backend deltas retain their signs after display rounding', as
     timed_utterance_span_seconds: { ...metric(1, 1.01), delta: 0.01 },
     estimated_words_per_minute: { ...metric(100, 99.99), delta: -0.01 } }
   api.setComparison(comparison)
-  await restore(api); await screen.findByRole('table')
+  await restore(api); await screen.findByRole('table', { name: 'Speaking duration is shown in seconds.' })
   expect(comparisonRow('Speaking duration')[2]).toBe('+0.0')
   expect(comparisonRow('Words per minute')[2]).toBe('-0.0')
 })
@@ -531,6 +536,7 @@ test('a null comparison from the backend never produces an empty comparison card
   api.append('Before'); api.append('After')
   const comparison = api.comparison(0)
   comparison.comparison = null
+  comparison.delivery_comparison = null
   comparison.after_attempt = null
   api.setComparison(comparison)
   await restore(api); await screen.findByRole('button', { name: 'Continue' })
@@ -599,7 +605,7 @@ test('an append during attempt retrieval causes a read-only reread with coherent
   })
   await restore(api)
   await screen.findByRole('button', { name: 'Continue' })
-  await screen.findByRole('table')
+  await screen.findByRole('table', { name: 'Speaking duration is shown in seconds.' })
   expect(screen.getByText('Initial saved answer')).toBeTruthy()
   expect(screen.getByText('Concurrent second answer')).toBeTruthy()
   expect(screen.getByText(/Attempt 1.*Attempt 2/)).toBeTruthy()
@@ -622,7 +628,7 @@ test('an append during comparison retrieval discards its stale latest identity a
     return undefined
   })
   await restore(api)
-  await screen.findByRole('table')
+  await screen.findByRole('table', { name: 'Speaking duration is shown in seconds.' })
   expect(screen.getByText('Concurrent third answer')).toBeTruthy()
   expect(screen.getByText(/Attempt 1.*Attempt 3/)).toBeTruthy()
   expect(api.gets('/questions/0/attempts')).toHaveLength(2)

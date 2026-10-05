@@ -15,7 +15,7 @@ from pydantic import (
 from sqlalchemy import and_, func, select, text
 from sqlalchemy.orm import Session
 
-from app.comparisons import MeasurementSnapshot
+from app.comparisons import MeasurementSnapshot, delivery_snapshot
 from app.database_models import QuestionAttempt, StoredInterviewSession, TranscriptionMeasurement
 from app.sessions import SessionNotFound
 
@@ -54,7 +54,7 @@ class HistoryDetailQuery(BaseModel):
 
 
 class HistoryMeasurement(MeasurementSnapshot):
-    """Nine persisted scalar/provenance fields; no measurement UUID or content."""
+    """Explicit persisted scalar facts; no measurement UUID or content."""
 
     measurement_source: Literal["original_transcription"]
 
@@ -144,7 +144,15 @@ class _SessionRead:
     questions: list[QuestionOverview]
 
 
-_MEASUREMENT_FIELDS = tuple(HistoryMeasurement.model_fields)
+_MEASUREMENT_FIELDS = (
+    "measurement_version", "measurement_source", "recognized_word_count", "um_count", "uh_count",
+    "filler_unavailable_reason", "timed_utterance_span_seconds", "estimated_words_per_minute",
+    "timing_unavailable_reason",
+)
+_DELIVERY_FIELDS = (
+    "delivery_measurement_version", "pause_count", "total_pause_duration_seconds",
+    "longest_pause_seconds", "pause_unavailable_reason",
+)
 
 
 def _measurement_columns():
@@ -152,6 +160,7 @@ def _measurement_columns():
     return (
         TranscriptionMeasurement.id.label("linked_measurement_id"),
         *(getattr(TranscriptionMeasurement, name) for name in _MEASUREMENT_FIELDS),
+        *(getattr(TranscriptionMeasurement, name) for name in _DELIVERY_FIELDS),
     )
 
 
@@ -170,7 +179,18 @@ def _measurement(row) -> HistoryMeasurement | None:
         return None
     if row["linked_measurement_id"] != row["measurement_id"]:
         raise HistoryIntegrityError()
-    return HistoryMeasurement(**{name: row[name] for name in _MEASUREMENT_FIELDS})
+    try:
+        delivery = delivery_snapshot(
+            row["delivery_measurement_version"], row["measurement_source"], row["pause_count"],
+            row["total_pause_duration_seconds"], row["longest_pause_seconds"],
+            row["pause_unavailable_reason"],
+        )
+    except ValueError:
+        raise HistoryIntegrityError() from None
+    return HistoryMeasurement(
+        **{name: row[name] for name in _MEASUREMENT_FIELDS},
+        delivery_metrics=delivery,
+    )
 
 
 class HistoryReadService:

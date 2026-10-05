@@ -1,4 +1,6 @@
 import type { TimingUnavailableReason } from './interviewApi'
+import { validDeliveryMetrics } from './deliveryMetrics'
+import type { DeliveryMetrics } from './deliveryMetrics'
 import { normalizeSessionId } from './historyStorage'
 
 export interface HistoryMeasurement {
@@ -11,6 +13,7 @@ export interface HistoryMeasurement {
   timed_utterance_span_seconds: number | null
   estimated_words_per_minute: number | null
   timing_unavailable_reason: TimingUnavailableReason | null
+  delivery_metrics: DeliveryMetrics | null
 }
 export interface HistoryFinalizedPoint {
   question_index: number
@@ -76,7 +79,7 @@ export interface HistoryReadOptions { signal?: AbortSignal }
 export interface HistoryDetailOptions extends HistoryReadOptions { questionIndex?: number; afterAttemptNumber?: number; limit?: number }
 
 const timingReasons: readonly unknown[] = ['missing_timings', 'timing_coverage_mismatch', 'invalid_timing', 'invalid_timing_order', 'unusable_span']
-const measurementKeys = ['measurement_version', 'measurement_source', 'recognized_word_count', 'um_count', 'uh_count', 'filler_unavailable_reason', 'timed_utterance_span_seconds', 'estimated_words_per_minute', 'timing_unavailable_reason']
+const measurementKeys = ['measurement_version', 'measurement_source', 'recognized_word_count', 'um_count', 'uh_count', 'filler_unavailable_reason', 'timed_utterance_span_seconds', 'estimated_words_per_minute', 'timing_unavailable_reason', 'delivery_metrics']
 const pointKeys = ['question_index', 'attempt_id', 'attempt_number', 'submitted_at', 'measurement']
 const summaryKeys = ['session_id', 'status', 'created_at', 'completed_at', 'current_question_number', 'total_questions', 'finalized_question_count', 'questions_practiced_count', 'total_attempt_count', 'total_retry_count', 'measured_final_answer_count', 'last_submitted_at', 'last_saved_activity_at', 'finalized_points']
 const questionKeys = ['question_index', 'question_text', 'finalized', 'attempt_count', 'latest_attempt_id', 'latest_attempt_number', 'final_attempt_id', 'final_attempt_number']
@@ -101,7 +104,11 @@ function measurement(value: unknown): value is HistoryMeasurement | null {
       : value.filler_unavailable_reason === 'unsupported_language' && value.um_count === null && value.uh_count === null) &&
     (value.timing_unavailable_reason === null
       ? positiveFloat(value.timed_utterance_span_seconds) && positiveFloat(value.estimated_words_per_minute)
-      : timingReasons.includes(value.timing_unavailable_reason) && value.timed_utterance_span_seconds === null && value.estimated_words_per_minute === null)
+      : timingReasons.includes(value.timing_unavailable_reason) && value.timed_utterance_span_seconds === null && value.estimated_words_per_minute === null) &&
+    (value.delivery_metrics === null || (validDeliveryMetrics(value.delivery_metrics) &&
+      value.delivery_metrics.source === value.measurement_source &&
+      (value.delivery_metrics.pause_count === null ||
+        (value.recognized_word_count >= 1 && value.delivery_metrics.pause_count <= value.recognized_word_count - 1))))
 }
 function point(value: unknown): value is HistoryFinalizedPoint {
   return shape(value, pointKeys) && integer(value.question_index) && uuid(value.attempt_id) && positive(value.attempt_number) && timestamp(value.submitted_at) && measurement(value.measurement)
