@@ -6,6 +6,9 @@ from pydantic import BaseModel, ConfigDict, Field, StringConstraints, computed_f
 from sqlalchemy import and_, func, select
 from sqlalchemy.orm import Session, sessionmaker
 
+from app.comparisons import (
+    AttemptComparison, ComparedAttempt, MeasurementSnapshot, compare_measurements,
+)
 from app.database_models import (
     MEASUREMENT_VERSION, QuestionAttempt, StoredInterviewSession,
     TranscriptionMeasurement, validate_submitted_answer_text,
@@ -80,6 +83,10 @@ class SessionConflict(Exception):
     pass
 
 
+class InvalidComparisonSelection(Exception):
+    pass
+
+
 class InterviewSessionService:
     """PostgreSQL storage; each operation owns and closes its ORM transaction."""
 
@@ -114,6 +121,62 @@ class InterviewSessionService:
             if not 0 <= question_index < len(rows[0][0].questions):
                 raise SessionNotFound("Question not found.")
             return [self._attempt_response(attempt) for _, attempt in rows if attempt is not None]
+
+    def get_comparison(
+        self, session_id: UUID, question_index: int,
+        before: int | None = None, after: int | None = None,
+    ) -> AttemptComparison:
+        with self._session_factory.begin() as database:
+            # One statement selects the immutable question snapshot, scoped attempts
+            # and their exact linked measurements. No read lock or latest-measurement
+            # inference is needed, even if another retry commits during this read.
+            rows = database.execute(
+                select(StoredInterviewSession, QuestionAttempt, TranscriptionMeasurement)
+                .select_from(StoredInterviewSession)
+                .outerjoin(QuestionAttempt, and_(
+                    QuestionAttempt.session_id == StoredInterviewSession.id,
+                    QuestionAttempt.question_index == question_index,
+                ))
+                .outerjoin(TranscriptionMeasurement, and_(
+                    TranscriptionMeasurement.id == QuestionAttempt.measurement_id,
+                    TranscriptionMeasurement.session_id == QuestionAttempt.session_id,
+                    TranscriptionMeasurement.question_index == QuestionAttempt.question_index,
+                ))
+                .where(StoredInterviewSession.id == session_id)
+                .order_by(QuestionAttempt.attempt_number)
+            ).all()
+            if not rows:
+                raise SessionNotFound("Session not found.")
+            if not 0 <= question_index < len(rows[0][0].questions):
+                raise SessionNotFound("Question not found.")
+            attempts = {
+                attempt.attempt_number: (attempt, measurement)
+                for _, attempt, measurement in rows if attempt is not None
+            }
+            if before is None and after is None and len(attempts) < 2:
+                baseline = attempts.get(1)
+                return AttemptComparison(
+                    session_id=session_id, question_index=question_index,
+                    before_attempt=self._compared_attempt(*baseline) if baseline is not None else None,
+                    after_attempt=None, comparison=None,
+                )
+            before_number = 1 if before is None else before
+            after_number = max(attempts, default=0) if after is None else after
+            if before_number not in attempts or after_number not in attempts:
+                raise SessionNotFound("Attempt not found.")
+            if before_number >= after_number:
+                raise InvalidComparisonSelection("before must be less than after.")
+            before_attempt, before_measurement = attempts[before_number]
+            after_attempt, after_measurement = attempts[after_number]
+            return AttemptComparison(
+                session_id=session_id, question_index=question_index,
+                before_attempt=self._compared_attempt(before_attempt, before_measurement),
+                after_attempt=self._compared_attempt(after_attempt, after_measurement),
+                comparison=compare_measurements(
+                    self._measurement_snapshot(before_measurement),
+                    self._measurement_snapshot(after_measurement),
+                ),
+            )
 
     def submit_attempt(
         self, session_id: UUID, question_index: int, answer: AttemptRequest,
@@ -247,6 +310,31 @@ class InterviewSessionService:
         return Attempt(
             id=attempt.id, question_index=attempt.question_index, attempt_number=attempt.attempt_number,
             answer=attempt.answer_text, submitted_at=attempt.submitted_at, measurement_id=attempt.measurement_id,
+        )
+
+    @staticmethod
+    def _compared_attempt(
+        attempt: QuestionAttempt, measurement: TranscriptionMeasurement | None,
+    ) -> ComparedAttempt:
+        return ComparedAttempt(
+            id=attempt.id, attempt_number=attempt.attempt_number, measurement_id=attempt.measurement_id,
+            measurement_version=measurement.measurement_version if measurement is not None else None,
+            measurement_source=measurement.measurement_source if measurement is not None else None,
+        )
+
+    @staticmethod
+    def _measurement_snapshot(measurement: TranscriptionMeasurement | None) -> MeasurementSnapshot | None:
+        if measurement is None:
+            return None
+        return MeasurementSnapshot(
+            measurement_version=measurement.measurement_version,
+            measurement_source=measurement.measurement_source,
+            recognized_word_count=measurement.recognized_word_count,
+            um_count=measurement.um_count, uh_count=measurement.uh_count,
+            filler_unavailable_reason=measurement.filler_unavailable_reason,
+            timed_utterance_span_seconds=measurement.timed_utterance_span_seconds,
+            estimated_words_per_minute=measurement.estimated_words_per_minute,
+            timing_unavailable_reason=measurement.timing_unavailable_reason,
         )
 
     @staticmethod

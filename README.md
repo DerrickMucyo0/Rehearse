@@ -240,6 +240,46 @@ original-transcription text copy or word timings are stored. There are no user
 accounts, semantic scoring, retry UI or history UI. Hosting remains provider-neutral;
 no Supabase-specific APIs are used. Issue #9 remains open and frozen.
 
+### Persisted attempt comparison (Retry milestone, backend slice 2)
+
+On the retry feature branch, the backend appends numbered attempts without advancing
+the question; explicit Continue finalizes it. The frontend Retry/Continue flow is
+pending slice 3. The comparison endpoint is a read-only backend API:
+
+`GET /api/sessions/{session_id}/questions/{question_index}/comparison`
+
+Optional positive integer selectors `before` and `after` choose attempt numbers for
+that exact session/question. `before` defaults to 1; `after` defaults to the latest
+persisted attempt, including attempts 3 and beyond. Both selectors omitted with
+fewer than two attempts returns 200 with `comparison: null`, `after_attempt: null`,
+and Attempt 1 as `before_attempt` if it exists. Supplying either selector requires
+both selected resources to exist: an unknown session, question or selected attempt
+returns 404. Invalid selector shapes return 422. Existing selections must satisfy
+`before < after`; equal or reversed numbers return 422. Partial selectors use the
+same defaults; for example `before=2` compares Attempt 2 with the latest attempt.
+
+The response has `session_id`, `question_index`, `before_attempt`, `after_attempt`
+and `comparison`. Each selected attempt exposes only `id`, `attempt_number`,
+`measurement_id`, `measurement_version` and `measurement_source`. The comparison
+contains `recognized_word_count`, `um_count`, `uh_count`,
+`timed_utterance_span_seconds` and `estimated_words_per_minute`. Each metric has
+`before`, `after`, `delta`, `before_unavailable_reason`, `after_unavailable_reason`,
+`comparable` and `comparison_unavailable_reason`.
+
+Only each attempt's exact linked immutable measurement supplies values. A single
+SQL read keeps selection and measurement provenance consistent without row locks.
+Unlinked measurements and edited answer text have no effect. Compatible, available
+pairs use the unrounded persisted values for `delta = after - before`; measured
+zero remains zero. Typed attempts have null values with `no_measurement`. Stored
+filler/timing unavailable reasons remain unchanged, with null deltas.
+
+Both measurements must have the same version and source `original_transcription`.
+Unequal versions yield `measurement_version_mismatch`; otherwise unsupported
+sources yield `measurement_source_incompatible`. These take precedence over
+`before_unavailable`, `after_unavailable` or `both_unavailable`, while per-side
+reasons remain visible. Comparisons report neutral facts and never score quality
+or label a change as improvement.
+
 ### Real PostgreSQL verification
 
 Create a dedicated disposable test database and role once, on the local Compose

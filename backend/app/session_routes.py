@@ -3,11 +3,12 @@ from functools import lru_cache
 from typing import Annotated
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, Path, Request, Response
+from fastapi import APIRouter, Depends, HTTPException, Path, Query, Request, Response
 from pydantic import Field
 from starlette.concurrency import run_in_threadpool
 
 from app.audio import AudioAccepted, bounded_multipart_request, validated_audio
+from app.comparisons import AttemptComparison
 from app.database import create_database_engine, create_session_factory
 from app.speaking_metrics import SpeakingMetrics, measure_transcription
 from app.sessions import (
@@ -15,6 +16,7 @@ from app.sessions import (
     AttemptRequest,
     AttemptSubmission,
     ContinueRequest,
+    InvalidComparisonSelection,
     InterviewSession,
     InterviewSessionService,
     SessionConflict,
@@ -90,6 +92,20 @@ def get_attempts(
         return sessions.get_attempts(session_id, question_index)
     except SessionNotFound as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.get("/{session_id}/questions/{question_index}/comparison", response_model=AttemptComparison)
+def get_comparison(
+    session_id: UUID, question_index: Annotated[int, Path(ge=0)], sessions: SessionService,
+    before: Annotated[int | None, Query(ge=1)] = None,
+    after: Annotated[int | None, Query(ge=1)] = None,
+) -> AttemptComparison:
+    try:
+        return sessions.get_comparison(session_id, question_index, before=before, after=after)
+    except SessionNotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except InvalidComparisonSelection as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
 @asynccontextmanager
