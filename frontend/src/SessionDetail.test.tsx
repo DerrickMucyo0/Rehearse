@@ -3,7 +3,8 @@ import { act, cleanup, fireEvent, render, screen, within } from '@testing-librar
 import { afterEach, beforeEach, expect, test, vi } from 'vitest'
 import SessionDetail from './SessionDetail'
 import { getHistoryDetail, HistoryApiError } from './historyApi'
-import type { HistoryAttempt, HistoryDetail } from './historyApi'
+import type { HistoryAttempt, HistoryDetail, HistoryMeasurement } from './historyApi'
+import type { DeliveryMetrics } from './deliveryMetrics'
 
 vi.mock('./historyApi', async (importOriginal) => {
   const original = await importOriginal<typeof import('./historyApi')>()
@@ -463,4 +464,106 @@ test.each(['overview', 'page'] as const)('unmounting aborts a pending %s read an
   expect(screen.queryByRole('region', { name: 'Session detail' })).toBeNull()
   expect(options.onBack).not.toHaveBeenCalled()
   expect(options.onRemove).not.toHaveBeenCalled()
+})
+
+function persistedMeasurement(delivery_metrics: DeliveryMetrics | null): HistoryMeasurement {
+  return { measurement_version: 'speaking-metrics-v1', measurement_source: 'original_transcription',
+    recognized_word_count: 10, um_count: 0, uh_count: 1, filler_unavailable_reason: null,
+    timed_utterance_span_seconds: 12.123456789, estimated_words_per_minute: 49.491231198,
+    timing_unavailable_reason: null, delivery_metrics }
+}
+function recordedDelivery(changes: Partial<DeliveryMetrics> = {}): DeliveryMetrics {
+  return { version: 'pause-metrics-v1', source: 'original_transcription', pause_count: 2,
+    total_pause_duration_seconds: 1.234567890123, longest_pause_seconds: 0.765432109876,
+    unavailable_reason: null, ...changes }
+}
+async function openMeasuredAttempt(delivery_metrics: DeliveryMetrics | null) {
+  const selected = attempt(0, 9, 'An edited saved answer; original timing facts remain unchanged.', true)
+  selected.measurement = persistedMeasurement(delivery_metrics)
+  readDetail.mockResolvedValueOnce(overview()).mockResolvedValueOnce(page(0, [selected]))
+  render(<SessionDetail {...props()} />)
+  fireEvent.click(await screen.findByRole('button', { name: 'Question 1' }))
+  const article = (await screen.findByRole('heading', { name: 'Attempt 9' })).closest('article')!
+  return { article, selected }
+}
+
+test('historical selected voice attempt displays Not recorded without fabricating a delivery version', async () => {
+  const { article } = await openMeasuredAttempt(null)
+  expect(within(article).getAllByText('Not recorded').length).toBeGreaterThan(0)
+  expect(article.textContent).not.toContain('pause-metrics-v1')
+  expect(article.textContent).not.toContain('Unavailable — No measurement')
+})
+
+test('selected persisted delivery values render factual labels and display-only rounding', async () => {
+  const original = recordedDelivery()
+  const { article, selected } = await openMeasuredAttempt(original)
+  expect(within(article).getByRole('heading', { name: 'Timed pauses' })).toBeTruthy()
+  expect(within(article).getByText('Pause count').nextElementSibling?.textContent).toBe('2')
+  expect(within(article).getByText('Total pause time').nextElementSibling?.textContent).toBe('1.2 s')
+  expect(within(article).getByText('Longest pause').nextElementSibling?.textContent).toBe('0.8 s')
+  expect(selected.measurement!.delivery_metrics).toEqual(original)
+  expect(article.textContent).toContain('original transcription')
+  expect(article.textContent).toContain('not necessarily acoustic silence')
+})
+
+test('zero-pause selected attempt renders three measured zeros, not unavailable or historical absence', async () => {
+  const { article } = await openMeasuredAttempt(recordedDelivery({ pause_count: 0, total_pause_duration_seconds: 0, longest_pause_seconds: 0 }))
+  expect(within(article).getByText('Pause count').nextElementSibling?.textContent).toBe('0')
+  expect(within(article).getAllByText('0.0 s')).toHaveLength(2)
+  expect(article.textContent).not.toContain('Not recorded')
+  expect(article.textContent).not.toContain('Unavailable')
+})
+
+test.each(['missing_timings', 'timing_coverage_mismatch', 'invalid_timing', 'invalid_timing_order', 'unusable_span'] as const)(
+  'selected recorded delivery %s displays unavailable rather than unrecorded or zero', async (unavailable_reason) => {
+    const { article } = await openMeasuredAttempt(recordedDelivery({
+      pause_count: null, total_pause_duration_seconds: null, longest_pause_seconds: null, unavailable_reason,
+    }))
+    expect(article.textContent).toContain('Unavailable')
+    expect(article.textContent).not.toContain(unavailable_reason)
+    expect(article.textContent).not.toContain('Not recorded')
+    expect(article.textContent).not.toContain('0.0 s')
+  },
+)
+
+test('typed selected final keeps no measurement distinct from historical voice Not recorded', async () => {
+  readDetail.mockResolvedValueOnce(overview()).mockResolvedValueOnce(page(0, [attempt(0, 9, 'Typed final.', true)]))
+  render(<SessionDetail {...props()} />)
+  fireEvent.click(await screen.findByRole('button', { name: 'Question 1' }))
+  expect(await screen.findByText('Timed pauses: Unavailable — No measurement')).toBeTruthy()
+  expect(screen.queryByText('Not recorded')).toBeNull()
+})
+
+test('delivery on an obsolete selected question cannot leak into the replacement question', async () => {
+  const old = deferred<HistoryDetail>()
+  const previous = attempt(0, 9, 'Old question measured answer', true)
+  previous.measurement = persistedMeasurement(recordedDelivery())
+  const current = attempt(1, 12, 'Current typed answer')
+  readDetail.mockResolvedValueOnce(overview()).mockReturnValueOnce(old.promise).mockResolvedValueOnce(page(1, [current]))
+  render(<SessionDetail {...props()} />)
+  fireEvent.click(await screen.findByRole('button', { name: 'Question 1' }))
+  fireEvent.click(screen.getByRole('button', { name: 'Question 2' }))
+  await screen.findByText('Current typed answer')
+  await act(async () => old.resolve(page(0, [previous])))
+  expect(screen.queryByText('Old question measured answer')).toBeNull()
+  expect(screen.queryByRole('heading', { name: 'Timed pauses' })).toBeNull()
+  expect(readDetail).toHaveBeenCalledTimes(3)
+})
+
+test('a paginated selected question preserves delivery facts attached to each persisted attempt', async () => {
+  const older = attempt(0, 1)
+  older.measurement = persistedMeasurement(null)
+  const first = firstPage()
+  first.selected_question!.attempts[0] = older
+  const final = lastPage()
+  final.selected_question!.attempts.at(-1)!.measurement = persistedMeasurement(recordedDelivery({ pause_count: 0, total_pause_duration_seconds: 0, longest_pause_seconds: 0 }))
+  readDetail.mockResolvedValueOnce(overview(FIRST, false, PAGINATED_QUESTIONS)).mockResolvedValueOnce(first).mockResolvedValueOnce(final)
+  render(<SessionDetail {...props()} />)
+  fireEvent.click(await screen.findByRole('button', { name: 'Question 1' }))
+  fireEvent.click(await screen.findByRole('button', { name: 'Load more' }))
+  const article = (await screen.findByRole('heading', { name: 'Attempt 39' })).closest('article')!
+  expect(within(article).getByText('Final')).toBeTruthy()
+  expect(within(article).getByText('Pause count').nextElementSibling?.textContent).toBe('0')
+  expect(within(screen.getByRole('heading', { name: 'Attempt 1' }).closest('article')!).getAllByText('Not recorded').length).toBeGreaterThan(0)
+  expect(readDetail.mock.calls[2][1]?.afterAttemptNumber).toBe(19)
 })

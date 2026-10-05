@@ -18,6 +18,7 @@ from app.database import create_database_engine, create_session_factory
 from app.database_models import (
     MEASUREMENT_VERSION, QuestionAttempt, StoredInterviewSession, TranscriptionMeasurement,
 )
+from app.delivery_metrics import DeliveryMetrics
 from app.history import HistoryReadService
 from app.history_routes import get_history_service
 from app.main import app
@@ -36,6 +37,7 @@ MEASUREMENT_FIELDS = {
     "measurement_version", "measurement_source", "recognized_word_count", "um_count",
     "uh_count", "filler_unavailable_reason", "timed_utterance_span_seconds",
     "estimated_words_per_minute", "timing_unavailable_reason",
+    "delivery_metrics",
 }
 POINT_FIELDS = {"question_index", "attempt_id", "attempt_number", "submitted_at", "measurement"}
 QUESTION_FIELDS = {
@@ -96,10 +98,11 @@ def metrics(**changes):
     return SpeakingMetrics(**values)
 
 
-def measurement_payload(values, version=MEASUREMENT_VERSION):
+def measurement_payload(values, version=MEASUREMENT_VERSION, delivery=None):
     return {
         "measurement_version": version, "measurement_source": values.source,
         **values.model_dump(exclude={"source"}),
+        "delivery_metrics": {**delivery.model_dump(), "source": values.source} if delivery is not None else None,
     }
 
 
@@ -109,9 +112,9 @@ def submit(sessions, identifier, *, question=0, revision=0, measurement=None, an
     )).attempt
 
 
-def measured_attempt(sessions, identifier, values=None, *, question=0, revision=0, answer="Answer"):
+def measured_attempt(sessions, identifier, values=None, *, question=0, revision=0, answer="Answer", delivery=None):
     measurement = sessions.create_measurement(
-        identifier, question, values or metrics(), expected_last_attempt_number=revision,
+        identifier, question, values or metrics(), expected_last_attempt_number=revision, delivery_metrics=delivery,
     )
     return submit(sessions, identifier, question=question, revision=revision,
                   measurement=measurement, answer=answer)
@@ -302,9 +305,23 @@ def test_number_gaps_use_actual_counts_and_greatest_number_not_timestamp(
         database.execute(update(StoredInterviewSession).where(StoredInterviewSession.id == created.id)
                          .values(created_at=datetime(2026, 1, 1, tzinfo=timezone.utc)))
         for number, submitted_at in ((1, later), (3, earlier)):
+            values = metrics()
+            pauses = delivery() if number == 1 else delivery(
+                pause_count=0, total_pause_duration_seconds=0.0, longest_pause_seconds=0.0,
+            )
+            measurement = TranscriptionMeasurement(
+                session_id=created.id, question_index=0, measurement_version=MEASUREMENT_VERSION,
+                measurement_source=values.source, **values.model_dump(exclude={"source"}),
+                delivery_measurement_version=pauses.version, pause_count=pauses.pause_count,
+                total_pause_duration_seconds=pauses.total_pause_duration_seconds,
+                longest_pause_seconds=pauses.longest_pause_seconds, pause_unavailable_reason=None,
+            )
+            database.add(measurement)
+            database.flush()
             database.execute(insert(QuestionAttempt).values(
                 id=identifiers[number], session_id=created.id, question_index=0,
                 attempt_number=number, answer_text=f"Historical {number}", submitted_at=submitted_at,
+                measurement_id=measurement.id,
             ))
     advance(sessions, created.id, revision=3)
     summary = batch(client, [created.id]).json()["summaries"][0]
@@ -312,14 +329,17 @@ def test_number_gaps_use_actual_counts_and_greatest_number_not_timestamp(
     assert datetime.fromisoformat(summary["last_submitted_at"]) == later
     assert summary["finalized_points"][0]["attempt_id"] == str(identifiers[3])
     assert summary["finalized_points"][0]["attempt_number"] == 3
+    assert summary["finalized_points"][0]["measurement"]["delivery_metrics"]["pause_count"] == 0
     first_page = client.get(detail_url(created.id), params={"question_index": 0, "limit": 1}).json()["selected_question"]
     assert [item["attempt_number"] for item in first_page["attempts"]] == [1]
     assert first_page["has_more"] is True
     assert first_page["next_after_attempt_number"] == 1
+    assert first_page["attempts"][0]["measurement"]["delivery_metrics"]["pause_count"] == 2
     last_page = client.get(detail_url(created.id), params={
         "question_index": 0, "limit": 1, "after_attempt_number": 1,
     }).json()["selected_question"]
     assert [item["attempt_number"] for item in last_page["attempts"]] == [3]
+    assert last_page["attempts"][0]["measurement"]["delivery_metrics"]["pause_count"] == 0
     assert last_page["attempts"][0]["is_final"] is True
     assert last_page["has_more"] is False
     assert last_page["next_after_attempt_number"] is None
@@ -546,7 +566,11 @@ def test_history_uses_read_only_repeatable_read_transactions(history, sessions, 
 def test_query_count_is_constant_at_batch_and_page_limits_and_summaries_never_select_answers(
         history, sessions, postgres_engine):
     identifiers = [sessions.start().id for _ in range(50)]
-    for revision in range(21):
+    for identifier in identifiers:
+        measured_attempt(sessions, identifier, delivery=delivery())
+        if identifier != identifiers[0]:
+            advance(sessions, identifier)
+    for revision in range(1, 22):
         submit(sessions, identifiers[0], revision=revision, answer="PRIVATE-QUERY-COVERAGE")
     captures = []
 
@@ -569,6 +593,7 @@ def test_query_count_is_constant_at_batch_and_page_limits_and_summaries_never_se
     full = capture(lambda: history.get_summaries(identifiers))
     assert 1 <= len(small) == len(full) <= 3
     assert all("answer_text" not in statement.lower() for statement in small + full)
+    assert all("delivery_measurement_version" in statement.lower() for statement in small + full)
     one = capture(lambda: history.get_detail(identifiers[0], question_index=0, limit=1))
     twenty = capture(lambda: history.get_detail(identifiers[0], question_index=0, limit=20))
     assert 1 <= len(one) == len(twenty) <= 4
@@ -668,7 +693,7 @@ def test_history_reads_leave_existing_comparison_endpoint_unchanged(
 
 def test_history_survives_service_and_engine_reconstruction(history, sessions, postgres_engine):
     created = sessions.start()
-    measured_attempt(sessions, created.id)
+    measured_attempt(sessions, created.id, delivery=delivery())
     advance(sessions, created.id)
     expected_summary = history.get_summaries([created.id])
     expected_detail = history.get_detail(created.id, question_index=0)
@@ -686,9 +711,11 @@ def test_history_survives_service_and_engine_reconstruction(history, sessions, p
 def test_history_snapshot_stays_coherent_without_blocking_retry_and_continue(
         history, sessions, postgres_engine, operation):
     created = sessions.start()
-    measured_attempt(sessions, created.id)
+    measured_attempt(sessions, created.id, delivery=delivery())
     advance(sessions, created.id)
-    original = measured_attempt(sessions, created.id, question=1)
+    original = measured_attempt(sessions, created.id, question=1, delivery=delivery(
+        pause_count=0, total_pause_duration_seconds=0.0, longest_pause_seconds=0.0,
+    ))
     reader_executed, release_reader, writer_finished = Event(), Event(), Event()
     results, errors = {}, {}
 
@@ -712,7 +739,7 @@ def test_history_snapshot_stays_coherent_without_blocking_retry_and_continue(
     def write():
         try:
             results["retry"] = measured_attempt(sessions, created.id, metrics(recognized_word_count=77),
-                                                question=1, revision=1)
+                                                question=1, revision=1, delivery=delivery())
             advance(sessions, created.id, 1, 2)
         except Exception as failure:
             errors["write"] = failure
@@ -751,8 +778,139 @@ def test_history_snapshot_stays_coherent_without_blocking_retry_and_continue(
         attempts = results["read"]["selected_question"]["attempts"]
         assert [attempt["attempt_id"] for attempt in attempts] == [str(original.id)]
         assert attempts[0]["is_final"] is False
+        assert attempts[0]["measurement"]["delivery_metrics"]["pause_count"] == 0
     later = summary_payload(history, created.id)
     assert later["total_attempt_count"] == 3
     assert later["finalized_question_count"] == 2
     assert later["finalized_points"][-1]["attempt_id"] == str(results["retry"].id)
     assert later["finalized_points"][-1]["measurement"]["recognized_word_count"] == 77
+    assert later["finalized_points"][-1]["measurement"]["delivery_metrics"]["pause_count"] == 2
+
+
+DELIVERY_FIELDS = {"version", "source", "pause_count", "total_pause_duration_seconds",
+                   "longest_pause_seconds", "unavailable_reason"}
+
+
+def delivery(**changes):
+    values = {"pause_count": 2, "total_pause_duration_seconds": 1.234567890123,
+              "longest_pause_seconds": 0.734567890123, "unavailable_reason": None}
+    values.update(changes)
+    return DeliveryMetrics(**values)
+
+
+def test_delivery_history_preserves_final_linkage_all_states_and_scoped_privacy(client, sessions):
+    owner, unrelated = sessions.start(), sessions.start()
+    superseded = measured_attempt(sessions, owner.id, delivery=delivery(), answer="SUPERSEDED-ANSWER")
+    exact = delivery(pause_count=3, total_pause_duration_seconds=1.234567890789,
+                     longest_pause_seconds=0.734567890789)
+    final = measured_attempt(sessions, owner.id, revision=1, delivery=exact, answer="FINAL-EDITED-ANSWER")
+    unlinked = sessions.create_measurement(owner.id, 0, metrics(recognized_word_count=999),
+        expected_last_attempt_number=2, delivery_metrics=delivery(pause_count=99,
+        total_pause_duration_seconds=99.0, longest_pause_seconds=1.0))
+    advance(sessions, owner.id, revision=2)
+    zero = delivery(pause_count=0, total_pause_duration_seconds=0.0, longest_pause_seconds=0.0)
+    zero_attempt = measured_attempt(sessions, owner.id, question=1, delivery=zero)
+    advance(sessions, owner.id, 1)
+    unavailable = delivery(pause_count=None, total_pause_duration_seconds=None, longest_pause_seconds=None,
+                           unavailable_reason="invalid_timing_order")
+    unavailable_attempt = measured_attempt(sessions, owner.id, question=2, delivery=unavailable)
+    advance(sessions, owner.id, 2)
+    legacy_attempt = measured_attempt(sessions, owner.id, question=3)
+    advance(sessions, owner.id, 3)
+    open_voice = measured_attempt(sessions, owner.id, question=4, delivery=delivery())
+    typed_final = submit(sessions, owner.id, question=4, revision=1, answer="TYPED-FINAL-ANSWER")
+    other = measured_attempt(sessions, unrelated.id, metrics(recognized_word_count=777),
+                             delivery=delivery(), answer="PRIVATE-OTHER-ANSWER")
+    advance(sessions, unrelated.id)
+    response = batch(client, [owner.id])
+    assert response.status_code == 200
+    assert response.headers["Cache-Control"] == "no-store"
+    summary = response.json()["summaries"][0]
+    assert summary["status"] == "active"
+    assert summary["total_attempt_count"] == 7
+    assert summary["total_retry_count"] == 2
+    assert summary["measured_final_answer_count"] == 4
+    points = summary["finalized_points"]
+    assert [point["attempt_id"] for point in points] == [
+        str(item.id) for item in (final, zero_attempt, unavailable_attempt, legacy_attempt)
+    ]
+    for point, expected in zip(points, (exact, zero, unavailable, None), strict=True):
+        assert point["measurement"] == measurement_payload(metrics(), delivery=expected)
+        nested = point["measurement"]["delivery_metrics"]
+        if nested is not None:
+            assert set(nested) == DELIVERY_FIELDS
+    assert points[1]["measurement"]["delivery_metrics"]["pause_count"] == 0
+    assert points[2]["measurement"]["delivery_metrics"]["unavailable_reason"] == "invalid_timing_order"
+    assert points[3]["measurement"]["delivery_metrics"] is None
+    assert str(superseded.id) not in response.text
+    assert str(open_voice.id) not in response.text
+    assert str(typed_final.id) not in response.text
+    assert "answer_text" not in response.text
+    details = client.get(detail_url(owner.id), params={"question_index": 0, "limit": 1})
+    assert details.status_code == 200
+    page = details.json()["selected_question"]
+    assert page["has_more"] is True
+    assert page["next_after_attempt_number"] == 1
+    assert page["attempts"][0]["attempt_id"] == str(superseded.id)
+    assert page["attempts"][0]["is_final"] is False
+    assert page["attempts"][0]["measurement"] == measurement_payload(metrics(), delivery=delivery())
+    next_page = client.get(detail_url(owner.id), params={
+        "question_index": 0, "after_attempt_number": 1, "limit": 1,
+    })
+    assert next_page.status_code == 200
+    final_page = next_page.json()["selected_question"]
+    assert final_page["has_more"] is False
+    assert final_page["next_after_attempt_number"] is None
+    assert final_page["attempts"][0]["attempt_id"] == str(final.id)
+    assert final_page["attempts"][0]["is_final"] is True
+    assert final_page["attempts"][0]["measurement"] == points[0]["measurement"]
+    for read in (response, details, next_page):
+        for identifier in (unrelated.id, other.id, other.measurement_id, unlinked,
+                           superseded.measurement_id, final.measurement_id, zero_attempt.measurement_id,
+                           unavailable_attempt.measurement_id, legacy_attempt.measurement_id, open_voice.measurement_id):
+            assert str(identifier) not in read.text
+        for private_field in ("words", "pause_events", "provider_response", "audio"):
+            assert f'"{private_field}"' not in read.text
+        assert "PRIVATE-OTHER-ANSWER" not in read.text
+    advance(sessions, owner.id, 4, 2)
+    completed = batch(client, [owner.id]).json()["summaries"][0]
+    assert completed["status"] == "completed"
+    assert completed["measured_final_answer_count"] == 4
+    assert completed["finalized_points"][:4] == points
+    assert completed["finalized_points"][4]["attempt_id"] == str(typed_final.id)
+    assert completed["finalized_points"][4]["measurement"] is None
+    typed_detail = client.get(detail_url(owner.id), params={"question_index": 4}).json()
+    assert typed_detail["selected_question"]["attempts"][0]["measurement"]["delivery_metrics"] is not None
+    assert typed_detail["selected_question"]["attempts"][1]["is_final"] is True
+    assert typed_detail["selected_question"]["attempts"][1]["measurement"] is None
+
+
+def test_history_preserves_independent_historical_delivery_version(client, sessions, postgres_session_factory):
+    created = sessions.start()
+    values, pauses = metrics(), delivery()
+    with postgres_session_factory.begin() as database:
+        row = TranscriptionMeasurement(
+            session_id=created.id, question_index=0, measurement_version=MEASUREMENT_VERSION,
+            measurement_source=values.source, **values.model_dump(exclude={"source"}),
+            delivery_measurement_version="pause-metrics-historical", pause_count=pauses.pause_count,
+            total_pause_duration_seconds=pauses.total_pause_duration_seconds,
+            longest_pause_seconds=pauses.longest_pause_seconds, pause_unavailable_reason=None,
+        )
+        database.add(row)
+        database.flush()
+        identifier = row.id
+    attempt = submit(sessions, created.id, measurement=identifier)
+    advance(sessions, created.id)
+    summary_response = batch(client, [created.id])
+    detail_response = client.get(detail_url(created.id), params={"question_index": 0})
+    assert summary_response.status_code == detail_response.status_code == 200
+    summary = summary_response.json()["summaries"][0]
+    measurement = summary["finalized_points"][0]["measurement"]
+    assert measurement["measurement_version"] == MEASUREMENT_VERSION
+    assert measurement["delivery_metrics"] == {
+        **pauses.model_dump(), "version": "pause-metrics-historical", "source": values.source,
+    }
+    selected = detail_response.json()["selected_question"]["attempts"][0]
+    assert selected["attempt_id"] == str(attempt.id)
+    assert selected["measurement"] == measurement
+    assert str(identifier) not in summary_response.text + detail_response.text

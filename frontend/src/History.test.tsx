@@ -19,7 +19,7 @@ const THIRD = '00000000-0000-4000-8000-000000000003'
 const hydrate = vi.mocked(hydrateHistory)
 const readDetail = vi.mocked(getHistoryDetail)
 const measurement = {
-  measurement_version: 'speaking-metrics-v1', measurement_source: 'original_transcription' as const,
+  measurement_version: 'speaking-metrics-v1', measurement_source: 'original_transcription' as const, delivery_metrics: null,
   recognized_word_count: 10, um_count: 0, uh_count: 1, filler_unavailable_reason: null,
   timed_utterance_span_seconds: 12.123456789, estimated_words_per_minute: 49.491231198,
   timing_unavailable_reason: null,

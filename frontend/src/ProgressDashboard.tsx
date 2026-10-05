@@ -1,6 +1,7 @@
 import type { HistoryHydrationState } from './historyHydration'
-import { describeUnavailableReason, formatProgressValue, PROGRESS_METRICS, projectProgress } from './progress'
-import type { ProgressGroup, ProgressMetric } from './progress'
+import { DELIVERY_PROGRESS_METRICS, describeUnavailableReason, formatProgressValue, PROGRESS_METRICS, projectProgress } from './progress'
+import type { DeliveryProgressMetric, ProgressGroup, ProgressMetric } from './progress'
+import { deliveryUnavailableText, formatDeliveryDuration, TIMED_PAUSES_EXPLANATION, TIMED_PAUSES_LIMITATION } from './deliveryMetrics'
 
 export interface ProgressDashboardProps {
   history: HistoryHydrationState
@@ -43,11 +44,34 @@ function MetricGroup({ group, metric }: { group: ProgressGroup; metric: Progress
   </div>
 }
 
+function DeliveryMetricTable({ metric }: { metric: DeliveryProgressMetric }) {
+  return <div className="progress-table-scroll">
+    <table className="progress-table">
+      <caption>{metric.label} ({metric.unit})</caption>
+      <thead><tr>
+        <th scope="col">Date/time</th><th scope="col">Question</th>
+        <th scope="col">Session status</th><th scope="col">Attempt</th>
+        <th scope="col">Value ({metric.unit})</th>
+      </tr></thead>
+      <tbody>{metric.rows.map(({ point, value, unavailableReason }, index) => <tr key={`${point.session_id}:${point.attempt_id}:${index}`}>
+        <td><time dateTime={point.submitted_at}>{new Date(point.submitted_at).toLocaleString()}</time></td>
+        <td>Question {point.question_index + 1}</td>
+        <td>{point.session_status === 'completed' ? 'Completed' : 'Active'}</td>
+        <td>{point.attempt_number}</td>
+        <td>{value === null
+          ? <>Unavailable{unavailableReason !== null && <> — {deliveryUnavailableText(unavailableReason)}</>}</>
+          : metric.id === 'pause_count' ? String(value) : formatDeliveryDuration(value)}</td>
+      </tr>)}</tbody>
+    </table>
+  </div>
+}
+
 export default function ProgressDashboard({ history, storageError, onRetry, onReload, onPractice }: ProgressDashboardProps) {
   const progress = projectProgress(history.summaries)
   const loading = history.status === 'loading' || history.status === 'idle'
   const complete = history.status === 'complete'
   const empty = history.rememberedCount === 0
+  const unrecordedDelivery = progress.points.filter((point) => point.measurement !== null && point.measurement.delivery_metrics === null).length
   return <section className="progress-dashboard" aria-label="Progress">
     <h2>Progress</h2>
     <p>Objective practice history from sessions remembered on this browser.</p>
@@ -87,6 +111,21 @@ export default function ProgressDashboard({ history, storageError, onRetry, onRe
             key={group.kind === 'measurement' ? JSON.stringify([group.measurementVersion, group.measurementSource]) : 'no_measurement'}
             group={group} metric={group.metrics.find((metric) => metric.id === definition.id)!} />)}
         </section>)}
+        <section aria-label="Timed pauses">
+          <h4>Timed pauses</h4>
+          <p>{TIMED_PAUSES_EXPLANATION}</p>
+          <p>{TIMED_PAUSES_LIMITATION}</p>
+          {unrecordedDelivery > 0 && <p>Timed pause analysis: Not recorded for {unrecordedDelivery} finalized measured {unrecordedDelivery === 1 ? 'answer' : 'answers'}.</p>}
+          {progress.deliveryGroups.length > 0 && DELIVERY_PROGRESS_METRICS.map((definition) => <section key={definition.id} aria-label={definition.label}>
+            <h5>{definition.label}</h5>
+            {progress.deliveryGroups.map((group) => <div className="progress-provenance" key={JSON.stringify([group.deliveryVersion, group.measurementSource])}>
+              <p>Delivery measurement version: {group.deliveryVersion}</p>
+              <p>Source: {group.measurementSource === 'original_transcription' ? 'Original transcription' : group.measurementSource}</p>
+              <p>{definition.label} available for {group.metrics.find((metric) => metric.id === definition.id)!.coverage.available} of {group.points.length} finalized answers in this delivery provenance group.</p>
+              <DeliveryMetricTable metric={group.metrics.find((metric) => metric.id === definition.id)!} />
+            </div>)}
+          </section>)}
+        </section>
       </section>}
     </>}
   </section>

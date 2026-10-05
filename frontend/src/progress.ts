@@ -1,4 +1,5 @@
 import type { HistoryFinalizedPoint, HistoryMeasurement, HistorySummary } from './historyApi'
+import type { DeliveryTimingReason } from './deliveryMetrics'
 
 export interface ProgressOverview {
   completedSessions: number
@@ -23,6 +24,12 @@ export const PROGRESS_METRICS = [
 ] as const
 
 export type ProgressMetricId = typeof PROGRESS_METRICS[number]['id']
+export const DELIVERY_PROGRESS_METRICS = [
+  { id: 'pause_count', label: 'Pause count', unit: 'count' },
+  { id: 'total_pause_duration_seconds', label: 'Total pause time', unit: 'seconds' },
+  { id: 'longest_pause_seconds', label: 'Longest pause', unit: 'seconds' },
+] as const
+export type DeliveryProgressMetricId = typeof DELIVERY_PROGRESS_METRICS[number]['id']
 export interface ProgressMetricRow {
   point: ProgressPoint
   value: number | null
@@ -50,6 +57,20 @@ export interface ProgressProjection {
   overview: ProgressOverview
   points: ProgressPoint[]
   groups: ProgressGroup[]
+  deliveryGroups: DeliveryProgressGroup[]
+}
+export interface DeliveryProgressMetric {
+  id: DeliveryProgressMetricId
+  label: string
+  unit: string
+  rows: { point: ProgressPoint; value: number | null; unavailableReason: DeliveryTimingReason | null }[]
+  coverage: { available: number; total: number }
+}
+export interface DeliveryProgressGroup {
+  deliveryVersion: string
+  measurementSource: string
+  points: ProgressPoint[]
+  metrics: DeliveryProgressMetric[]
 }
 
 function compareText(left: string, right: string): number {
@@ -122,10 +143,22 @@ function projectMetric(points: ProgressPoint[], definition: typeof PROGRESS_METR
   }
 }
 
+function projectDeliveryMetric(points: ProgressPoint[], definition: typeof DELIVERY_PROGRESS_METRICS[number]): DeliveryProgressMetric {
+  const rows = points.map((point) => {
+    // This cohort contains only recorded delivery snapshots. Legacy and typed
+    // points remain outside it, with their existing speaking facts unchanged.
+    const delivery = point.measurement!.delivery_metrics!
+    return { point, value: delivery[definition.id], unavailableReason: delivery.unavailable_reason }
+  })
+  return { ...definition, rows,
+    coverage: { available: rows.filter((row) => row.value !== null).length, total: rows.length } }
+}
+
 export function projectProgress(summaries: readonly HistorySummary[]): ProgressProjection {
   const points = finalizedProgressPoints(summaries)
   const measured = new Map<string, Extract<ProgressGroup, { kind: 'measurement' }>>()
   const noMeasurement: ProgressPoint[] = []
+  const deliveryCohorts = new Map<string, DeliveryProgressGroup>()
   for (const point of points) {
     if (point.measurement === null) {
       noMeasurement.push(point)
@@ -139,12 +172,25 @@ export function projectProgress(summaries: readonly HistorySummary[]): ProgressP
       measured.set(key, group)
     }
     group.points.push(point)
+    const delivery = point.measurement.delivery_metrics
+    if (delivery !== null) {
+      const deliveryKey = JSON.stringify([delivery.version, delivery.source])
+      let deliveryGroup = deliveryCohorts.get(deliveryKey)
+      if (!deliveryGroup) {
+        deliveryGroup = { deliveryVersion: delivery.version, measurementSource: delivery.source, points: [], metrics: [] }
+        deliveryCohorts.set(deliveryKey, deliveryGroup)
+      }
+      deliveryGroup.points.push(point)
+    }
   }
   const groups: ProgressGroup[] = [...measured.values()].sort((left, right) =>
     compareText(left.measurementVersion, right.measurementVersion) || compareText(left.measurementSource, right.measurementSource))
   if (noMeasurement.length > 0) groups.push({ kind: 'no_measurement', points: noMeasurement, metrics: [] })
   for (const group of groups) group.metrics = PROGRESS_METRICS.map((definition) => projectMetric(group.points, definition))
-  return { overview: progressOverview(summaries), points, groups }
+  const deliveryGroups = [...deliveryCohorts.values()].sort((left, right) =>
+    compareText(left.deliveryVersion, right.deliveryVersion) || compareText(left.measurementSource, right.measurementSource))
+  for (const group of deliveryGroups) group.metrics = DELIVERY_PROGRESS_METRICS.map((definition) => projectDeliveryMetric(group.points, definition))
+  return { overview: progressOverview(summaries), points, groups, deliveryGroups }
 }
 
 export function formatProgressValue(value: number, id: ProgressMetricId): string {

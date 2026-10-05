@@ -4,6 +4,7 @@ import { afterEach, beforeEach, expect, test, vi } from 'vitest'
 import type { HistoryFinalizedPoint, HistoryMeasurement, HistorySummary } from './historyApi'
 import type { HistoryHydrationState } from './historyHydration'
 import ProgressDashboard from './ProgressDashboard'
+import type { DeliveryMetrics } from './deliveryMetrics'
 
 const FIRST = '00000000-0000-4000-8000-000000000001'
 const SECOND = '00000000-0000-4000-8000-000000000002'
@@ -12,7 +13,7 @@ function measurement(changes: Partial<HistoryMeasurement> = {}): HistoryMeasurem
     measurement_version: 'speaking_metrics_v1', measurement_source: 'original_transcription',
     recognized_word_count: 10, um_count: 0, uh_count: 1, filler_unavailable_reason: null,
     timed_utterance_span_seconds: 12.123456789, estimated_words_per_minute: 49.491231198,
-    timing_unavailable_reason: null, ...changes,
+    timing_unavailable_reason: null, delivery_metrics: null, ...changes,
   }
 }
 function point(changes: Partial<HistoryFinalizedPoint> = {}): HistoryFinalizedPoint {
@@ -213,4 +214,148 @@ test('future provenance is React plaintext and cannot inject markup', () => {
   const { container } = setup(state([summary({ finalized_points: [point({ measurement: measurement({ measurement_version: marker }) })] })]))
   expect(screen.getAllByText(`Measurement version: ${marker}`)).toHaveLength(5)
   expect(container.querySelector('img')).toBeNull()
+})
+
+function delivery(changes: Partial<DeliveryMetrics> = {}): DeliveryMetrics {
+  return { version: 'pause-metrics-v1', source: 'original_transcription', pause_count: 2,
+    total_pause_duration_seconds: 1.234567890123, longest_pause_seconds: 0.765432109876,
+    unavailable_reason: null, ...changes }
+}
+function recordedPoint(delivery_metrics: DeliveryMetrics | null = delivery(), changes: Partial<HistoryFinalizedPoint> = {}): HistoryFinalizedPoint {
+  return point({ measurement: measurement({ delivery_metrics }), ...changes })
+}
+
+test.each([
+  ['Pause count', 'count', '2'], ['Total pause time', 'seconds', '1.2 s'], ['Longest pause', 'seconds', '0.8 s'],
+])('recorded %s has an accessible factual table and clear units', (name, unit, value) => {
+  const original = delivery()
+  setup(state([summary({ finalized_points: [recordedPoint(original)] })]))
+  const section = screen.getByRole('region', { name })
+  const table = within(section).getByRole('table', { name: `${name} (${unit})` })
+  expect(within(table).getAllByRole('columnheader')).toHaveLength(5)
+  expect(within(table).getByRole('columnheader', { name: `Value (${unit})` })).toBeTruthy()
+  expect(within(table).getAllByRole('row')[1].lastElementChild?.textContent).toBe(value)
+  expect(section.textContent).toContain('Delivery measurement version: pause-metrics-v1')
+  expect(section.textContent).toContain('Source: Original transcription')
+  expect(original.total_pause_duration_seconds).toBe(1.234567890123)
+  expect(original.longest_pause_seconds).toBe(0.765432109876)
+})
+
+test('timed pauses explains lexical gaps and acoustic limitation without delivery judgments', () => {
+  setup(state([summary({ finalized_points: [recordedPoint()] })]))
+  const section = screen.getByRole('region', { name: 'Timed pauses' })
+  expect(within(section).getByText('Timed pauses are gaps of at least 0.50 seconds between consecutive recognized words in the original transcription.')).toBeTruthy()
+  expect(within(section).getByText('These gaps are not necessarily acoustic silence.')).toBeTruthy()
+  expect(section.textContent).not.toMatch(/\b(better|worse|improved|improvement|regressed|confidence|fluent|fluency|weak|strong|ideal|score|average|median|trend)\b/i)
+})
+
+test('available delivery zeros show count0 and fixed-decimal duration0.0, not unavailability', () => {
+  setup(state([summary({ finalized_points: [recordedPoint(delivery({ pause_count: 0, total_pause_duration_seconds: 0, longest_pause_seconds: 0 }))] })]))
+  const section = screen.getByRole('region', { name: 'Timed pauses' })
+  expect(within(section).getByText('0')).toBeTruthy()
+  expect(within(section).getAllByText('0.0 s')).toHaveLength(2)
+  expect(section.textContent).not.toContain('Unavailable')
+  expect(section.textContent).not.toContain('Not recorded')
+  expect(section.textContent).toContain('available for 1 of 1')
+})
+
+test.each(['missing_timings', 'timing_coverage_mismatch', 'invalid_timing', 'invalid_timing_order', 'unusable_span'] as const)(
+  'recorded delivery %s stays unavailable with factual explanation and denominator', (unavailable_reason) => {
+    setup(state([summary({ finalized_points: [recordedPoint(delivery({
+      pause_count: null, total_pause_duration_seconds: null, longest_pause_seconds: null, unavailable_reason,
+    }))] })]))
+    const section = screen.getByRole('region', { name: 'Timed pauses' })
+    expect(within(section).getAllByText(/^Unavailable — /)).toHaveLength(3)
+    expect(section.textContent).toContain('available for 0 of 1')
+    expect(section.textContent).not.toContain(unavailable_reason)
+    expect(section.textContent).not.toContain('Not recorded')
+    expect(section.textContent).not.toContain('0.0 s')
+  },
+)
+
+test('legacy finalized measurements display Not recorded without a fabricated pause version or delivery cohort', () => {
+  setup(state([summary({ finalized_points: [recordedPoint(null)] })]))
+  const section = screen.getByRole('region', { name: 'Timed pauses' })
+  expect(within(section).getByText('Timed pause analysis: Not recorded for 1 finalized measured answer.')).toBeTruthy()
+  expect(within(section).queryByRole('table')).toBeNull()
+  expect(section.textContent).not.toContain('pause-metrics-v1')
+  expect(screen.getAllByRole('table')).toHaveLength(5)
+})
+
+test('typed finals keep established no-measurement meaning without becoming historical delivery rows', () => {
+  setup(state([summary({ finalized_points: [point({ measurement: null })], measured_final_answer_count: 0 })]))
+  expect(screen.getAllByText('Unavailable — No measurement')).toHaveLength(5)
+  expect(screen.queryByText(/Timed pause analysis: Not recorded/)).toBeNull()
+  expect(within(screen.getByRole('region', { name: 'Timed pauses' })).queryByRole('table')).toBeNull()
+})
+
+test('delivery coverage counts recorded-unavailable but excludes legacy and typed finals', () => {
+  const unavailable = delivery({ pause_count: null, total_pause_duration_seconds: null, longest_pause_seconds: null, unavailable_reason: 'missing_timings' })
+  setup(state([summary({ finalized_points: [recordedPoint(), recordedPoint(unavailable), recordedPoint(null), point({ measurement: null })], measured_final_answer_count: 3 })]))
+  expect(screen.getByText('Pause count available for 1 of 2 finalized answers in this delivery provenance group.')).toBeTruthy()
+  expect(screen.getByText('Timed pause analysis: Not recorded for 1 finalized measured answer.')).toBeTruthy()
+  expect(screen.getByText('Measured final answers').nextElementSibling?.textContent).toBe('3')
+  expect(within(screen.getByRole('region', { name: 'Pause count' })).getAllByRole('row')).toHaveLength(3)
+})
+
+test('delivery versions separate tables even when speaking measurement version matches', () => {
+  setup(state([summary({ finalized_points: [recordedPoint(), recordedPoint(delivery({ version: 'pause-metrics-v2' }))] })]))
+  const region = screen.getByRole('region', { name: 'Pause count' })
+  expect(within(region).getAllByRole('table')).toHaveLength(2)
+  expect(within(region).getByText('Delivery measurement version: pause-metrics-v1')).toBeTruthy()
+  expect(within(region).getByText('Delivery measurement version: pause-metrics-v2')).toBeTruthy()
+  expect(within(region).getAllByText('Pause count available for 1 of 1 finalized answers in this delivery provenance group.')).toHaveLength(2)
+  expect(within(screen.getByRole('region', { name: 'Estimated WPM' })).getAllByRole('table')).toHaveLength(1)
+})
+
+test('compatible delivery cohort stays unified when speaking versions differ', () => {
+  const second = recordedPoint(delivery(), { measurement: measurement({ measurement_version: 'speaking-metrics-v2', delivery_metrics: delivery() }) })
+  setup(state([summary({ finalized_points: [recordedPoint(), second] })]))
+  expect(within(screen.getByRole('region', { name: 'Pause count' })).getAllByRole('table')).toHaveLength(1)
+  expect(screen.getByText('Pause count available for 2 of 2 finalized answers in this delivery provenance group.')).toBeTruthy()
+  expect(within(screen.getByRole('region', { name: 'Estimated WPM' })).getAllByRole('table')).toHaveLength(2)
+})
+
+test('future delivery sources remain explicit separate groups in pure projected UI', () => {
+  const second = recordedPoint(delivery({ source: 'future_source' }), { measurement: measurement({
+    measurement_source: 'future_source' as HistoryMeasurement['measurement_source'], delivery_metrics: delivery({ source: 'future_source' }),
+  }) })
+  setup(state([summary({ finalized_points: [recordedPoint(), second] })]))
+  const region = screen.getByRole('region', { name: 'Pause count' })
+  expect(within(region).getAllByRole('table')).toHaveLength(2)
+  expect(within(region).getByText('Source: future_source')).toBeTruthy()
+  expect(within(region).getByText('Source: Original transcription')).toBeTruthy()
+})
+
+test('delivery rows retain chronological order and microseconds rather than supplied summary order', () => {
+  setup(state([
+    summary({ finalized_points: [recordedPoint(delivery(), { submitted_at: '2026-10-05T12:00:00.000009Z', question_index: 1 })] }),
+    summary({ session_id: SECOND, finalized_points: [recordedPoint(delivery(), { submitted_at: '2026-10-05T12:00:00.000001Z' })] }),
+  ]))
+  const rows = within(screen.getByRole('region', { name: 'Pause count' })).getAllByRole('row').slice(1)
+  expect(rows.map((row) => row.querySelector('time')!.dateTime)).toEqual(['2026-10-05T12:00:00.000001Z', '2026-10-05T12:00:00.000009Z'])
+  expect(rows[0].textContent).toContain('Question 1')
+  expect(rows[1].textContent).toContain('Question 2')
+  expect(document.body.textContent).not.toContain(FIRST)
+  expect(document.body.textContent).not.toContain(SECOND)
+})
+
+test('partial hydration shows loaded delivery facts while suppressing all overview totals', () => {
+  const { props } = setup(state([summary({ finalized_points: [recordedPoint()] })], { status: 'partial', failedChunks: [[SECOND]], rememberedCount: 2 }))
+  expect(screen.queryByRole('region', { name: 'Progress overview' })).toBeNull()
+  expect(screen.getByText('Progress totals are unavailable until all remembered sessions load.')).toBeTruthy()
+  expect(screen.getByText('Showing finalized answers from loaded sessions only.')).toBeTruthy()
+  expect(within(screen.getByRole('region', { name: 'Timed pauses' })).getAllByRole('table')).toHaveLength(3)
+  fireEvent.click(screen.getByRole('button', { name: 'Retry failed history requests' }))
+  expect(props.onRetry).toHaveBeenCalledOnce()
+})
+
+test('delivery projection and presentation do not mutate exact persisted values or fetch new detail', () => {
+  const original = delivery()
+  const source = summary({ finalized_points: [recordedPoint(original)] })
+  const before = JSON.stringify(source)
+  setup(state([source]))
+  expect(JSON.stringify(source)).toBe(before)
+  expect(screen.getAllByRole('table')).toHaveLength(8)
+  expect(fetch).not.toHaveBeenCalled()
 })

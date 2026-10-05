@@ -5,6 +5,7 @@ import {
   progressOverview, projectProgress,
 } from './progress'
 import type { ProgressMetricId, ProgressPoint } from './progress'
+import type { DeliveryMetrics } from './deliveryMetrics'
 
 const FIRST = '00000000-0000-4000-8000-000000000001'
 const SECOND = '00000000-0000-4000-8000-000000000002'
@@ -13,7 +14,7 @@ function measurement(changes: Partial<HistoryMeasurement> = {}): HistoryMeasurem
     measurement_version: 'speaking_metrics_v1', measurement_source: 'original_transcription',
     recognized_word_count: 10, um_count: 0, uh_count: 1, filler_unavailable_reason: null,
     timed_utterance_span_seconds: 12.123456789, estimated_words_per_minute: 49.491231198,
-    timing_unavailable_reason: null, ...changes,
+    timing_unavailable_reason: null, delivery_metrics: null, ...changes,
   }
 }
 function point(changes: Partial<HistoryFinalizedPoint> = {}): HistoryFinalizedPoint {
@@ -41,7 +42,7 @@ function sortable(changes: Partial<ProgressPoint> = {}): ProgressPoint {
 test('empty summaries produce zero for all six objective counts and no points or groups', () => {
   expect(projectProgress([])).toEqual({
     overview: { completedSessions: 0, activeSessions: 0, finalizedQuestions: 0, savedAttempts: 0, savedRetries: 0, measuredFinalAnswers: 0 },
-    points: [], groups: [],
+    points: [], groups: [], deliveryGroups: [],
   })
 })
 test('active summary includes objective persisted totals', () => {
@@ -220,4 +221,153 @@ test('projection does not mutate source summaries, point arrays, measurement, or
   Object.freeze(original)
   projectProgress(Object.freeze([original]))
   expect(JSON.stringify(original)).toBe(before)
+})
+
+function delivery(changes: Partial<DeliveryMetrics> = {}): DeliveryMetrics {
+  return { version: 'pause-metrics-v1', source: 'original_transcription', pause_count: 2,
+    total_pause_duration_seconds: 1.234567890123, longest_pause_seconds: 0.765432109876,
+    unavailable_reason: null, ...changes }
+}
+function deliveryPoint(delivery_metrics: DeliveryMetrics | null = delivery(), changes: Partial<HistoryFinalizedPoint> = {}): HistoryFinalizedPoint {
+  return point({ measurement: measurement({ delivery_metrics }), ...changes })
+}
+
+test('recorded pause facts create three separate delivery metrics without changing speaking groups or overview semantics', () => {
+  const source = summary({ finalized_points: [deliveryPoint()] })
+  const projected = projectProgress([source])
+  expect(projected.overview).toEqual(progressOverview([source]))
+  expect(projected.groups).toHaveLength(1)
+  expect(projected.groups[0].metrics).toHaveLength(5)
+  expect(projected.deliveryGroups).toHaveLength(1)
+  expect(projected.deliveryGroups[0].metrics.map((item) => item.id)).toEqual(['pause_count', 'total_pause_duration_seconds', 'longest_pause_seconds'])
+  expect(projected.deliveryGroups[0].deliveryVersion).toBe('pause-metrics-v1')
+  expect(projected.deliveryGroups[0].measurementSource).toBe('original_transcription')
+})
+
+test('same delivery provenance forms one cohort independently of differing speaking versions', () => {
+  const points = [deliveryPoint(), deliveryPoint(delivery(), { measurement: measurement({
+    measurement_version: 'speaking-metrics-v2', delivery_metrics: delivery(),
+  }) })]
+  const projected = projectProgress([summary({ finalized_points: points })])
+  expect(projected.groups).toHaveLength(2)
+  expect(projected.deliveryGroups).toHaveLength(1)
+  expect(projected.deliveryGroups[0].points).toHaveLength(2)
+})
+
+test('different delivery versions form independent cohorts within the same speaking version', () => {
+  const projected = projectProgress([summary({ finalized_points: [deliveryPoint(), deliveryPoint(delivery({ version: 'pause-metrics-v2' }))] })])
+  expect(projected.groups).toHaveLength(1)
+  expect(projected.deliveryGroups.map((group) => group.deliveryVersion)).toEqual(['pause-metrics-v1', 'pause-metrics-v2'])
+  expect(projected.deliveryGroups.every((group) => group.metrics.every((item) => item.coverage.total === 1))).toBe(true)
+})
+
+test('pure delivery projection separates future source tuples without normalizing them', () => {
+  const projected = projectProgress([summary({ finalized_points: [
+    deliveryPoint(), deliveryPoint(delivery({ source: 'future_source' }), {
+      measurement: measurement({ measurement_source: 'future_source' as HistoryMeasurement['measurement_source'], delivery_metrics: delivery({ source: 'future_source' }) }),
+    }),
+  ] })])
+  expect(projected.deliveryGroups.map((group) => group.measurementSource)).toEqual(['future_source', 'original_transcription'])
+})
+
+test('delivery tuple grouping does not collide through embedded separators', () => {
+  const projected = projectProgress([summary({ finalized_points: [
+    deliveryPoint(delivery({ version: 'a:b', source: 'c' })), deliveryPoint(delivery({ version: 'a', source: 'b:c' })),
+  ] })])
+  expect(projected.deliveryGroups).toHaveLength(2)
+})
+
+test('legacy delivery absence stays outside recorded cohorts without removing its speaking facts', () => {
+  const projected = projectProgress([summary({ finalized_points: [deliveryPoint(null), deliveryPoint()] })])
+  expect(projected.points).toHaveLength(2)
+  expect(projected.groups[0].points).toHaveLength(2)
+  expect(projected.deliveryGroups[0].points).toHaveLength(1)
+  expect(projected.deliveryGroups[0].metrics[0].coverage).toEqual({ available: 1, total: 1 })
+  expect(projected.points[0].measurement!.delivery_metrics).toBeNull()
+})
+
+test('typed finals remain no measurement instead of masquerading as historical delivery absence', () => {
+  const projected = projectProgress([summary({ finalized_points: [point({ measurement: null }), deliveryPoint(null)], measured_final_answer_count: 1 })])
+  expect(projected.deliveryGroups).toEqual([])
+  expect(projected.groups.map((group) => group.kind)).toEqual(['measurement', 'no_measurement'])
+  expect(projected.overview.measuredFinalAnswers).toBe(1)
+})
+
+test.each(['pause_count', 'total_pause_duration_seconds', 'longest_pause_seconds'] as const)(
+  'zero %s remains available numeric zero in its delivery cohort', (id) => {
+    const projected = projectProgress([summary({ finalized_points: [deliveryPoint(delivery({ pause_count: 0, total_pause_duration_seconds: 0, longest_pause_seconds: 0 }))] })])
+    const metric = projected.deliveryGroups[0].metrics.find((item) => item.id === id)!
+    expect(metric.rows[0].value).toBe(0)
+    expect(metric.rows[0].unavailableReason).toBeNull()
+    expect(metric.coverage).toEqual({ available: 1, total: 1 })
+  },
+)
+
+test.each(['missing_timings', 'timing_coverage_mismatch', 'invalid_timing', 'invalid_timing_order', 'unusable_span'] as const)(
+  'recorded delivery %s contributes three nulls and denominator coverage', (unavailable_reason) => {
+    const unavailable = delivery({ pause_count: null, total_pause_duration_seconds: null, longest_pause_seconds: null, unavailable_reason })
+    const projected = projectProgress([summary({ finalized_points: [deliveryPoint(), deliveryPoint(unavailable)] })])
+    for (const metric of projected.deliveryGroups[0].metrics) {
+      expect(metric.rows[1].value).toBeNull()
+      expect(metric.rows[1].unavailableReason).toBe(unavailable_reason)
+      expect(metric.coverage).toEqual({ available: 1, total: 2 })
+    }
+  },
+)
+
+test('all unavailable delivery points still create a cohort with zero available values', () => {
+  const unavailable = delivery({ pause_count: null, total_pause_duration_seconds: null, longest_pause_seconds: null, unavailable_reason: 'missing_timings' })
+  const projected = projectProgress([summary({ finalized_points: [deliveryPoint(unavailable), deliveryPoint(unavailable)] })])
+  expect(projected.deliveryGroups[0].metrics.every((metric) => metric.coverage.available === 0 && metric.coverage.total === 2)).toBe(true)
+})
+
+test.each([
+  ['total_pause_duration_seconds', 1.234567890123], ['longest_pause_seconds', 0.765432109876],
+] as const)('delivery %s preserves exact stored float without recomputation or rounding', (id, value) => {
+  const projected = projectProgress([summary({ finalized_points: [deliveryPoint()] })])
+  expect(projected.deliveryGroups[0].metrics.find((metric) => metric.id === id)!.rows[0].value).toBe(value)
+})
+
+test('delivery metric chronology uses persisted timestamps and all existing tie breakers', () => {
+  const points = [
+    deliveryPoint(delivery(), { submitted_at: '2026-10-05T12:00:00.000009Z', question_index: 3, attempt_number: 2 }),
+    deliveryPoint(delivery(), { submitted_at: '2026-10-05T12:00:00.000001Z', question_index: 2, attempt_number: 4 }),
+    deliveryPoint(delivery(), { submitted_at: '2026-10-05T12:00:00.000001Z', question_index: 2, attempt_number: 1 }),
+    deliveryPoint(delivery(), { submitted_at: '2026-10-05T12:00:00.000001Z', question_index: 1, attempt_number: 3 }),
+  ]
+  const second = summary({ session_id: SECOND, finalized_points: [deliveryPoint(delivery(), { submitted_at: '2026-10-05T12:00:00.000001Z' })] })
+  const projected = projectProgress([second, summary({ finalized_points: points })])
+  const rows = projected.deliveryGroups[0].metrics[0].rows.map((row) => row.point)
+  expect(rows.map((item) => [item.session_id, item.question_index, item.attempt_number])).toEqual([
+    [FIRST, 1, 3], [FIRST, 2, 1], [FIRST, 2, 4], [SECOND, 0, 2], [FIRST, 3, 2],
+  ])
+})
+
+test('only finalized-point delivery enters the projection, even when the active question has later measured retries', () => {
+  const source = summary({ current_question_number: 2, finalized_points: [deliveryPoint()], total_attempt_count: 10, total_retry_count: 8 })
+  Object.assign(source, { current_attempt: deliveryPoint(delivery(), { question_index: 1 }), superseded_attempt: deliveryPoint(delivery(), { attempt_number: 1 }) })
+  const projected = projectProgress([source])
+  expect(projected.deliveryGroups[0].points).toHaveLength(1)
+  expect(projected.deliveryGroups[0].points[0].question_index).toBe(0)
+  expect(projected.deliveryGroups[0].points[0].attempt_number).toBe(2)
+  expect(projected.deliveryGroups[0].points[0].session_status).toBe('active')
+})
+
+test('delivery availability does not reinterpret measured_final_answer_count', () => {
+  const unavailable = delivery({ pause_count: null, total_pause_duration_seconds: null, longest_pause_seconds: null, unavailable_reason: 'missing_timings' })
+  const projected = projectProgress([summary({ measured_final_answer_count: 3,
+    finalized_points: [deliveryPoint(), deliveryPoint(null), deliveryPoint(unavailable)] })])
+  expect(projected.overview.measuredFinalAnswers).toBe(3)
+  expect(projected.deliveryGroups[0].metrics[0].coverage).toEqual({ available: 1, total: 2 })
+})
+
+test('delivery projection leaves frozen source snapshots and precision unchanged', () => {
+  const recorded = Object.freeze(delivery())
+  const measured = Object.freeze(measurement({ delivery_metrics: recorded }))
+  const finalized = Object.freeze(point({ measurement: measured }))
+  const source = Object.freeze(summary({ finalized_points: [finalized] }))
+  Object.freeze(source.finalized_points)
+  const before = JSON.stringify(source)
+  projectProgress([source])
+  expect(JSON.stringify(source)).toBe(before)
 })

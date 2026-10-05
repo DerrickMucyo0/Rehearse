@@ -4,6 +4,8 @@ import { afterEach, beforeEach, expect, test, vi } from 'vitest'
 import AudioAnswer from './AudioAnswer'
 import Interview from './Interview'
 import type { Attempt, InterviewSession, SpeakingMetrics } from './interviewApi'
+import type { DeliveryMetrics } from './deliveryMetrics'
+import { deliveryUnavailableText, TIMED_PAUSES_EXPLANATION, TIMED_PAUSES_LIMITATION } from './deliveryMetrics'
 
 const session: InterviewSession = { id: 'session-1', status: 'active', current_question_index: 0, current_question: 'Question', current_question_latest_attempt_number: 0, questions: ['Question'], answers: [] }
 let stopTrack: ReturnType<typeof vi.fn>
@@ -69,6 +71,7 @@ function interviewFetch({ active = session, transcriptions = [], submissionError
   let current = active
   const histories = new Map<number, Attempt[]>()
   const persistedMetrics = new Map<string, SpeakingMetrics>()
+  const persistedDelivery = new Map<string, DeliveryMetrics>()
   const fetchMock = vi.fn(async (url: string, options?: RequestInit) => {
     const json = (value: unknown, status = 200) => new Response(JSON.stringify(value), { status })
     if (url === '/api/sessions') {
@@ -82,6 +85,7 @@ function interviewFetch({ active = session, transcriptions = [], submissionError
       if (!response) throw new Error('No mocked transcription remains')
       const result = await response.clone().json().catch(() => null)
       if (typeof result?.measurement_id === 'string' && result.metrics) persistedMetrics.set(result.measurement_id, result.metrics)
+      if (typeof result?.measurement_id === 'string' && result.delivery_metrics) persistedDelivery.set(result.measurement_id, result.delivery_metrics)
       return response
     }
     const path = `/api/sessions/${active.id}/questions/${current.current_question_index}`
@@ -128,10 +132,25 @@ function interviewFetch({ active = session, transcriptions = [], submissionError
           comparison_unavailable_reason: comparable ? null : values[0] === null && values[1] === null ? 'both_unavailable'
             : values[0] === null ? 'before_unavailable' : 'after_unavailable' }
       }
+      const selected = [history[0], history.at(-1)!].map((attempt) => attempt.measurement_id ? persistedDelivery.get(attempt.measurement_id) : undefined)
+      const deliveryMetric = (name: 'pause_count' | 'total_pause_duration_seconds' | 'longest_pause_seconds') => {
+        const values = selected.map((facts) => facts?.[name] ?? null)
+        const reasons = selected.map((facts) => facts ? facts.unavailable_reason : 'no_measurement')
+        const comparable = values[0] !== null && values[1] !== null
+        return { before: values[0], after: values[1], delta: comparable ? values[1]! - values[0]! : null,
+          before_unavailable_reason: reasons[0], after_unavailable_reason: reasons[1], comparable,
+          comparison_unavailable_reason: comparable ? null : values[0] === null && values[1] === null ? 'both_unavailable'
+            : values[0] === null ? 'before_unavailable' : 'after_unavailable' }
+      }
       return json({ session_id: current.id, question_index: current.current_question_index,
         before_attempt: identity(history[0]), after_attempt: identity(history.at(-1)!), comparison: {
           recognized_word_count: metric('recognized_word_count'), um_count: metric('um_count'), uh_count: metric('uh_count'),
           timed_utterance_span_seconds: metric('timed_utterance_span_seconds'), estimated_words_per_minute: metric('estimated_words_per_minute'),
+        }, delivery_comparison: {
+          before_version: selected[0]?.version ?? null, after_version: selected[1]?.version ?? null,
+          before_source: selected[0]?.source ?? null, after_source: selected[1]?.source ?? null,
+          pause_count: deliveryMetric('pause_count'), total_pause_duration_seconds: deliveryMetric('total_pause_duration_seconds'),
+          longest_pause_seconds: deliveryMetric('longest_pause_seconds'),
         } })
     }
     throw new Error('Unmocked route is forbidden')
@@ -342,13 +361,21 @@ const originalMetrics: SpeakingMetrics = {
 const provenance = 'Based on your original recording. Editing the transcript won’t change these measurements.'
 const measurementId = 'aed74a31-ddc3-4e0a-b2aa-b98ad52f7b61'
 const replacementMeasurementId = '90b9d4a5-4158-4bb3-ae17-33e83a1e9ccf'
+const zeroDelivery: DeliveryMetrics = {
+  version: 'pause-metrics-v1', source: 'original_transcription', pause_count: 0,
+  total_pause_duration_seconds: 0, longest_pause_seconds: 0, unavailable_reason: null,
+}
 
-function transcriptResponse(text = 'Hello from my recording', metrics: SpeakingMetrics = originalMetrics) {
+function transcriptResponse(text = 'Hello from my recording', metrics: SpeakingMetrics = originalMetrics,
+  delivery: DeliveryMetrics = metrics.timing_unavailable_reason === null ? zeroDelivery : {
+    ...zeroDelivery, pause_count: null, total_pause_duration_seconds: null, longest_pause_seconds: null,
+    unavailable_reason: metrics.timing_unavailable_reason,
+  }) {
   return new Response(JSON.stringify({ session_id: session.id, question_index: 0, measurement_id: measurementId, text,
     language: 'eng', words: [
       { text: 'Hello', start: 10, end: 10.5 }, { text: 'from', start: 10.5, end: 11 },
       { text: 'my', start: 11, end: 11.5 }, { text: 'recording', start: 11.5, end: 12.46 },
-    ], metrics }))
+    ], metrics, delivery_metrics: delivery }))
 }
 
 function measurement(label: string) {
@@ -478,7 +505,7 @@ test('displays returned filler counts and formats numbers without mutating API v
     words: [
       { text: 'Um,', start: 10, end: 10.5 }, { text: 'UH', start: 10.5, end: 11 },
       { text: 'my', start: 11, end: 11.5 }, { text: 'recording', start: 11.5, end: 12.46 },
-    ], metrics,
+    ], metrics, delivery_metrics: zeroDelivery,
   }
   const response = new Response()
   vi.spyOn(response, 'json').mockResolvedValue(result)
@@ -529,7 +556,7 @@ test.each(['missing_timings', 'timing_coverage_mismatch', 'invalid_timing', 'inv
     expect(within(panel).getByText(reason === 'timing_coverage_mismatch'
       ? 'Timing measurements aren’t available because complete word timing wasn’t available.'
       : 'Timing measurements aren’t available for this transcription.')).toBeTruthy()
-    expect(panel.textContent).not.toMatch(/NaN|undefined|0 sec|0 WPM/)
+    expect(panel.querySelector('dl')?.textContent).not.toMatch(/NaN|undefined|0 sec|0 WPM/)
     expect(panel.textContent).not.toContain(reason)
     expect(measurement('Um')).toBe('0')
     expect(measurement('Uh')).toBe('0')
@@ -540,7 +567,8 @@ test('replacement clears original metrics immediately, and its new transcription
   const replacement: SpeakingMetrics = { ...originalMetrics, recognized_word_count: 1,
     timed_utterance_span_seconds: 2, estimated_words_per_minute: 30 }
   const nextResponse = new Response(JSON.stringify({ session_id: session.id, question_index: 0, measurement_id: replacementMeasurementId,
-    text: 'Replacement', language: 'eng', words: [{ text: 'Replacement', start: 0, end: 2 }], metrics: replacement }))
+    text: 'Replacement', language: 'eng', words: [{ text: 'Replacement', start: 0, end: 2 }], metrics: replacement,
+    delivery_metrics: zeroDelivery }))
   const fetchMock = interviewFetch({ transcriptions: [transcriptResponse(), nextResponse] })
   await interviewRecording()
   fireEvent.click(screen.getByRole('button', { name: 'Transcribe Recording' }))
@@ -659,7 +687,7 @@ test.each([
   { ...originalMetrics, timing_unavailable_reason: 'private-provider-message' },
 ])('rejects missing or malformed required measurements without displaying fake values (case %#)', async (metrics) => {
   const response = new Response(JSON.stringify({ session_id: session.id, question_index: 0, measurement_id: measurementId,
-    text: 'Hello', language: 'eng', words: [], metrics }))
+    text: 'Hello', language: 'eng', words: [], metrics, delivery_metrics: zeroDelivery }))
   vi.stubGlobal('fetch', vi.fn().mockResolvedValueOnce(new Response(JSON.stringify(session)))
     .mockResolvedValueOnce(response))
   await interviewRecording()
@@ -727,6 +755,56 @@ test('hands the successful transcript and its exact opaque ID to the draft owner
   expect(onTranscript).toHaveBeenCalledExactlyOnceWith('Hello from my recording', measurementId)
   expect(onInvalidateMeasurement).toHaveBeenCalledTimes(2)
 })
+
+test('live positive delivery displays scalar original-transcription facts and survives transcript edits without storage persistence', async () => {
+  const delivery: DeliveryMetrics = { ...zeroDelivery, pause_count: 2, total_pause_duration_seconds: 1.123456789, longest_pause_seconds: 0.623456789 }
+  const before = structuredClone(delivery)
+  vi.stubGlobal('fetch', vi.fn().mockResolvedValueOnce(new Response(JSON.stringify(session)))
+    .mockResolvedValueOnce(transcriptResponse('Hello from my recording', originalMetrics, delivery)))
+  await interviewRecording()
+  const storageBefore = Object.entries(localStorage)
+  fireEvent.click(screen.getByRole('button', { name: 'Transcribe Recording' }))
+  const panel = await screen.findByRole('region', { name: 'Timed pauses' })
+  const value = (label: string) => within(panel).getByText(label, { selector: 'dt', exact: true }).nextElementSibling?.textContent
+  expect(value('Pause count')).toBe('2')
+  expect(value('Total pause time')).toBe('1.1 s')
+  expect(value('Longest pause')).toBe('0.6 s')
+  expect(within(panel).getByText(TIMED_PAUSES_EXPLANATION)).toBeTruthy()
+  expect(within(panel).getByText(TIMED_PAUSES_LIMITATION)).toBeTruthy()
+  expect(screen.getByText(provenance)).toBeTruthy()
+  fireEvent.change(screen.getByRole('textbox'), { target: { value: 'Edited answer with different words' } })
+  expect(value('Pause count')).toBe('2')
+  expect(value('Total pause time')).toBe('1.1 s')
+  expect(screen.getByText(provenance)).toBeTruthy()
+  expect(delivery).toEqual(before)
+  expect(Object.entries(localStorage)).toEqual(storageBefore)
+  expect(panel.textContent).not.toMatch(/\b(improved|better|worse|score|quality|confidence|fluency|ideal)\b/i)
+})
+
+test('live zero delivery renders 0 and 0.0 s instead of unavailable states', async () => {
+  vi.stubGlobal('fetch', vi.fn().mockResolvedValueOnce(transcriptResponse()))
+  show(); await record(); await finish()
+  fireEvent.click(screen.getByRole('button', { name: 'Transcribe Recording' }))
+  const panel = await screen.findByRole('region', { name: 'Timed pauses' })
+  expect(within(panel).getByText('Pause count', { selector: 'dt' }).nextElementSibling?.textContent).toBe('0')
+  expect(within(panel).getByText('Total pause time', { selector: 'dt' }).nextElementSibling?.textContent).toBe('0.0 s')
+  expect(within(panel).getByText('Longest pause', { selector: 'dt' }).nextElementSibling?.textContent).toBe('0.0 s')
+  expect(panel.textContent).not.toMatch(/Unavailable|Not recorded/)
+})
+
+test.each(['missing_timings', 'timing_coverage_mismatch', 'invalid_timing', 'invalid_timing_order', 'unusable_span'] as const)(
+  'live unavailable delivery (%s) renders only factual mapped reason and null facts', async (reason) => {
+    const metrics: SpeakingMetrics = { ...originalMetrics, timed_utterance_span_seconds: null, estimated_words_per_minute: null, timing_unavailable_reason: reason }
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValueOnce(transcriptResponse('Hello from my recording', metrics)))
+    show(); await record(); await finish()
+    fireEvent.click(screen.getByRole('button', { name: 'Transcribe Recording' }))
+    const panel = await screen.findByRole('region', { name: 'Timed pauses' })
+    expect(within(panel).getByText('Pause count', { selector: 'dt' }).nextElementSibling?.textContent).toBe('Unavailable')
+    expect(within(panel).getByText(`Unavailable — ${deliveryUnavailableText(reason)}`)).toBeTruthy()
+    expect(panel.textContent).not.toContain(reason)
+    expect(panel.textContent).not.toMatch(/Not recorded|0.0 s/)
+  },
+)
 
 test('Retry clears the recorded draft and a typed retry explicitly carries no original measurement ID', async () => {
   const fetchMock = interviewFetch({ transcriptions: [transcriptResponse()] })

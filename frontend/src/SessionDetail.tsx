@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { getHistoryDetail, HistoryApiError } from './historyApi'
 import type { HistoryAttempt, HistoryDetail, HistorySummary } from './historyApi'
+import DeliveryFacts from './DeliveryFacts'
 
 interface Props {
   sessionId: string
@@ -217,6 +218,9 @@ function SessionDetailView({ sessionId, onBack, onRemove }: Props) {
                   {attempt.is_final && <p className="final-badge">Final</p>}
                   <p>Submitted <time dateTime={attempt.submitted_at}>{timestamp(attempt.submitted_at)}</time></p>
                   <p className="saved-answer">{attempt.answer_text}</p>
+                  {attempt.measurement === null
+                    ? <p>Timed pauses: Unavailable — No measurement</p>
+                    : <DeliveryFacts metrics={attempt.measurement.delivery_metrics} headingLevel={6} />}
                 </article>)}
                 {selectedPage.hasMore && <button type="button" disabled={pageLoading} onClick={loadMore}>Load more</button>}
               </>}

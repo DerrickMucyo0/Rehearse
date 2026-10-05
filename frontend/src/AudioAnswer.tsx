@@ -2,6 +2,8 @@ import { useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { ApiError, isConflictError, transcribeAudio, uploadAudio } from './interviewApi'
 import type { InterviewSession, SpeakingMetrics } from './interviewApi'
 import { useAudioRecorder } from './useAudioRecorder'
+import DeliveryFacts from './DeliveryFacts'
+import type { DeliveryMetrics } from './deliveryMetrics'
 
 interface Props {
   session: InterviewSession
@@ -20,7 +22,7 @@ export default function AudioAnswer({ session, disabled, hasAnswer, onTranscript
   const [uploadState, setUploadState] = useState<'idle' | 'uploading' | 'accepted' | 'transcribing' | 'transcribed' | 'error'>('idle')
   const [error, setError] = useState('')
   // One owner, tied to the original Blob; edited answer text is never an input.
-  const [measurements, setMeasurements] = useState<{ blob: Blob; metrics: SpeakingMetrics } | null>(null)
+  const [measurements, setMeasurements] = useState<{ blob: Blob; metrics: SpeakingMetrics; delivery: DeliveryMetrics } | null>(null)
   const controller = useRef<AbortController | null>(null)
   useEffect(() => () => {
     controller.current?.abort()
@@ -47,7 +49,7 @@ export default function AudioAnswer({ session, disabled, hasAnswer, onTranscript
       const result = await transcribeAudio(session, audio, pending.signal)
       if (!pending.signal.aborted) {
         onTranscript(result.text, result.measurement_id)
-        setMeasurements({ blob: audio, metrics: result.metrics })
+        setMeasurements({ blob: audio, metrics: result.metrics, delivery: result.delivery_metrics })
         setUploadState('transcribed')
       }
     } catch (cause) {
@@ -139,6 +141,7 @@ export default function AudioAnswer({ session, disabled, hasAnswer, onTranscript
           {metrics.timing_unavailable_reason && <p>{metrics.timing_unavailable_reason === 'timing_coverage_mismatch'
             ? 'Timing measurements aren’t available because complete word timing wasn’t available.'
             : 'Timing measurements aren’t available for this transcription.'}</p>}
+          <DeliveryFacts metrics={measurements!.delivery} />
         </section>
       )}
     </section>

@@ -64,7 +64,7 @@ test('typed retries preserve attempts and require Continue through completion an
   }
 
   await submit(0, 0, 'Integration baseline answer')
-  await expect(page.getByRole('table')).toHaveCount(0)
+  await expect(page.getByRole('table', { name: 'Speaking duration is shown in seconds.' })).toHaveCount(0)
   await page.reload()
   await expect(page.getByRole('heading', { name: 'Attempt 1', exact: true })).toBeVisible()
   await expect(page.getByRole('textbox')).toHaveCount(0)
@@ -76,7 +76,7 @@ test('typed retries preserve attempts and require Continue through completion an
   await expect(page.getByRole('heading', { name: 'Attempt 2', exact: true })).toBeVisible()
   await expect(page.getByText('Integration baseline answer', { exact: true })).toBeVisible()
   await expect(page.getByText('Integration retry answer', { exact: true })).toBeVisible()
-  const comparison = page.getByRole('table')
+  const comparison = page.getByRole('table', { name: 'Speaking duration is shown in seconds.' })
   await expect(comparison).toBeVisible()
   for (const name of ['Before', 'After', 'Change']) {
     await expect(comparison.getByRole('columnheader', { name, exact: true })).toBeVisible()
@@ -84,7 +84,7 @@ test('typed retries preserve attempts and require Continue through completion an
   await expect(comparison.getByRole('row', { name: /Recognized words/ }).getByRole('cell').first()).toContainText('Unavailable')
   await continueQuestion(0, 2)
   await expect(page.getByText('Question 2 of 5', { exact: true })).toBeVisible()
-  await expect(page.getByRole('table')).toHaveCount(0)
+  await expect(page.getByRole('table', { name: 'Speaking duration is shown in seconds.' })).toHaveCount(0)
 
   for (let index = 1; index < 5; index += 1) {
     await expect(page.getByText(`Question ${index + 1} of 5`, { exact: true })).toBeVisible()
