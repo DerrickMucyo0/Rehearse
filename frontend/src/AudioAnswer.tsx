@@ -7,11 +7,12 @@ interface Props {
   session: InterviewSession
   disabled: boolean
   hasAnswer: boolean
-  onTranscript: (text: string) => void
+  onTranscript: (text: string, measurementId: string) => void
+  onInvalidateMeasurement: () => void
   onTranscribing: (busy: boolean) => void
 }
 
-export default function AudioAnswer({ session, disabled, hasAnswer, onTranscript, onTranscribing }: Props) {
+export default function AudioAnswer({ session, disabled, hasAnswer, onTranscript, onInvalidateMeasurement, onTranscribing }: Props) {
   const recording = useAudioRecorder()
   const [uploadState, setUploadState] = useState<'idle' | 'uploading' | 'accepted' | 'transcribing' | 'transcribed' | 'error'>('idle')
   const [error, setError] = useState('')
@@ -31,17 +32,19 @@ export default function AudioAnswer({ session, disabled, hasAnswer, onTranscript
     const pending = new AbortController()
     controller.current = pending
     setUploadState('transcribing')
+    onInvalidateMeasurement()
     onTranscribing(true)
     setError('')
     try {
       const result = await transcribeAudio(session, audio, pending.signal)
       if (!pending.signal.aborted) {
-        onTranscript(result.text)
+        onTranscript(result.text, result.measurement_id)
         setMeasurements({ blob: audio, metrics: result.metrics })
         setUploadState('transcribed')
       }
     } catch (cause) {
       if (!pending.signal.aborted) {
+        onInvalidateMeasurement()
         setUploadState('error')
         setError(cause instanceof Error ? cause.message : 'Transcription failed. Please try again.')
       }
@@ -75,7 +78,7 @@ export default function AudioAnswer({ session, disabled, hasAnswer, onTranscript
       <p>Record an answer (up to 5 minutes / 10 MiB). Transcribe Recording sends audio to ElevenLabs.
         Review and edit the transcript, then Submit Answer to continue.</p>
       <button type="button" disabled={disabled || pendingRequest || ['requesting', 'recording', 'stopping'].includes(recording.state)}
-        onClick={() => { setMeasurements(null); setUploadState('idle'); setError(''); void recording.start() }}>
+        onClick={() => { onInvalidateMeasurement(); setMeasurements(null); setUploadState('idle'); setError(''); void recording.start() }}>
         Record Answer
       </button>
       {recording.state === 'recording' && <button type="button" onClick={recording.stop}>Stop Recording</button>}

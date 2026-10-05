@@ -10,8 +10,8 @@ from app.sessions import InterviewSessionService
 
 
 @pytest.fixture
-def client() -> Iterator[TestClient]:
-    service = InterviewSessionService()
+def client(postgres_session_factory) -> Iterator[TestClient]:
+    service = InterviewSessionService(postgres_session_factory)
     app.dependency_overrides[get_session_service] = lambda: service
     try:
         with TestClient(app) as test_client:

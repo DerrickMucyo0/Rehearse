@@ -25,7 +25,7 @@ export function startInterview(): Promise<InterviewSession> {
   return requestSession('/api/sessions', { method: 'POST' })
 }
 
-export async function submitAnswer(session: InterviewSession, answer: string): Promise<InterviewSession> {
+export async function submitAnswer(session: InterviewSession, answer: string, measurementId?: string | null): Promise<InterviewSession> {
   // Reconcile after a lost response before retrying a write. The server also
   // rejects stale indices so simultaneous requests cannot skip a question.
   const current = await requestSession(`/api/sessions/${session.id}`)
@@ -33,7 +33,8 @@ export async function submitAnswer(session: InterviewSession, answer: string): P
   return requestSession(`/api/sessions/${session.id}/answers`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ question_index: session.current_question_index, answer }),
+    body: JSON.stringify({ question_index: session.current_question_index, answer,
+      ...(measurementId == null ? {} : { measurement_id: measurementId }) }),
   })
 }
 
@@ -102,6 +103,7 @@ export interface SpeakingMetrics {
 export interface TranscriptionResult {
   session_id: string
   question_index: number
+  measurement_id: string
   text: string
   language: string | null
   words: { text: string; start: number; end: number }[]
@@ -148,7 +150,9 @@ export async function transcribeAudio(session: InterviewSession, audio: Blob, si
   }
   const result: TranscriptionResult = await response.json()
   if (typeof result?.text !== 'string' || !result.text.trim() || result.text.length > 10000 ||
-      result.session_id !== session.id || result.question_index !== session.current_question_index) {
+      result.session_id !== session.id || result.question_index !== session.current_question_index ||
+      typeof result.measurement_id !== 'string' ||
+      !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(result.measurement_id)) {
     throw new Error('No usable transcript was returned. Please try again or type your answer.')
   }
   if (!validSpeakingMetrics(result.metrics)) {

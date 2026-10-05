@@ -9,7 +9,7 @@ submission, and a completion state.
 
 - `frontend/`: React, TypeScript (strict mode), and Vite.
 - `backend/app/`: FastAPI application served by Uvicorn; session routes call a
-  separate in-memory session service with Pydantic request/response models.
+  separate PostgreSQL-backed session service with Pydantic request/response models.
 - `tests/`: backend tests using pytest and FastAPI TestClient.
 - `docs/`: reserved for future documentation.
 
@@ -34,17 +34,26 @@ Session endpoints:
 
 Answer body: `{"question_index":0,"answer":"My answer"}`. The index is zero-based
 and must match the current question. Answers must be strings with 1–10,000
-characters after trimming whitespace. Invalid bodies or malformed UUIDs return
+characters after trimming whitespace; embedded U+0000 is rejected before insertion.
+Invalid bodies or malformed UUIDs return
 422; unknown session UUIDs return 404; completed sessions and stale/future question
 indices return 409 without changing state.
+
+For a transcription-derived draft, the body may additionally include
+`"measurement_id":"<UUID returned by transcription>"`. Typed-only answers omit it.
+The backend links only that exact measurement, never a latest recording or inferred
+measurement. Malformed measurement UUIDs return 422. Unknown, mismatched-session,
+mismatched-question and already-linked references all return the same 409 detail:
+`Measurement cannot be attached to this answer.` Rejected links leave the attempt,
+session index/status and completion timestamp unchanged.
 
 Responses contain `id`, `status` (`active` or `completed`),
 `current_question_index`, `current_question`, `questions`, and ordered `answers`.
 After completion, the index equals the question count and `current_question` is null.
 
-Sessions live only in the backend process and disappear on restart/reload. Run one
-Uvicorn worker: sessions are not shared between workers. Browser refresh resets
-the UI; there is no session restoration, authentication, database, expiry, or scoring.
+Sessions and submitted answers survive backend restart/reload in PostgreSQL and
+are shared across backend workers. Browser refresh still resets the UI; there is
+no browser session restoration, authentication, expiry, or scoring.
 Anyone with a session ID can access that session. This is a local development prototype.
 
 ## Local frontend setup
@@ -70,8 +79,8 @@ npm run test:integration
 ```
 
 Alternatively, set `PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH` to an installed Chrome
-executable. This test uses real API requests and creates disposable in-memory
-sessions. It checks all five answers, completion without a remount/navigation,
+executable. This test uses real API requests and creates sessions in the configured
+development database. It checks all five answers, completion without a remount/navigation,
 and an explicit restart. Failure traces are written to ignored `test-results/`.
 
 ## Local backend setup
@@ -87,14 +96,179 @@ python -m uvicorn app.main:app --app-dir backend --reload --host 127.0.0.1 --por
 
 On Windows, activate with `backend\.venv\Scripts\activate` instead.
 The health endpoint is at `http://127.0.0.1:8000/api/health`.
+Before using session endpoints, configure `DATABASE_URL` in the backend process and
+apply the migration as described below. The health endpoint does not require a database.
 
 ## Run backend tests
 
 From the project root with the backend virtual environment activated:
 
 ```sh
-python -m pytest -W error
+REHEARSE_REQUIRE_POSTGRES_TESTS=1 python -m pytest -W error
 ```
+
+Configure the isolated `TEST_DATABASE_URL` first using the instructions below.
+Session, audio and transcription API regression tests use real PostgreSQL; pure
+speaking-metrics and configuration tests remain database-independent.
+
+## PostgreSQL persistence (Issue #11)
+
+PostgreSQL stores interview sessions and submitted answers, using synchronous
+SQLAlchemy 2.x, psycopg 3 and Alembic. Importing the application creates no engine or
+connection. Session routes resolve `DATABASE_URL` on first use and cache the service's
+engine/session factory. Each service operation creates and closes its own ORM session.
+`create_database_engine()` creates a lazy engine;
+`create_session_factory()` returns a factory, not a shared session. Callers
+own their sessions and transactions. There is no startup `create_all()`, automatic
+migration, storage fallback, or additional provider integration.
+
+`DATABASE_URL` is required for session endpoints and migrations.
+`TEST_DATABASE_URL` is exclusively for destructive
+PostgreSQL tests and never falls back to `DATABASE_URL`. Standard PostgreSQL URLs
+are normalized to `postgresql+psycopg`. Destructive tests require both database and
+role to be named `rehearse_test`, reject connection-query overrides and any configured
+application database of the same name, and verify the actual connected database/role
+before DDL. The test target must contain only this test schema. Configuration errors
+omit URL values; engine SQL echo is disabled and bound parameters are hidden in
+SQLAlchemy errors. Do not enable SQL logging or log database exceptions/URLs containing
+submitted text or credentials. No automatic `.env` loading is added.
+
+### Local PostgreSQL and explicit migrations
+
+Install Docker separately if needed. Development and CI use
+`postgres:18.6-bookworm`. Compose binds only `127.0.0.1:5432`, uses the named
+`postgres_development` volume and a `pg_isready` healthcheck. Credentials are required
+environment inputs for local development only; never reuse production credentials.
+For macOS zsh, from the repository root:
+
+```zsh
+export POSTGRES_USER=rehearse_dev
+read -rs "POSTGRES_PASSWORD?Local PostgreSQL password: "
+echo
+export POSTGRES_PASSWORD
+docker compose up -d postgres
+docker compose ps
+```
+
+Once healthy, enter an application URL privately. Its shape is
+`postgresql+psycopg://rehearse_dev:<URL-encoded-password>@127.0.0.1:5432/rehearse_dev`.
+Use percent encoding for special characters in credentials. These commands put
+neither the entered value nor password into shell history:
+
+```zsh
+read -rs "DATABASE_URL?Local application database URL: "
+echo
+export DATABASE_URL
+PYTHONDONTWRITEBYTECODE=1 backend/.venv/bin/python -m alembic upgrade head
+PYTHONDONTWRITEBYTECODE=1 backend/.venv/bin/python -m alembic current
+```
+
+Migration `0001_database_foundation` creates the three tables below, their constraints,
+the measurement creation-time index and two immutability triggers. Its DDL is
+self-contained. Downgrade removes attempts, measurements, sessions, then trigger
+functions; it destroys stored data and must only be run intentionally on an appropriate
+database. Changing initial Compose credentials does not change an existing volume's
+database roles/passwords. `docker compose down` retains the named volume.
+
+### Schema and enforcement boundary
+
+All IDs are application-generated UUID primary keys. Required timestamps are
+`TIMESTAMPTZ` with server `now()` defaults. There is no `user_id` or account schema.
+
+| Table | Columns |
+| --- | --- |
+| `interview_sessions` | `id UUID`, `questions JSONB NOT NULL`, `current_question_index INTEGER NOT NULL` (default 0), `status TEXT NOT NULL` (default active), `created_at TIMESTAMPTZ NOT NULL`, `completed_at TIMESTAMPTZ NULL` |
+| `question_attempts` | `id UUID`, `session_id UUID NOT NULL`, `question_index INTEGER NOT NULL`, `attempt_number INTEGER NOT NULL` (ORM default 1), `answer_text TEXT NOT NULL`, `submitted_at TIMESTAMPTZ NOT NULL`, `measurement_id UUID NULL` |
+| `transcription_measurements` | `id UUID`, `session_id UUID NOT NULL`, `question_index INTEGER NOT NULL`, `created_at TIMESTAMPTZ NOT NULL`, `measurement_version TEXT NOT NULL`, `measurement_source TEXT NOT NULL`, `recognized_word_count INTEGER NOT NULL`, `um_count INTEGER NULL`, `uh_count INTEGER NULL`, `filler_unavailable_reason TEXT NULL`, `timed_utterance_span_seconds DOUBLE PRECISION NULL`, `estimated_words_per_minute DOUBLE PRECISION NULL`, `timing_unavailable_reason TEXT NULL` |
+
+PostgreSQL enforces:
+
+- Exactly five nonempty text questions; snapshot changes are rejected by a trigger.
+  Active sessions have index 0–4 and no completion timestamp. Completed sessions have
+  index 5 and a completion timestamp no earlier than creation. Only `active` and
+  `completed` statuses are allowed.
+- Nonnegative question indices and positive attempt numbers. Attempts 2, 3 and beyond
+  are permitted by the schema, with a unique `(session_id, question_index, attempt_number)`.
+  Answer text length is 1–10,000 characters.
+- Measurement source exactly `original_transcription`, nonblank version and
+  nonnegative word/filler counts. Available filler counts are both non-null with no
+  reason; unavailable counts are both null with `unsupported_language`.
+- Available timing values are both positive and finite, including rejection of NaN
+  and infinity, with no unavailable reason. Unavailable values are both null with one
+  of `missing_timings`, `timing_coverage_mismatch`, `invalid_timing`,
+  `invalid_timing_order`, or `unusable_span`. Double-precision values are not rounded.
+  A trigger rejects updates to persisted measurement snapshots.
+- Foreign keys from attempts/measurements to their session. A composite foreign key
+  makes a linked measurement match the attempt's session and question. Unique
+  `measurement_id` permits only one attachment; null permits typed-only attempts.
+  Session deletion cascades to both child tables; deleting a linked measurement alone
+  is rejected. No deletion endpoint is introduced.
+
+The request and persistence validators trim submitted answers and reject embedded
+U+0000 before insertion with HTTP 422; they do not strip/replace NUL.
+Answer submission opens a transaction, selects the session row `FOR UPDATE`, validates
+existence/status/current index, inserts attempt 1, advances the index and, on answer 5,
+sets `completed` plus a UTC completion timestamp. All changes commit together; an
+exception rolls back the attempt and session state. Competing submissions to the same
+session serialize on that row; different sessions use independent row locks. There is
+no global Python lock or global ORM session. Retrieval joins session state and ordered
+first-attempt answers in one statement for a consistent PostgreSQL read snapshot.
+Async audio/transcription routes perform session checks in the thread pool and close
+their database operation before awaiting upload/provider work.
+
+Successful transcription creates an immutable measurement in its own transaction after
+the provider call and deterministic metric calculation. The service reopens a database
+operation, locks/revalidates the authoritative current session/question and stores only
+the scalar metrics, version, source and context. If the session advanced during inference,
+it rejects the result without creating a stale measurement. No database session/lock is
+held while awaiting provider inference.
+
+Answer submission optionally loads and locks the exact context-matching measurement,
+checks that it is unattached, and writes its ID with the attempt in the same transaction
+as session advancement/completion. The existing foreign keys and unique constraint
+remain a final safety layer. A failed link rolls back all changes; no measurement is
+inferred from answer text. Typed-only attempts retain null `measurement_id`.
+
+Unlinked measurements become deletion-eligible after 24 hours; linked measurements
+remain associated with their attempt. A pure timestamp/linkage helper models this
+policy. It introduces neither automatic expiry of attachment rights nor a cleanup
+worker; future cleanup must recheck linkage transactionally. Replaced/unsubmitted
+measurements remain unlinked; the frontend does not synchronously delete them.
+
+Only the final trimmed submitted answer is durable text. No audio, second
+original-transcription text copy or word timings are stored. There are no user
+accounts, semantic scoring, retry UI or history UI. Hosting remains provider-neutral;
+no Supabase-specific APIs are used. Issue #9 remains open and frozen.
+
+### Real PostgreSQL verification
+
+Create a dedicated disposable test database and role once, on the local Compose
+server. The interactive password command does not expose its value:
+
+```zsh
+docker compose exec postgres psql -U "$POSTGRES_USER" -d rehearse_dev -c 'CREATE ROLE rehearse_test LOGIN'
+docker compose exec postgres psql -U "$POSTGRES_USER" -d rehearse_dev -c '\password rehearse_test'
+docker compose exec postgres createdb -U "$POSTGRES_USER" -O rehearse_test rehearse_test
+read -rs "TEST_DATABASE_URL?Isolated rehearse_test database URL: "
+echo
+export TEST_DATABASE_URL
+REHEARSE_REQUIRE_POSTGRES_TESTS=1 PYTHONDONTWRITEBYTECODE=1 backend/.venv/bin/python -m pytest -W error tests/test_sessions.py tests/test_session_persistence.py tests/test_measurement_persistence.py tests/test_postgres_schema.py
+REHEARSE_REQUIRE_POSTGRES_TESTS=1 PYTHONDONTWRITEBYTECODE=1 backend/.venv/bin/python -m pytest -W error
+git diff --check
+```
+
+The test URL must use `rehearse_test` for both username and database, with the privately
+entered password and local host/port. Integration tests downgrade/upgrade this schema,
+including an upgrade from an empty schema; **never use a database containing valuable
+data**. They verify schema/ORM parity, UUID/JSONB/timestamp persistence, constraints,
+immutability, foreign keys, delete policy and persistence across engine reconstruction.
+Session integration tests also prove transactional rollback, completion persistence,
+HTTP NUL rejection, and actual PostgreSQL row-lock blocking with independent-session
+progress. Existing audio/transcription API tests use database-backed session storage.
+They use real PostgreSQL, never SQLite. Without explicit local configuration they skip
+as `BLOCKED_BY_LOCAL_DB_ENV`; this is not PostgreSQL acceptance. Setting
+`REHEARSE_REQUIRE_POSTGRES_TESTS=1` makes missing configuration fail. Database-independent
+configuration/domain/offline migration tests and existing API regressions remain runnable.
 
 ## Continuous integration
 
@@ -102,7 +276,8 @@ GitHub Actions runs `.github/workflows/ci.yml` on pushes to `main` and pull
 requests targeting `main`, with separate backend and frontend jobs on Ubuntu:
 
 - Python 3.13: install runtime and test requirements, then run the complete pytest
-  suite with warnings treated as errors.
+  suite with warnings treated as errors against an isolated PostgreSQL 18.6 service.
+  Its runner-only test credentials are disposable; PostgreSQL tests are required.
 - Node.js 24 LTS: install locked npm dependencies, run Vitest component tests,
   type-check and build with TypeScript/Vite, and lint with Oxlint.
 
@@ -182,7 +357,8 @@ not returned. Errors: 404 for unknown sessions, 409 for completed sessions or st
 questions, 413 for excessive size, 415 for unsupported media types, and 422 for missing,
 invalid, or empty inputs. Multipart parser limits/malformed form data can return 400.
 The current-question check runs after transfer to reject concurrent typed-answer changes.
-No authentication or persistence is added; existing local-prototype limitations apply.
+This upload-only action persists no audio and creates no measurement; existing
+local-prototype authentication limitations apply.
 
 ### Manual Chrome verification
 
@@ -265,11 +441,15 @@ implemented.
 
 The panel states: “Based on your original recording. Editing the transcript won’t
 change these measurements.” Measurements describe the original transcribed recording;
-editing the draft does not recalculate them. They exist only in the transcription
-response and temporary frontend state, without persistent metrics history. A
+editing the draft does not recalculate them. The backend stores their exact unrounded
+values in an immutable `transcription_measurements` record tagged `speaking-metrics-v1`;
+there is no history/dashboard UI. The response supplies an opaque `measurement_id`
+that the frontend keeps beside the draft and preserves through nonempty edits. A
 replacement recording clears them immediately, a new successful transcription
 replaces them, and leaving the question/session clears them. Typed-only answers
-show no measurements panel.
+show no measurements panel and submit no measurement ID. Clearing the draft clears
+its ID, so later typed text cannot inherit the old association. Explicit submission
+of an edited transcript links the original measurement without recalculation.
 
 ### Server configuration
 
@@ -290,7 +470,7 @@ export ELEVENLABS_API_KEY
 python -m uvicorn app.main:app --app-dir backend --reload --host 127.0.0.1 --port 8000
 ```
 
-`.env.example` contains only the empty variable name. `.env` files are ignored, but the
+`.env.example` contains empty provider/database configuration placeholders. `.env` files are ignored, but the
 application does **not** automatically load them; no dotenv dependency is needed.
 Never use a `VITE_` variable for this key, include it in frontend configuration, or
 commit a real value. The application and all non-transcription endpoints work without
@@ -302,13 +482,15 @@ CI/tests require no real key and use fake transcribers or an SDK mock HTTP trans
 `POST /api/sessions/{session_id}/transcriptions` accepts the same multipart `audio`
 and `question_index` fields and limits as `/audio`. Shared validation rejects invalid
 uploads before contacting the provider. The session/question is checked again after
-transcription to reject an answer that became stale while the provider was running.
+transcription, under a new short database row lock, before storing a measurement.
+This rejects context that became stale while the provider was running.
 HTTP 200 returns only application metadata, for example:
 
 ```json
 {
   "session_id": "<existing session UUID>",
   "question_index": 0,
+  "measurement_id": "<new opaque measurement UUID>",
   "text": "Hello there.",
   "language": "eng",
   "words": [
@@ -328,7 +510,7 @@ HTTP 200 returns only application metadata, for example:
 }
 ```
 
-The `metrics` object is required. Unavailable numeric measurements use `null`;
+The `metrics` object and UUID `measurement_id` are required. Unavailable numeric measurements use `null`;
 zero remains a real word/filler count when applicable. Available measurements have
 a `null` unavailable reason. `filler_unavailable_reason` is `unsupported_language`
 when both filler counts are unavailable. `timing_unavailable_reason` identifies
@@ -356,7 +538,9 @@ have a 75-second timeout to allow for upload and the backend provider deadline.
 Transcribe Recording sends the recording to ElevenLabs. Rehearse does not permanently
 store audio, log raw audio/keys/provider responses, or persist transcripts separately.
 Temporary upload files close after success or failure. Draft transcripts stay in the
-browser; explicitly submitted text uses the existing process-local session storage.
+browser; explicitly submitted text and its optional original measurement association
+are stored in PostgreSQL. No separate original-transcript copy or word timing arrays
+are stored; raw timings are used transiently for deterministic calculations.
 ElevenLabs processing/retention is governed by your provider account and policies;
 Rehearse's lack of permanent audio storage is not a promise of provider-side deletion.
 Aborting a browser request does not guarantee cancellation of provider work already
@@ -366,7 +550,7 @@ This remains a local prototype without authentication or rate limits. Keep the
 key-enabled backend local. Speaking Metrics v1 adds no semantic scoring, coaching
 judgments, adaptive interviewing, pause diagnosis, longitudinal progress tracking,
 or persistent metrics history. Timing metrics remain unavailable when evidence is
-insufficient. Realtime transcription, Nemotron, AI follow-ups, TTS, a database,
+insufficient. Realtime transcription, Nemotron, AI follow-ups, TTS,
 and authentication remain absent.
 
 ### Manual verification with a real key

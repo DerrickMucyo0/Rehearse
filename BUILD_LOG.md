@@ -325,3 +325,135 @@ Previously completed milestone-wide verification from committed implementation:
 - Zero live NVIDIA calls and zero live ElevenLabs calls during this verification;
   provider integration was not exercised live. Tests used mocks/local services.
 - Issue #9 and held-out data remained untouched. No push or PR created.
+
+## Issue #11 — PostgreSQL foundation, first slice
+
+- Branch: `feat/postgres-persistence`, starting from the merged Speaking Metrics v1
+  baseline. Adds synchronous SQLAlchemy 2.x, psycopg 3 and Alembic within the existing
+  ranged requirements style. Hosting remains provider-neutral.
+- Adds opt-in environment configuration, lazy engines and caller-owned ORM sessions.
+  Application `DATABASE_URL` and destructive `TEST_DATABASE_URL` are separate; tests
+  require the dedicated `rehearse_test` database/role and verify the connected target
+  before DDL. No automatic dotenv loading, migrations, SQL echo or storage fallback.
+- Adds the three-table schema: immutable five-question session snapshots, numbered
+  submitted-answer attempts and immutable original-transcription measurements.
+  Named checks cover status/completion, counts, finite timing values and unavailable
+  states. Unique/composite foreign keys enforce one attachment and matching context.
+  Parent session deletion cascades; a linked measurement cannot be deleted alone.
+- Initial revision `0001_database_foundation` contains self-contained reviewed DDL,
+  immutability triggers and a child-first downgrade. No startup `create_all()`.
+  Domain validation trims answers and rejects NUL without repair. A pure helper
+  models 24-hour unlinked deletion eligibility; no cleanup worker is introduced.
+- Adds development Compose PostgreSQL `18.6-bookworm`, a loopback port, named volume,
+  healthcheck and environment-supplied local credentials. Backend CI uses the same
+  image with isolated disposable test credentials and requires integration tests;
+  frontend CI is unchanged. README documents setup, migrations, destructive-test
+  isolation, security and the future transactional service enforcement boundary.
+- Runtime session/API/transcription behavior remains in memory. Measurement-ID
+  association, atomic submission, HTTP 422 NUL handling and cleanup integration are
+  deferred. No audio, original-transcript copy or word timing persistence, accounts,
+  history/retry UI, semantic scoring, or production hosting integration.
+
+Verification:
+- Configuration/domain/offline migration tests with warnings as errors: 44 passed.
+  PostgreSQL DDL renders for upgrade and downgrade; one initial revision is present.
+- Targeted real PostgreSQL tests: 57 skipped, classified **BLOCKED_BY_LOCAL_DB_ENV**.
+  Docker and `psql` are unavailable and `TEST_DATABASE_URL` is absent. No SQLite
+  substitution was used. Migration execution and constraint acceptance on a real
+  server remain unverified locally; this slice is not production-verified.
+- Full backend suite with warnings as errors: 213 passed, 57 skipped. All 169 existing
+  API/audio/transcription/speaking-metrics regressions passed.
+- `git diff --check` passed. Fingerprints of all pre-existing runtime, frontend and
+  test files remained unchanged. No Issue #9 research or held-out inspection, no live
+  provider calls, commit, push or PR.
+
+## Issue #11 — PostgreSQL session runtime, second slice
+
+- Continues `feat/postgres-persistence` from foundation commit `20613fa`, starting
+  with a clean working tree. Replaces process-local session/answer storage with the
+  existing synchronous SQLAlchemy schema; no new migration or dependency changes.
+- Session routes lazily resolve `DATABASE_URL` and cache an engine/session factory,
+  never an ORM Session. Each service operation owns and closes its database session
+  and transaction. There is no in-memory or `TEST_DATABASE_URL` fallback.
+- Creation persists the immutable five-question snapshot and initial state. Retrieval
+  reads state and ordered attempt-1 answers in a single SQL statement for consistent
+  snapshots. UUIDs, public response fields, Location, trimming, 404/409/422 behavior,
+  and fifth-answer completion are preserved.
+- Submission locks the owning session with `SELECT ... FOR UPDATE`, checks
+  existence/status/current index, rejects NUL before insertion, inserts attempt 1,
+  advances state and sets UTC completion time on the fifth answer. Flush and commit
+  failures roll back the attempt, index, status and completion timestamp together.
+  The row lock serializes competing submissions without a global Python lock.
+- Async audio/transcription endpoints run synchronous session checks in the thread
+  pool; no database operation stays open during upload/provider awaits. Existing
+  temporary-file cleanup, transcription configuration and speaking metrics remain
+  unchanged. Measurement creation/linking is deferred; submitted attempts have no
+  measurement association. No frontend, auth, retry UI or provider changes.
+- Shared PostgreSQL fixtures preserve explicit destructive-test isolation. Existing
+  session/audio/transcription test assertions remain intact; their old in-memory
+  setup now injects a real database factory. README reflects active persistence and
+  required application/test configuration.
+
+Verification against local PostgreSQL 18.6 (Postgres.app):
+- Focused session/persistence/schema suite with warnings as errors and PostgreSQL
+  required: 102 passed, 0 failed, 0 skipped (23 existing API, 22 new persistence,
+  57 schema cases).
+- Full backend suite with warnings as errors and PostgreSQL required: 292 passed,
+  0 failed, 0 skipped. No SQLite substitution.
+- Tests prove session/answer/completion persistence across engine reconstruction,
+  timestamps and attempt 1, explicit configuration, pool connection return,
+  transactional rollback after flush/before commit, uniqueness protection, and
+  HTTP 422 for NUL without mutation. The default HTTP dependency is tested without
+  service overrides and retains answers after reconstruction.
+- Concurrency tests observe the actual PostgreSQL blocker for duplicate submissions,
+  require only one accepted answer, and advance a different session while that lock
+  remains held. A concurrent read retains a consistent state/answer snapshot even
+  when an answer commits before the reader returns.
+- `git diff --check` passed. Schema definitions/migration bytes, frontend, provider
+  implementations/configuration and speaking-metrics calculation files remain
+  unchanged. Issue #9/held-out data untouched; zero live provider calls. No commit,
+  push, PR or merge.
+
+## Issue #11 — Original measurement persistence and explicit association
+
+- Continues `feat/postgres-persistence` from session-runtime commit `da01b77`, with
+  a clean working tree. Uses the existing schema; no migration, dependency, CI,
+  provider configuration or speaking-metrics formula changes.
+- Successful transcription calculates the original deterministic metrics, then
+  starts a separate database operation. The service locks/revalidates the active
+  persisted session/current question, saves immutable scalar metrics with
+  `speaking-metrics-v1`, original-transcription source and UTC creation time, and
+  returns an opaque UUID `measurement_id`. Audio, transcript copies and word timing
+  arrays are not persisted. No database operation remains open during provider work.
+- Answer requests optionally include the exact measurement UUID. In the existing
+  session-row-locked transaction, the service locks a context-matching measurement,
+  verifies it is unattached, and links it with attempt 1, session advancement and
+  completion atomically. Unknown/wrong-context/already-linked IDs share HTTP 409
+  `Measurement cannot be attached to this answer.` Malformed UUIDs return 422.
+  Failures leave attempts, progress and completion unchanged; existing constraints
+  remain a final safety layer. Typed answers omit the ID; no latest lookup or
+  recalculation from edited text is introduced.
+- The frontend pairs the transcript draft with its returned ID. Nonempty edits keep
+  that association. Clearing the draft, replacing the recording, failed replacement
+  transcription, successful advancement and session restart clear stale IDs; a new
+  successful transcription supplies its own ID. Typed-only requests omit the field.
+  Original metrics display/provenance, reconciliation, and visual layout are preserved.
+- Replaced/unsubmitted rows remain unlinked; no synchronous deletion or background
+  cleanup worker is added. The existing 24-hour unlinked deletion-eligibility policy
+  and linked retention remain unchanged. No authentication, retry behavior, history
+  UI or semantic scoring is added.
+
+Verification against local PostgreSQL 18.6 (Postgres.app):
+- Focused measurement/transcription/session suite with warnings as errors and
+  PostgreSQL required: 149 passed, 0 failed, 0 skipped, including 42 new measurement
+  cases. Covers exact unrounded and unavailable values, reconstruction, original-ID
+  rather than latest association, edited text, malformed/invalid references,
+  fifth-answer completion, rollback after flush/before commit, no provider-held DB
+  resources, post-calculation races and actual PostgreSQL row-lock revalidation.
+- Full backend with warnings as errors and PostgreSQL required: 334 passed,
+  0 failed, 0 skipped. Existing session concurrency tests remain passing.
+- Frontend `npm test`: 59 passed (49 existing plus 10 new cases). `npm run build`
+  and `npm run lint` passed. Tests use mocked fetch/media APIs.
+- `git diff --check` passed. Schema definitions and migration bytes remain unchanged;
+  speaking-metrics formulas and provider implementations/configuration are unchanged.
+  Zero live provider calls; Issue #9/held-out data untouched. No commit, push, PR or merge.

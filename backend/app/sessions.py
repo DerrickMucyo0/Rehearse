@@ -1,8 +1,16 @@
-from threading import Lock
+from datetime import datetime, timezone
 from typing import Annotated, Literal
-from uuid import UUID, uuid4
+from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, StringConstraints, computed_field
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints, computed_field, field_validator
+from sqlalchemy import and_, select
+from sqlalchemy.orm import Session, sessionmaker
+
+from app.database_models import (
+    MEASUREMENT_VERSION, QuestionAttempt, StoredInterviewSession,
+    TranscriptionMeasurement, validate_submitted_answer_text,
+)
+from app.speaking_metrics import SpeakingMetrics
 
 QUESTIONS = (
     "Tell me about yourself.",
@@ -20,6 +28,12 @@ class AnswerRequest(BaseModel):
     answer: Annotated[
         str, StringConstraints(strict=True, strip_whitespace=True, min_length=1, max_length=10000)
     ]
+    measurement_id: UUID | None = None
+
+    @field_validator("answer")
+    @classmethod
+    def reject_nul(cls, value: str) -> str:
+        return validate_submitted_answer_text(value)
 
 
 class InterviewSession(BaseModel):
@@ -46,45 +60,126 @@ class SessionConflict(Exception):
 
 
 class InterviewSessionService:
-    """Process-local storage and transitions; routes only depend on this service."""
+    """PostgreSQL storage; each operation owns and closes its ORM transaction."""
 
-    def __init__(self) -> None:
-        self._sessions: dict[UUID, InterviewSession] = {}
-        self._lock = Lock()
+    def __init__(self, session_factory: sessionmaker[Session]) -> None:
+        self._session_factory = session_factory
 
     def start(self) -> InterviewSession:
-        session = InterviewSession(id=uuid4(), questions=list(QUESTIONS))
-        with self._lock:
-            self._sessions[session.id] = session
-            return session.model_copy(deep=True)
+        with self._session_factory.begin() as database:
+            stored = StoredInterviewSession(questions=QUESTIONS)
+            database.add(stored)
+            database.flush()
+            return self._response(stored, [])
 
     def get(self, session_id: UUID) -> InterviewSession:
-        with self._lock:
-            return self._find(session_id).model_copy(deep=True)
+        with self._session_factory.begin() as database:
+            # One statement gives state and ordered answers the same PostgreSQL
+            # snapshot, without holding a read lock across separate statements.
+            rows = database.execute(
+                select(StoredInterviewSession, QuestionAttempt.answer_text)
+                .outerjoin(QuestionAttempt, and_(
+                    QuestionAttempt.session_id == StoredInterviewSession.id,
+                    QuestionAttempt.attempt_number == 1,
+                ))
+                .where(StoredInterviewSession.id == session_id)
+                .order_by(QuestionAttempt.question_index)
+            ).all()
+            if not rows:
+                raise SessionNotFound("Session not found.")
+            return self._response(rows[0][0], [answer for _, answer in rows if answer is not None])
 
     def submit_answer(self, session_id: UUID, answer: AnswerRequest) -> InterviewSession:
-        with self._lock:
-            session = self._find(session_id)
-            self._check_question(session, answer.question_index)
-            session.answers.append(answer.answer)
-            session.current_question_index += 1
-            if session.current_question_index == len(session.questions):
-                session.status = "completed"
-            return session.model_copy(deep=True)
+        with self._session_factory.begin() as database:
+            stored = database.scalar(
+                select(StoredInterviewSession)
+                .where(StoredInterviewSession.id == session_id)
+                .with_for_update()
+            )
+            if stored is None:
+                raise SessionNotFound("Session not found.")
+            self._check_question(stored, answer.question_index)
+            # Revalidate even for non-HTTP callers that bypass AnswerRequest's
+            # validation. NUL is rejected before an INSERT can reach PostgreSQL.
+            submitted = validate_submitted_answer_text(answer.answer)
+            if answer.measurement_id is not None:
+                # Lock only an exact measurement in the owning context. Unknown
+                # IDs and context mismatches have the same public error.
+                measurement = database.scalar(
+                    select(TranscriptionMeasurement)
+                    .where(
+                        TranscriptionMeasurement.id == answer.measurement_id,
+                        TranscriptionMeasurement.session_id == stored.id,
+                        TranscriptionMeasurement.question_index == stored.current_question_index,
+                    )
+                    .with_for_update()
+                )
+                if measurement is None or database.scalar(
+                    select(QuestionAttempt.id)
+                    .where(QuestionAttempt.measurement_id == answer.measurement_id)
+                ) is not None:
+                    raise SessionConflict("Measurement cannot be attached to this answer.")
+            database.add(QuestionAttempt(
+                session_id=stored.id, question_index=answer.question_index,
+                attempt_number=1, answer_text=submitted, measurement_id=answer.measurement_id,
+            ))
+            stored.current_question_index += 1
+            if stored.current_question_index == len(stored.questions):
+                stored.status = "completed"
+                stored.completed_at = datetime.now(timezone.utc)
+            database.flush()
+            answers = list(database.scalars(
+                select(QuestionAttempt.answer_text)
+                .where(QuestionAttempt.session_id == stored.id, QuestionAttempt.attempt_number == 1)
+                .order_by(QuestionAttempt.question_index)
+            ))
+            # The context manager commits before the caller receives this DTO.
+            # Any exception, including flush/commit failure, rolls everything back.
+            return self._response(stored, answers)
+
+    def create_measurement(self, session_id: UUID, question_index: int, metrics: SpeakingMetrics) -> UUID:
+        """Persist only original metrics after inference, in a new transaction.
+
+        The session lock closes the revalidation/insert race with answer submission.
+        No provider call, audio, transcript text or word timing array enters here.
+        """
+        with self._session_factory.begin() as database:
+            stored = database.scalar(
+                select(StoredInterviewSession)
+                .where(StoredInterviewSession.id == session_id)
+                .with_for_update()
+            )
+            if stored is None:
+                raise SessionNotFound("Session not found.")
+            self._check_question(stored, question_index)
+            measurement = TranscriptionMeasurement(
+                session_id=stored.id, question_index=stored.current_question_index,
+                created_at=datetime.now(timezone.utc), measurement_version=MEASUREMENT_VERSION,
+                measurement_source=metrics.source, recognized_word_count=metrics.recognized_word_count,
+                um_count=metrics.um_count, uh_count=metrics.uh_count,
+                filler_unavailable_reason=metrics.filler_unavailable_reason,
+                timed_utterance_span_seconds=metrics.timed_utterance_span_seconds,
+                estimated_words_per_minute=metrics.estimated_words_per_minute,
+                timing_unavailable_reason=metrics.timing_unavailable_reason,
+            )
+            database.add(measurement)
+            database.flush()
+            return measurement.id
 
     def validate_current_question(self, session_id: UUID, question_index: int) -> None:
-        with self._lock:
-            self._check_question(self._find(session_id), question_index)
+        self._check_question(self.get(session_id), question_index)
 
     @staticmethod
-    def _check_question(session: InterviewSession, question_index: int) -> None:
+    def _check_question(session: InterviewSession | StoredInterviewSession, question_index: int) -> None:
         if session.status == "completed":
             raise SessionConflict("Session is already completed.")
         if question_index != session.current_question_index:
             raise SessionConflict("Answer does not match the current question.")
 
-    def _find(self, session_id: UUID) -> InterviewSession:
-        try:
-            return self._sessions[session_id]
-        except KeyError:
-            raise SessionNotFound("Session not found.") from None
+    @staticmethod
+    def _response(stored: StoredInterviewSession, answers: list[str]) -> InterviewSession:
+        return InterviewSession(
+            id=stored.id, status=stored.status,
+            current_question_index=stored.current_question_index,
+            questions=list(stored.questions), answers=answers,
+        )

@@ -45,7 +45,7 @@ beforeEach(() => {
 })
 afterEach(() => { cleanup(); vi.unstubAllGlobals(); vi.restoreAllMocks(); vi.useRealTimers() })
 
-function show() { return render(<AudioAnswer session={session} disabled={false} hasAnswer={false} onTranscript={vi.fn()} onTranscribing={vi.fn()} />) }
+function show() { return render(<AudioAnswer session={session} disabled={false} hasAnswer={false} onTranscript={vi.fn()} onInvalidateMeasurement={vi.fn()} onTranscribing={vi.fn()} />) }
 async function record() {
   fireEvent.click(screen.getByRole('button', { name: 'Record Answer' }))
   await screen.findByRole('button', { name: 'Stop Recording' })
@@ -248,9 +248,11 @@ const originalMetrics: SpeakingMetrics = {
   estimated_words_per_minute: 97.5609756097561, timing_unavailable_reason: null,
 }
 const provenance = 'Based on your original recording. Editing the transcript won’t change these measurements.'
+const measurementId = 'aed74a31-ddc3-4e0a-b2aa-b98ad52f7b61'
+const replacementMeasurementId = '90b9d4a5-4158-4bb3-ae17-33e83a1e9ccf'
 
 function transcriptResponse(text = 'Hello from my recording', metrics: SpeakingMetrics = originalMetrics) {
-  return new Response(JSON.stringify({ session_id: session.id, question_index: 0, text,
+  return new Response(JSON.stringify({ session_id: session.id, question_index: 0, measurement_id: measurementId, text,
     language: 'eng', words: [
       { text: 'Hello', start: 10, end: 10.5 }, { text: 'from', start: 10.5, end: 11 },
       { text: 'my', start: 11, end: 11.5 }, { text: 'recording', start: 11.5, end: 12.46 },
@@ -314,7 +316,9 @@ test('transcribes once, fills editable answer, and advances only after explicit 
   expect(screen.getByText(provenance)).toBeTruthy()
   fireEvent.click(screen.getByRole('button', { name: 'Submit Answer' }))
   await screen.findByRole('heading', { name: 'Interview Complete' })
-  expect(JSON.parse(fetchMock.mock.calls[3][1].body)).toEqual({ question_index: 0, answer: 'Edited answer' })
+  expect(JSON.parse(fetchMock.mock.calls[3][1].body)).toEqual({
+    question_index: 0, answer: 'Edited answer', measurement_id: measurementId,
+  })
   expect(stopTrack).toHaveBeenCalledTimes(1)
   expect(screen.queryByRole('region', { name: 'Speaking measurements' })).toBeNull()
 })
@@ -359,7 +363,7 @@ test('unmount cancels transcription and ignores a late result', async () => {
   const onTranscript = vi.fn()
   vi.stubGlobal('fetch', fetchMock)
   const view = render(<AudioAnswer session={session} disabled={false} hasAnswer={false}
-    onTranscript={onTranscript} onTranscribing={vi.fn()} />)
+    onTranscript={onTranscript} onInvalidateMeasurement={vi.fn()} onTranscribing={vi.fn()} />)
   await record(); await finish()
   fireEvent.click(screen.getByRole('button', { name: 'Transcribe Recording' }))
   const signal = fetchMock.mock.calls[0][1].signal as AbortSignal
@@ -381,7 +385,7 @@ test.each(['', '   ', 'x'.repeat(10001)])('unusable transcript does not populate
 test('displays returned filler counts and formats numbers without mutating API values', async () => {
   const metrics = { ...originalMetrics, um_count: 1, uh_count: 1 }
   const result = {
-    session_id: session.id, question_index: 0, text: 'Um, UH my recording', language: 'eng',
+    session_id: session.id, question_index: 0, measurement_id: measurementId, text: 'Um, UH my recording', language: 'eng',
     words: [
       { text: 'Um,', start: 10, end: 10.5 }, { text: 'UH', start: 10.5, end: 11 },
       { text: 'my', start: 11, end: 11.5 }, { text: 'recording', start: 11.5, end: 12.46 },
@@ -446,11 +450,15 @@ test.each(['missing_timings', 'timing_coverage_mismatch', 'invalid_timing', 'inv
 test('replacement clears original metrics immediately, and its new transcription replaces them', async () => {
   const replacement: SpeakingMetrics = { ...originalMetrics, recognized_word_count: 1,
     timed_utterance_span_seconds: 2, estimated_words_per_minute: 30 }
-  const nextResponse = new Response(JSON.stringify({ session_id: session.id, question_index: 0,
+  const nextResponse = new Response(JSON.stringify({ session_id: session.id, question_index: 0, measurement_id: replacementMeasurementId,
     text: 'Replacement', language: 'eng', words: [{ text: 'Replacement', start: 0, end: 2 }],
     metrics: replacement }))
-  vi.stubGlobal('fetch', vi.fn().mockResolvedValueOnce(new Response(JSON.stringify(session)))
-    .mockResolvedValueOnce(transcriptResponse()).mockResolvedValueOnce(nextResponse))
+  const fetchMock = vi.fn().mockResolvedValueOnce(new Response(JSON.stringify(session)))
+    .mockResolvedValueOnce(transcriptResponse()).mockResolvedValueOnce(nextResponse)
+    .mockResolvedValueOnce(new Response(JSON.stringify(session)))
+    .mockResolvedValueOnce(new Response(JSON.stringify({ ...session, status: 'completed',
+      current_question_index: 1, current_question: null, answers: ['Replacement'] })))
+  vi.stubGlobal('fetch', fetchMock)
   await interviewRecording()
   fireEvent.click(screen.getByRole('button', { name: 'Transcribe Recording' }))
   await screen.findByRole('region', { name: 'Speaking measurements' })
@@ -468,6 +476,11 @@ test('replacement clears original metrics immediately, and its new transcription
   expect(measurement('Words')).toBe('1')
   expect(measurement('Timed speech span')).toBe('2 sec')
   expect(measurement('Estimated WPM')).toBe('30 WPM')
+  fireEvent.click(screen.getByRole('button', { name: 'Submit Answer' }))
+  await screen.findByRole('heading', { name: 'Interview Complete' })
+  expect(JSON.parse(fetchMock.mock.calls[4][1].body)).toEqual({
+    question_index: 0, answer: 'Replacement', measurement_id: replacementMeasurementId,
+  })
 })
 
 test('failed same-recording transcription retains metrics; failed replacement creates none', async () => {
@@ -490,8 +503,12 @@ test('failed same-recording transcription retains metrics; failed replacement cr
 })
 
 test('replacement microphone failure cannot leave old metrics visible', async () => {
-  vi.stubGlobal('fetch', vi.fn().mockResolvedValueOnce(new Response(JSON.stringify(session)))
-    .mockResolvedValueOnce(transcriptResponse()))
+  const fetchMock = vi.fn().mockResolvedValueOnce(new Response(JSON.stringify(session)))
+    .mockResolvedValueOnce(transcriptResponse())
+    .mockResolvedValueOnce(new Response(JSON.stringify(session)))
+    .mockResolvedValueOnce(new Response(JSON.stringify({ ...session, status: 'completed',
+      current_question_index: 1, current_question: null, answers: ['Hello from my recording'] })))
+  vi.stubGlobal('fetch', fetchMock)
   await interviewRecording()
   fireEvent.click(screen.getByRole('button', { name: 'Transcribe Recording' }))
   await screen.findByRole('region', { name: 'Speaking measurements' })
@@ -499,37 +516,66 @@ test('replacement microphone failure cannot leave old metrics visible', async ()
   fireEvent.click(screen.getByRole('button', { name: 'Record Answer' }))
   await screen.findByRole('alert')
   expect(screen.queryByRole('region', { name: 'Speaking measurements' })).toBeNull()
+  expect((screen.getByRole('textbox') as HTMLTextAreaElement).value).toBe('Hello from my recording')
+  fireEvent.click(screen.getByRole('button', { name: 'Submit Answer' }))
+  await screen.findByRole('heading', { name: 'Interview Complete' })
+  expect(JSON.parse(fetchMock.mock.calls[3][1].body)).toEqual({
+    question_index: 0, answer: 'Hello from my recording',
+  })
 })
 
 test('question advancement clears measurements rather than carrying them to the next question', async () => {
   const active = { ...session, questions: ['First', 'Second'] }
   const next = { ...active, current_question_index: 1, current_question: 'Second', answers: ['Hello from my recording'] }
-  vi.stubGlobal('fetch', vi.fn().mockResolvedValueOnce(new Response(JSON.stringify(active)))
+  const fetchMock = vi.fn().mockResolvedValueOnce(new Response(JSON.stringify(active)))
     .mockResolvedValueOnce(transcriptResponse()).mockResolvedValueOnce(new Response(JSON.stringify(active)))
-    .mockResolvedValueOnce(new Response(JSON.stringify(next))))
+    .mockResolvedValueOnce(new Response(JSON.stringify(next)))
+    .mockResolvedValueOnce(new Response(JSON.stringify(next)))
+    .mockResolvedValueOnce(new Response(JSON.stringify({ ...next, status: 'completed',
+      current_question_index: 2, current_question: null, answers: [...next.answers, 'Second typed answer'] })))
+  vi.stubGlobal('fetch', fetchMock)
   await interviewRecording()
   fireEvent.click(screen.getByRole('button', { name: 'Transcribe Recording' }))
   await screen.findByRole('region', { name: 'Speaking measurements' })
   fireEvent.click(screen.getByRole('button', { name: 'Submit Answer' }))
   await screen.findByText('Question 2 of 2')
   expect(screen.queryByRole('region', { name: 'Speaking measurements' })).toBeNull()
+  fireEvent.change(screen.getByRole('textbox'), { target: { value: 'Second typed answer' } })
+  fireEvent.click(screen.getByRole('button', { name: 'Submit Answer' }))
+  await screen.findByRole('heading', { name: 'Interview Complete' })
+  expect(JSON.parse(fetchMock.mock.calls[3][1].body)).toEqual({
+    question_index: 0, answer: 'Hello from my recording', measurement_id: measurementId,
+  })
+  expect(JSON.parse(fetchMock.mock.calls[5][1].body)).toEqual({ question_index: 1, answer: 'Second typed answer' })
 })
 
 test('failed submission preserves metrics and explicit session restart clears them', async () => {
   const restarted = { ...session, id: 'session-2' }
-  vi.stubGlobal('fetch', vi.fn().mockResolvedValueOnce(new Response(JSON.stringify(session)))
+  const fetchMock = vi.fn().mockResolvedValueOnce(new Response(JSON.stringify(session)))
     .mockResolvedValueOnce(transcriptResponse()).mockResolvedValueOnce(new Response(JSON.stringify(session)))
     .mockResolvedValueOnce(new Response('{}', { status: 500 }))
-    .mockResolvedValueOnce(new Response(JSON.stringify(restarted))))
+    .mockResolvedValueOnce(new Response(JSON.stringify(restarted)))
+    .mockResolvedValueOnce(new Response(JSON.stringify(restarted)))
+    .mockResolvedValueOnce(new Response(JSON.stringify({ ...restarted, status: 'completed',
+      current_question_index: 1, current_question: null, answers: ['New session typed answer'] })))
+  vi.stubGlobal('fetch', fetchMock)
   await interviewRecording()
   fireEvent.click(screen.getByRole('button', { name: 'Transcribe Recording' }))
   await screen.findByRole('region', { name: 'Speaking measurements' })
   fireEvent.click(screen.getByRole('button', { name: 'Submit Answer' }))
   await screen.findByRole('alert')
   expect(measurement('Words')).toBe('4')
+  expect(JSON.parse(fetchMock.mock.calls[3][1].body)).toEqual({
+    question_index: 0, answer: 'Hello from my recording', measurement_id: measurementId,
+  })
   fireEvent.click(screen.getByRole('button', { name: 'Start New Interview' }))
   await waitFor(() => expect(screen.queryByRole('region', { name: 'Speaking measurements' })).toBeNull())
   expect((screen.getByRole('textbox') as HTMLTextAreaElement).value).toBe('')
+  fireEvent.change(screen.getByRole('textbox'), { target: { value: 'New session typed answer' } })
+  fireEvent.click(screen.getByRole('button', { name: 'Submit Answer' }))
+  await screen.findByRole('heading', { name: 'Interview Complete' })
+  expect(fetchMock.mock.calls[6][0]).toBe('/api/sessions/session-2/answers')
+  expect(JSON.parse(fetchMock.mock.calls[6][1].body)).toEqual({ question_index: 0, answer: 'New session typed answer' })
 })
 
 test('a typed-only answer never creates speaking measurements or requests the microphone', async () => {
@@ -551,6 +597,7 @@ test('a typed-only answer never creates speaking measurements or requests the mi
   expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([
     '/api/sessions', '/api/sessions/session-1', '/api/sessions/session-1/answers',
   ])
+  expect(JSON.parse(fetchMock.mock.calls[2][1].body)).toEqual({ question_index: 0, answer: 'Typed answer' })
 })
 
 test.each([
@@ -560,7 +607,7 @@ test.each([
   { ...originalMetrics, estimated_words_per_minute: null },
   { ...originalMetrics, timing_unavailable_reason: 'private-provider-message' },
 ])('rejects missing or malformed required measurements without displaying fake values (case %#)', async (metrics) => {
-  const response = new Response(JSON.stringify({ session_id: session.id, question_index: 0,
+  const response = new Response(JSON.stringify({ session_id: session.id, question_index: 0, measurement_id: measurementId,
     text: 'Hello', language: 'eng', words: [], metrics }))
   vi.stubGlobal('fetch', vi.fn().mockResolvedValueOnce(new Response(JSON.stringify(session)))
     .mockResolvedValueOnce(response))
@@ -571,4 +618,72 @@ test.each([
   expect(alert.textContent).not.toContain('private-provider-message')
   expect((screen.getByRole('textbox') as HTMLTextAreaElement).value).toBe('')
   expect(screen.queryByRole('region', { name: 'Speaking measurements' })).toBeNull()
+})
+
+test.each(['', '   '])('clearing the transcript to %j removes its measurement association from a later typed draft', async (empty) => {
+  const fetchMock = vi.fn().mockResolvedValueOnce(new Response(JSON.stringify(session)))
+    .mockResolvedValueOnce(transcriptResponse())
+    .mockResolvedValueOnce(new Response(JSON.stringify(session)))
+    .mockResolvedValueOnce(new Response(JSON.stringify({ ...session, status: 'completed',
+      current_question_index: 1, current_question: null, answers: ['Typed replacement'] })))
+  vi.stubGlobal('fetch', fetchMock)
+  await interviewRecording()
+  fireEvent.click(screen.getByRole('button', { name: 'Transcribe Recording' }))
+  await screen.findByRole('region', { name: 'Speaking measurements' })
+  fireEvent.change(screen.getByRole('textbox'), { target: { value: empty } })
+  fireEvent.change(screen.getByRole('textbox'), { target: { value: 'Typed replacement' } })
+  fireEvent.click(screen.getByRole('button', { name: 'Submit Answer' }))
+  await screen.findByRole('heading', { name: 'Interview Complete' })
+  expect(JSON.parse(fetchMock.mock.calls[3][1].body)).toEqual({ question_index: 0, answer: 'Typed replacement' })
+})
+
+test('failed replacement transcription leaves no old measurement ID on a later typed answer', async () => {
+  const fetchMock = vi.fn().mockResolvedValueOnce(new Response(JSON.stringify(session)))
+    .mockResolvedValueOnce(transcriptResponse())
+    .mockResolvedValueOnce(new Response('{}', { status: 502 }))
+    .mockResolvedValueOnce(new Response(JSON.stringify(session)))
+    .mockResolvedValueOnce(new Response(JSON.stringify({ ...session, status: 'completed',
+      current_question_index: 1, current_question: null, answers: ['Typed after failure'] })))
+  vi.stubGlobal('fetch', fetchMock)
+  await interviewRecording()
+  fireEvent.click(screen.getByRole('button', { name: 'Transcribe Recording' }))
+  await screen.findByRole('region', { name: 'Speaking measurements' })
+  fireEvent.change(screen.getByRole('textbox'), { target: { value: '' } })
+  await record(); await finish()
+  fireEvent.click(screen.getByRole('button', { name: 'Transcribe Recording' }))
+  await screen.findByRole('alert')
+  fireEvent.change(screen.getByRole('textbox'), { target: { value: 'Typed after failure' } })
+  fireEvent.click(screen.getByRole('button', { name: 'Submit Answer' }))
+  await screen.findByRole('heading', { name: 'Interview Complete' })
+  expect(JSON.parse(fetchMock.mock.calls[4][1].body)).toEqual({ question_index: 0, answer: 'Typed after failure' })
+})
+
+test.each([undefined, null, '', 'not-a-uuid', 123, `${measurementId}-extra`])(
+  'rejects a transcription without a usable opaque measurement UUID (case %#)', async (id) => {
+    const response = await transcriptResponse().json()
+    response.measurement_id = id
+    const fetchMock = vi.fn().mockResolvedValueOnce(new Response(JSON.stringify(session)))
+      .mockResolvedValueOnce(new Response(JSON.stringify(response)))
+    vi.stubGlobal('fetch', fetchMock)
+    await interviewRecording()
+    fireEvent.click(screen.getByRole('button', { name: 'Transcribe Recording' }))
+    const alert = await screen.findByRole('alert')
+    expect(alert.textContent).toBe('No usable transcript was returned. Please try again or type your answer.')
+    expect((screen.getByRole('textbox') as HTMLTextAreaElement).value).toBe('')
+    expect(screen.queryByRole('region', { name: 'Speaking measurements' })).toBeNull()
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+  },
+)
+
+test('hands the successful transcript and its exact opaque ID to the draft owner together', async () => {
+  const onTranscript = vi.fn()
+  const onInvalidateMeasurement = vi.fn()
+  vi.stubGlobal('fetch', vi.fn().mockResolvedValueOnce(transcriptResponse()))
+  render(<AudioAnswer session={session} disabled={false} hasAnswer={false}
+    onTranscript={onTranscript} onInvalidateMeasurement={onInvalidateMeasurement} onTranscribing={vi.fn()} />)
+  await record(); await finish()
+  fireEvent.click(screen.getByRole('button', { name: 'Transcribe Recording' }))
+  await screen.findByText(/Transcript ready/)
+  expect(onTranscript).toHaveBeenCalledExactlyOnceWith('Hello from my recording', measurementId)
+  expect(onInvalidateMeasurement).toHaveBeenCalledTimes(2)
 })

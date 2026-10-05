@@ -1,6 +1,6 @@
 import asyncio
 from io import BytesIO
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import httpx
 import pytest
@@ -46,8 +46,8 @@ class FakeTranscriber:
 
 
 @pytest.fixture
-def setup():
-    service = InterviewSessionService()
+def setup(postgres_session_factory):
+    service = InterviewSessionService(postgres_session_factory)
     fake = FakeTranscriber()
     app.dependency_overrides[get_session_service] = lambda: service
     app.dependency_overrides[get_transcription_service] = lambda: fake
@@ -68,7 +68,10 @@ def test_success_does_not_advance_and_closes_file(setup):
     session = service.start()
     result = post(client, session.id)
     assert result.status_code == 200
+    measurement_id = result.json()['measurement_id']
+    assert UUID(measurement_id).version == 4
     assert result.json() == {'session_id': str(session.id), 'question_index': 0,
+                             'measurement_id': measurement_id,
                              'text': 'Hello there', 'language': 'eng',
                              'words': [{'text': 'Hello', 'start': 0.0, 'end': 0.5}],
                              'metrics': {
