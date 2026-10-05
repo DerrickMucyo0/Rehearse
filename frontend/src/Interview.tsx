@@ -62,9 +62,10 @@ async function readSavedView(id: string): Promise<SavedView> {
 interface Props {
   onSessionAccess?: (sessionId: string) => void
   onNavigationBusyChange?: (busy: boolean) => void
+  onHistoryFactsChange?: () => void
 }
 
-export default function Interview({ onSessionAccess, onNavigationBusyChange }: Props = {}) {
+export default function Interview({ onSessionAccess, onNavigationBusyChange, onHistoryFactsChange }: Props = {}) {
   const [restoreId] = useState(storedSessionId)
   const [view, setView] = useState<SavedView | null>(null)
   const [draft, setDraft] = useState<{ text: string; measurementId: string | null }>({ text: '', measurementId: null })
@@ -78,6 +79,8 @@ export default function Interview({ onSessionAccess, onNavigationBusyChange }: P
   const mounted = useRef(true)
   const accessCallback = useRef(onSessionAccess)
   useLayoutEffect(() => { accessCallback.current = onSessionAccess }, [onSessionAccess])
+  const factsCallback = useRef(onHistoryFactsChange)
+  useLayoutEffect(() => { factsCallback.current = onHistoryFactsChange }, [onHistoryFactsChange])
   const session = view?.session
   const blocked = operation !== null || transcribing || recovery !== null
   const navigationBlocked = blocked || audioBusy
@@ -133,6 +136,7 @@ export default function Interview({ onSessionAccess, onNavigationBusyChange }: P
       if (!mounted.current) return
       install({ session: created, attempts: [], comparison: null, mode: 'composing' })
       accessCallback.current?.(created.id)
+      factsCallback.current?.()
       setRecovery(null)
     } catch (cause) {
       if (mounted.current) setError(cause instanceof Error ? cause.message : 'Unable to start interview.')
@@ -146,6 +150,7 @@ export default function Interview({ onSessionAccess, onNavigationBusyChange }: P
       const saved = await readSavedView(context.sessionId)
       if (!mounted.current) return
       install(saved)
+      factsCallback.current?.()
       setRecovery(null)
       setError('The interview changed. Reloaded the saved state; review it before continuing.')
     } catch {
@@ -169,11 +174,13 @@ export default function Interview({ onSessionAccess, onNavigationBusyChange }: P
         acknowledged = true
         if (!mounted.current) return
         install({ session: result.session, attempts: [...view.attempts, result.attempt], comparison: null, mode: 'review' })
+        factsCallback.current?.()
       } else {
         const updated = await continueQuestion(view.session)
         acknowledged = true
         if (!mounted.current) return
         install({ session: updated, attempts: [], comparison: null, mode: 'composing' })
+        factsCallback.current?.()
       }
       const saved = await readSavedView(view.session.id)
       if (mounted.current) { install(saved); setRecovery(null) }
@@ -223,6 +230,9 @@ export default function Interview({ onSessionAccess, onNavigationBusyChange }: P
       if (unchangedDraft) setView({ ...saved, mode: 'composing' })
       else install(saved)
       if (recovery.kind === 'restore') accessCallback.current?.(saved.session.id)
+      // Recovery reads may reveal a committed write whose response was lost.
+      // A standalone unlinked transcription does not change history summaries.
+      if (recovery.kind !== 'transcription' || !unchangedDraft) factsCallback.current?.()
       setRecovery(null)
       setError('Saved state rechecked. Choose your next action; no request was resubmitted.')
     } catch {

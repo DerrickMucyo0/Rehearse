@@ -1,6 +1,6 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
-import { hydrateHistory } from './historyHydration'
-import type { HistoryHydrationState } from './historyHydration'
+import { useState } from 'react'
+import { useHistoryHydration } from './useHistoryHydration'
+import type { SharedHistoryHydration } from './useHistoryHydration'
 import SessionDetail, { SessionFacts } from './SessionDetail'
 
 interface Props {
@@ -9,56 +9,25 @@ interface Props {
   onRemove: (id: string) => void
   onClear: () => void
   onPractice: () => void
+  hydration?: SharedHistoryHydration
 }
 
-function emptyHistory(rememberedCount: number): HistoryHydrationState {
-  return {
-    status: rememberedCount ? 'loading' : 'complete', summaries: [], missingIds: [],
-    failedChunks: [], rememberedCount,
-  }
-}
-
-export default function History({ sessionIds, storageError, onRemove, onClear, onPractice }: Props) {
+export default function History(props: Props) {
   // A different registry starts a fresh cancellable read generation and drops
   // any detail cache belonging to its previous membership.
-  return <HistoryView key={sessionIds.join('\n')} sessionIds={sessionIds} storageError={storageError}
-    onRemove={onRemove} onClear={onClear} onPractice={onPractice} />
+  return props.hydration
+    ? <HistoryView key={props.sessionIds.join('\n')} {...props} hydration={props.hydration} />
+    : <StandaloneHistory key={props.sessionIds.join('\n')} {...props} />
 }
 
-function HistoryView({ sessionIds, storageError, onRemove, onClear, onPractice }: Props) {
-  const [ids] = useState(sessionIds)
-  const [history, setHistory] = useState<HistoryHydrationState>(() => emptyHistory(sessionIds.length))
+function StandaloneHistory(props: Props) {
+  const hydration = useHistoryHydration(props.sessionIds, 0, true)
+  return <HistoryView {...props} hydration={hydration} />
+}
+
+function HistoryView({ sessionIds, storageError, onRemove, onClear, onPractice, hydration }: Props & { hydration: SharedHistoryHydration }) {
+  const { history } = hydration
   const [selectedId, setSelectedId] = useState<string | null>(null)
-  const controller = useRef<AbortController | null>(null)
-  const generation = useRef(0)
-  const load = useCallback((previous?: HistoryHydrationState) => {
-    controller.current?.abort()
-    const pending = new AbortController()
-    controller.current = pending
-    const read = ++generation.current
-    void hydrateHistory(ids, {
-      signal: pending.signal,
-      ...(previous?.failedChunks.length ? { previous, retryChunks: previous.failedChunks } : {}),
-    }).then((loaded) => {
-      if (!pending.signal.aborted && generation.current === read) setHistory(loaded)
-    }).catch(() => {
-      if (pending.signal.aborted || generation.current !== read) return
-      setHistory((current) => ({ ...current, status: 'error' }))
-    })
-  }, [ids])
-
-  useEffect(() => {
-    load()
-    return () => {
-      controller.current?.abort()
-      generation.current += 1
-    }
-  }, [load])
-
-  function retryFailed() {
-    setHistory({ ...history, status: 'loading' })
-    load(history)
-  }
 
   function remove(id: string) {
     if (selectedId === id) setSelectedId(null)
@@ -67,10 +36,8 @@ function HistoryView({ sessionIds, storageError, onRemove, onClear, onPractice }
 
   function clear() {
     if (!window.confirm('Clear sessions remembered on this browser?\n\nThis removes the local history list. It does not delete sessions stored on the server.')) return
-    controller.current?.abort()
-    generation.current += 1
+    hydration.discard()
     setSelectedId(null)
-    setHistory(emptyHistory(0))
     onClear()
   }
 
@@ -89,13 +56,16 @@ function HistoryView({ sessionIds, storageError, onRemove, onClear, onPractice }
       <p>No sessions are remembered on this browser yet.</p>
       <button type="button" onClick={onPractice}>Practice</button>
     </>}
-    {sessionIds.length > 0 && <button type="button" onClick={clear}>Clear remembered history</button>}
+    {sessionIds.length > 0 && <div className="attempt-actions">
+      <button type="button" disabled={history.status === 'loading'} onClick={hydration.reload}>Reload history</button>
+      <button type="button" onClick={clear}>Clear remembered history</button>
+    </div>}
     {history.status === 'loading' && sessionIds.length > 0 && <p role="status">Loading remembered sessions…</p>}
     {(history.status === 'partial' || history.status === 'error' || history.failedChunks.length > 0) && <div>
       <p role="alert">{summaries.length > 0 || missingIds.length > 0
         ? 'Some remembered sessions could not be loaded. These results are incomplete.'
         : 'Remembered sessions could not be loaded.'}</p>
-      <button type="button" disabled={history.status === 'loading'} onClick={retryFailed}>
+      <button type="button" disabled={history.status === 'loading'} onClick={hydration.retry}>
         Retry failed history requests
       </button>
     </div>}

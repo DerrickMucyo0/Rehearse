@@ -214,7 +214,7 @@ async function finishRecording() {
 }
 function rememberedKeys() { return Object.keys(localStorage).filter((key) => key.startsWith(HISTORY_PREFIX)).sort() }
 
-test('navigation preserves the same idle typed editor and exposes only a Progress placeholder', async () => {
+test('navigation preserves the same idle typed editor while displaying objective Progress', async () => {
   mockAppApi(); render(<App />); await start()
   const editor = screen.getByRole('textbox')
   fireEvent.change(editor, { target: { value: 'Safe unsaved answer' } })
@@ -222,7 +222,7 @@ test('navigation preserves the same idle typed editor and exposes only a Progres
   await screen.findByRole('heading', { name: 'History' })
   expect(screen.queryByRole('textbox')).toBeNull()
   go('Progress')
-  expect(await screen.findByText('Progress dashboard coming next.')).toBeTruthy()
+  expect(await screen.findByText('Objective practice history from sessions remembered on this browser.')).toBeTruthy()
   expect(nav('Progress').getAttribute('aria-current')).toBe('page')
   go('Practice')
   expect(screen.getByRole('textbox')).toBe(editor)

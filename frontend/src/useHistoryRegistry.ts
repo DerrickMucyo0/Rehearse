@@ -18,8 +18,8 @@ export function useHistoryRegistry() {
     function changed(event: StorageEvent) {
       if (!isHistoryStorageEvent(event)) return
       refresh()
-      // A clear in another tab also discards any current detail/read cache.
-      if (event.key === null) setCacheGeneration((value) => value + 1)
+      // Even unchanged membership can accompany newly persisted facts.
+      setCacheGeneration((value) => value + 1)
     }
     window.addEventListener('storage', changed)
     return () => { window.removeEventListener('storage', changed) }
@@ -28,12 +28,14 @@ export function useHistoryRegistry() {
   const remember = useCallback((sessionId: string) => {
     const result = addRememberedSession(sessionId)
     setNotice(result.ok ? null : result.reason === 'capacity' ? CAPACITY_WARNING : STORAGE_WARNING)
+    setCacheGeneration((value) => value + 1)
     refresh() // The writing tab does not receive its own storage event.
   }, [refresh])
 
   const remove = useCallback((sessionId: string) => {
     const result = removeRememberedSession(sessionId)
     setNotice(result.ok ? null : STORAGE_WARNING)
+    setCacheGeneration((value) => value + 1)
     refresh()
   }, [refresh])
 

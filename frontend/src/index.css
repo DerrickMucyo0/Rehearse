@@ -187,3 +187,62 @@ button:disabled {
 .history-detail button {
   margin: 0.25rem 0.5rem 0.25rem 0;
 }
+
+.progress-dashboard {
+  text-align: left;
+}
+
+.progress-counts {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(8rem, 1fr));
+  gap: 1rem;
+}
+
+.progress-counts > div,
+.progress-provenance {
+  border: 1px solid #526174;
+  border-radius: 0.3rem;
+  padding: 1rem;
+}
+
+.progress-counts dd {
+  margin: 0.5rem 0 0;
+  font-size: 1.5rem;
+  font-variant-numeric: tabular-nums;
+}
+
+.progress-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+
+.progress-provenance {
+  margin: 1rem 0;
+}
+
+.progress-provenance p {
+  overflow-wrap: anywhere;
+}
+
+.progress-table-scroll {
+  overflow-x: auto;
+}
+
+.progress-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-variant-numeric: tabular-nums;
+}
+
+.progress-table caption {
+  text-align: left;
+  padding-bottom: 0.5rem;
+}
+
+.progress-table th,
+.progress-table td {
+  padding: 0.5rem;
+  border-bottom: 1px solid #526174;
+  vertical-align: top;
+}
