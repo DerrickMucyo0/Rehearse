@@ -9,7 +9,7 @@ from starlette.concurrency import run_in_threadpool
 
 from app.audio import AudioAccepted, bounded_multipart_request, validated_audio
 from app.comparisons import AttemptComparison
-from app.database import create_database_engine, create_session_factory
+from app.database import get_database_session_factory
 from app.delivery_metrics import DeliveryMetrics, measure_delivery
 from app.semantic_diagnosis import SemanticDiagnosis
 from app.semantic_diagnosis_adapter import SemanticDiagnosisAdapter
@@ -45,7 +45,7 @@ router = APIRouter(prefix="/api/sessions", tags=["sessions"])
 def get_session_service() -> InterviewSessionService:
     # Pool the engine, never an ORM Session. Configuration uses DATABASE_URL only
     # and is resolved on first use, preserving database-free imports and health.
-    return InterviewSessionService(create_session_factory(create_database_engine()))
+    return InterviewSessionService(get_database_session_factory())
 
 
 SessionService = Annotated[InterviewSessionService, Depends(get_session_service)]

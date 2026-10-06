@@ -71,7 +71,7 @@ def offline_boundaries_and_clean_overrides(monkeypatch):
     monkeypatch.setattr(socket, "create_connection", forbidden)
     monkeypatch.setattr(socket, "getaddrinfo", forbidden)
     for name in (
-        "create_database_engine", "create_session_factory", "measure_transcription", "measure_delivery",
+        "get_database_session_factory", "measure_transcription", "measure_delivery",
     ):
         monkeypatch.setattr(routes, name, forbidden)
     try:

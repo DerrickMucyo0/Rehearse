@@ -9,7 +9,11 @@ from fastapi.testclient import TestClient
 from sqlalchemy import event, func, insert, select
 from sqlalchemy.orm import Session, sessionmaker
 
-from app.database import DatabaseConfigurationError, create_database_engine, create_session_factory
+from app import database as database_configuration
+from app.database import (
+    DatabaseConfigurationError, create_database_engine, create_session_factory,
+    get_database_session_factory,
+)
 from app.database_models import QuestionAttempt, StoredInterviewSession, TranscriptionMeasurement
 from app.main import app
 from app.session_routes import get_session_service
@@ -21,6 +25,28 @@ from app.sessions import (
 @pytest.fixture
 def sessions(postgres_session_factory):
     return InterviewSessionService(postgres_session_factory)
+
+
+@pytest.fixture
+def default_dependency_engines(monkeypatch):
+    get_session_service.cache_clear()
+    get_database_session_factory.cache_clear()
+    engines = []
+    actual_create_engine = database_configuration.create_database_engine
+
+    def captured_engine(*args, **kwargs):
+        engine = actual_create_engine(*args, **kwargs)
+        engines.append(engine)
+        return engine
+
+    monkeypatch.setattr(database_configuration, "create_database_engine", captured_engine)
+    try:
+        yield engines
+    finally:
+        get_session_service.cache_clear()
+        get_database_session_factory.cache_clear()
+        for engine in engines:
+            engine.dispose()
 
 
 def submit(sessions, identifier, question=0, revision=0, answer="Answer"):
@@ -442,69 +468,64 @@ def test_service_operations_return_connections_on_success_and_error(sessions, po
 
 
 def test_default_dependency_requires_application_url_and_never_falls_back_to_test_url(
-        postgres_engine, monkeypatch):
-    get_session_service.cache_clear()
-    configured_engine = None
+        postgres_engine, monkeypatch, default_dependency_engines):
     monkeypatch.setenv("TEST_DATABASE_URL", postgres_engine.url.render_as_string(hide_password=False))
     monkeypatch.delenv("DATABASE_URL", raising=False)
-    try:
-        with pytest.raises(DatabaseConfigurationError, match="DATABASE_URL must be explicitly configured"):
-            get_session_service()
-        assert get_session_service.cache_info().currsize == 0
-        monkeypatch.setenv("DATABASE_URL", postgres_engine.url.render_as_string(hide_password=False))
-        configured = get_session_service()
-        configured_engine = configured._session_factory.kw["bind"]
-        assert isinstance(configured, InterviewSessionService)
-        assert configured_engine.url == postgres_engine.url
-        assert configured_engine.echo is False
-        assert configured_engine.hide_parameters is True
-        assert configured_engine.pool.checkedout() == 0
-        assert get_session_service() is configured
-    finally:
-        get_session_service.cache_clear()
-        if configured_engine is not None:
-            configured_engine.dispose()
+    with pytest.raises(DatabaseConfigurationError, match="DATABASE_URL must be explicitly configured"):
+        get_session_service()
+    assert get_session_service.cache_info().currsize == get_database_session_factory.cache_info().currsize == 0
+    assert default_dependency_engines == []
+    monkeypatch.setenv("DATABASE_URL", postgres_engine.url.render_as_string(hide_password=False))
+    configured = get_session_service()
+    assert isinstance(configured, InterviewSessionService)
+    assert len(default_dependency_engines) == 1
+    configured_engine = default_dependency_engines[0]
+    assert isinstance(get_database_session_factory(), sessionmaker)
+    assert configured_engine.url == postgres_engine.url
+    assert configured_engine.echo is False
+    assert configured_engine.hide_parameters is True
+    assert configured_engine.pool.checkedout() == 0
+    assert get_session_service() is configured
+    assert len(default_dependency_engines) == 1
 
 
 def test_default_http_dependency_persists_without_service_override(
-        postgres_session_factory, postgres_engine, monkeypatch):
+        postgres_session_factory, postgres_engine, monkeypatch, default_dependency_engines):
     monkeypatch.setenv("DATABASE_URL", postgres_engine.url.render_as_string(hide_password=False))
     assert get_session_service not in app.dependency_overrides
-    get_session_service.cache_clear()
-    engines = []
-    try:
-        with TestClient(app) as client:
-            created = client.post("/api/sessions")
-            assert created.status_code == 201
-            location = created.headers["Location"]
-            engines.append(get_session_service()._session_factory.kw["bind"])
-            submitted = client.post(f"{location}/questions/0/attempts", json={
-                "expected_last_attempt_number": 0, "answer": "  Durable answer.  ",
-            })
-            assert submitted.status_code == 201
-            assert submitted.json()["attempt"]["answer"] == "Durable answer."
-            assert submitted.json()["session"]["answers"] == []
-            assert submitted.json()["session"]["current_question_latest_attempt_number"] == 1
-            # Rebuild the actual route dependency, rather than injecting a fake.
-            get_session_service.cache_clear()
-            engines[0].dispose()
-            reloaded = client.get(location)
-            assert reloaded.status_code == 200
-            assert reloaded.json() == submitted.json()["session"]
-            engines.append(get_session_service()._session_factory.kw["bind"])
-            attempts = client.get(f"{location}/questions/0/attempts")
-            assert attempts.status_code == 200
-            assert attempts.json() == [submitted.json()["attempt"]]
-            continued = client.post(f"{location}/questions/0/continue", json={
-                "expected_last_attempt_number": 1,
-            })
-            assert continued.status_code == 200
-            assert continued.json()["answers"] == ["Durable answer."]
-            assert client.get(location).json() == continued.json()
-    finally:
+    with TestClient(app) as client:
+        created = client.post("/api/sessions")
+        assert created.status_code == 201
+        location = created.headers["Location"]
+        assert len(default_dependency_engines) == 1
+        first_engine = default_dependency_engines[0]
+        submitted = client.post(f"{location}/questions/0/attempts", json={
+            "expected_last_attempt_number": 0, "answer": "  Durable answer.  ",
+        })
+        assert submitted.status_code == 201
+        assert submitted.json()["attempt"]["answer"] == "Durable answer."
+        assert submitted.json()["session"]["answers"] == []
+        assert submitted.json()["session"]["current_question_latest_attempt_number"] == 1
+        assert len(default_dependency_engines) == 1
+        # Rebuild both production dependencies to exercise persistence across engines.
         get_session_service.cache_clear()
-        for engine in engines:
-            engine.dispose()
+        get_database_session_factory.cache_clear()
+        first_engine.dispose()
+        reloaded = client.get(location)
+        assert reloaded.status_code == 200
+        assert reloaded.json() == submitted.json()["session"]
+        assert len(default_dependency_engines) == 2
+        assert default_dependency_engines[1] is not first_engine
+        attempts = client.get(f"{location}/questions/0/attempts")
+        assert attempts.status_code == 200
+        assert attempts.json() == [submitted.json()["attempt"]]
+        continued = client.post(f"{location}/questions/0/continue", json={
+            "expected_last_attempt_number": 1,
+        })
+        assert continued.status_code == 200
+        assert continued.json()["answers"] == ["Durable answer."]
+        assert client.get(location).json() == continued.json()
+        assert len(default_dependency_engines) == 2
 
 
 def test_read_snapshot_remains_consistent_when_submission_commits_during_read(sessions, postgres_engine):

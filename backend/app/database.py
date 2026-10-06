@@ -5,6 +5,8 @@ runtime storage fallback, or automatic migrations are introduced here.
 """
 import os
 from collections.abc import Mapping
+from functools import lru_cache
+from threading import Lock
 from urllib.parse import parse_qsl, urlsplit
 
 from sqlalchemy import Engine, create_engine
@@ -77,3 +79,35 @@ def create_database_engine(url: URL | None = None) -> Engine:
 def create_session_factory(engine: Engine) -> sessionmaker[Session]:
     """Create a factory, never a shared ORM session; callers own transactions."""
     return sessionmaker(bind=engine)
+
+
+_factory_configuration_lock = Lock()
+
+
+@lru_cache(maxsize=1)
+def _configured_database_session_factory() -> sessionmaker[Session]:
+    return create_session_factory(create_database_engine())
+
+
+def get_database_session_factory() -> sessionmaker[Session]:
+    """Share one lazy production factory, never a Session or request identity.
+
+    Configuration still uses DATABASE_URL only. Explicit create_* functions and
+    isolated test factories retain their existing independent-resource behavior.
+    Serialize cache access because lru_cache alone permits concurrent first-call
+    construction. The lock covers configuration only, never a database operation.
+    """
+    with _factory_configuration_lock:
+        return _configured_database_session_factory()
+
+
+def _clear_database_session_factory_cache() -> None:
+    # Like other dependency caches, clearing does not dispose resources still in
+    # use. Tests/reconfiguration own disposal of the engines they have obtained.
+    with _factory_configuration_lock:
+        _configured_database_session_factory.cache_clear()
+
+
+# Retain the familiar cache inspection/reset interface for dependency tests.
+get_database_session_factory.cache_clear = _clear_database_session_factory_cache
+get_database_session_factory.cache_info = _configured_database_session_factory.cache_info
