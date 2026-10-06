@@ -420,6 +420,143 @@ test('semantic diagnosis completion preserves finalized measurements, attempt fa
   }
 })
 
+test.each([
+  ['success', 'History'], ['error', 'History'],
+  ['success', 'Progress'], ['error', 'Progress'],
+] as const)('completed summary %s stays separate from shared objective history while Practice is hidden in %s', async (result, hiddenView) => {
+  const api = mockAppApi()
+  const pending = deferred<Response>()
+  const summaryPath = `/api/sessions/${SESSION_ID}/history-detail`
+  const summaryReads = () => api.fetchMock.mock.calls.filter(([url]) => String(url).includes('/history-detail'))
+  api.intercept((url) => url === summaryPath ? pending.promise : undefined)
+  const view = render(<App />); await start(); await record(); await finishRecording()
+  fireEvent.click(screen.getByRole('button', { name: 'Transcribe Recording' }))
+  await screen.findByRole('region', { name: 'Speaking measurements' })
+  for (let index = 0; index < questions.length; index += 1) {
+    await submit(`PRIVATE_COMPLETED_SUMMARY_ANSWER_${index}`)
+    expect(screen.queryByRole('region', { name: 'Interview summary' })).toBeNull()
+    expect(summaryReads()).toHaveLength(0)
+    fireEvent.click(screen.getByRole('button', { name: 'Continue' }))
+    if (index + 1 < questions.length) {
+      await screen.findByText(`Question ${index + 2} of 5`)
+      await waitFor(() => expect((nav('Progress') as HTMLButtonElement).disabled).toBe(false))
+    }
+  }
+  await screen.findByRole('heading', { name: 'Interview Complete' })
+  await waitFor(() => expect(summaryReads()).toHaveLength(1))
+  const summary = screen.getByRole('region', { name: 'Interview summary' })
+  expect(summary.getAttribute('aria-busy')).toBe('true')
+  expect(within(summary).getByRole('status').textContent).toBe('Loading interview summary…')
+  expect((screen.getByRole('button', { name: 'Start New Interview' }) as HTMLButtonElement).disabled).toBe(false)
+  const [path, options] = summaryReads()[0]
+  expect(path).toBe(summaryPath)
+  expect(options?.method).toBeUndefined()
+  expect(options?.body).toBeUndefined()
+  const signal = options?.signal
+  await openLoadedHistory()
+  await openLoadedProgress()
+  const expectedOverview = [
+    ['Completed sessions', '1'], ['Active sessions', '0'], ['Finalized questions', '5'],
+    ['Saved attempts', '5'], ['Saved retries', '0'], ['Measured final answers', '1'],
+  ]
+  for (const [label, value] of expectedOverview) {
+    expect(overviewValue(label).querySelector('dd')?.textContent).toBe(value)
+  }
+  const beforePauseCount = within(progress()).getByRole('region', { name: 'Pause count' }).textContent
+  if (hiddenView === 'History') await openLoadedHistory()
+  const visiblePanel = screen.getByRole('region', { name: hiddenView === 'History' ? 'Remembered session history' : 'Progress' })
+  const beforePanel = visiblePanel.innerHTML
+  const beforeFacts = JSON.stringify(api.detail(null))
+  const beforeAttempts = JSON.stringify(questions.map((_, index) => api.saved(index)))
+  const beforeRequests = api.fetchMock.mock.calls.length
+  const beforeHistoryReads = summariesReadCount(api)
+  const beforeDiagnosis = api.posts('/diagnosis').length
+  const beforeComparisonReads = api.fetchMock.mock.calls.filter(([url]) => String(url).endsWith('/comparison')).length
+  const beforeLocalStorage = JSON.stringify(Object.entries(localStorage))
+  const beforeSessionStorage = JSON.stringify(Object.entries(sessionStorage))
+  const setItem = vi.spyOn(Storage.prototype, 'setItem')
+  const removeItem = vi.spyOn(Storage.prototype, 'removeItem')
+  const clear = vi.spyOn(Storage.prototype, 'clear')
+  expect(screen.queryByRole('region', { name: 'Interview summary' })).toBeNull()
+  expect(signal?.aborted).toBe(false)
+
+  await act(async () => pending.resolve(result === 'success'
+    ? response(api.detail(null)) : response({ detail: 'PRIVATE_COMPLETED_SUMMARY_BACKEND_ERROR' }, 503)))
+  view.rerender(<App />)
+  expect(visiblePanel.innerHTML).toBe(beforePanel)
+  expect(within(visiblePanel).queryByRole('region', { name: 'Interview summary' })).toBeNull()
+  expect(api.fetchMock.mock.calls).toHaveLength(beforeRequests)
+  await openLoadedProgress()
+  for (const [label, value] of expectedOverview) {
+    expect(overviewValue(label).querySelector('dd')?.textContent).toBe(value)
+  }
+  expect(within(progress()).getByRole('region', { name: 'Pause count' }).textContent).toBe(beforePauseCount)
+  expect(within(progress()).queryByRole('region', { name: 'Interview summary' })).toBeNull()
+  await openLoadedHistory()
+  expect(within(screen.getByRole('region', { name: 'Remembered session history' })).queryByRole('region', { name: 'Interview summary' })).toBeNull()
+  go('Practice')
+  expect(screen.getByRole('region', { name: 'Interview summary' })).toBe(summary)
+  expect(summary.getAttribute('aria-busy')).toBe('false')
+  if (result === 'success') {
+    expect(within(summary).getByText('Questions completed', { exact: true }).nextElementSibling?.textContent).toBe('5 / 5')
+    expect(within(summary).getByText('Total attempts', { exact: true }).nextElementSibling?.textContent).toBe('5')
+    expect(within(summary).getByText('Total retries', { exact: true }).nextElementSibling?.textContent).toBe('0')
+    const rows = within(summary).getAllByRole('article')
+    expect(rows.map((row) => within(row).getByRole('heading', { level: 4 }).textContent)).toEqual([
+      'Question 1', 'Question 2', 'Question 3', 'Question 4', 'Question 5',
+    ])
+    rows.forEach((row, index) => {
+      expect(within(row).getByText(questions[index], { exact: true })).toBeTruthy()
+      expect(within(row).getByText('Final attempt', { exact: true }).nextElementSibling?.textContent).toBe('1')
+      expect(within(row).getByText('Retries', { exact: true }).nextElementSibling?.textContent).toBe('0')
+    })
+    const speaking = within(rows[0]).getByRole('region', { name: 'Speaking measurements' })
+    expect(within(speaking).getByText('Recognized words', { exact: true }).nextElementSibling?.textContent).toBe('3')
+    expect(within(speaking).getByText('Um count', { exact: true }).nextElementSibling?.textContent).toBe('0')
+    expect(within(speaking).getByText('Uh count', { exact: true }).nextElementSibling?.textContent).toBe('0')
+    expect(within(speaking).getByText('Estimated WPM', { exact: true }).nextElementSibling?.textContent).toBe('120')
+    expect(within(speaking).getByText('Timed speech span', { exact: true }).nextElementSibling?.textContent).toBe('1.5')
+    const delivery = within(rows[0]).getByRole('region', { name: 'Timed pauses' })
+    expect(within(delivery).getByText('Pause count', { exact: true }).nextElementSibling?.textContent).toBe('2')
+    expect(within(delivery).getByText('Total pause time', { exact: true }).nextElementSibling?.textContent).toBe('1.5 s')
+    expect(within(delivery).getByText('Longest pause', { exact: true }).nextElementSibling?.textContent).toBe('0.8 s')
+    for (const row of rows.slice(1)) {
+      expect(within(row).getByText('Speaking measurements: Unavailable — No measurement')).toBeTruthy()
+      expect(within(row).getByText('Timed pauses: Unavailable — No measurement')).toBeTruthy()
+    }
+  } else {
+    expect(within(summary).getByRole('alert').textContent).toBe('Interview summary is unavailable.')
+    expect(within(summary).queryByText(questions[0], { exact: true })).toBeNull()
+  }
+  expect(summary.textContent).not.toMatch(/PRIVATE_COMPLETED_SUMMARY|Semantic-only|interview-summary-v1|summary_version|score|confidence|NVIDIA|Nemotron|ElevenLabs/i)
+  expect(summary.textContent).not.toContain(SESSION_ID)
+  expect(summary.textContent).not.toContain(MEASUREMENT_ID)
+  for (const attempt of questions.flatMap((_, index) => api.saved(index))) {
+    expect(summary.textContent).not.toContain(attempt.id)
+  }
+  expect(summary.textContent).not.toContain(personalizedDrillForFocus(semanticDiagnosis.next_focus).title)
+  expect(within(summary).queryByRole('region', { name: 'Practice drill' })).toBeNull()
+  expect(within(summary).queryByRole('region', { name: 'Attempt comparison' })).toBeNull()
+  expect((screen.getByRole('button', { name: 'Start New Interview' }) as HTMLButtonElement).disabled).toBe(false)
+  view.rerender(<App />)
+  expect(signal?.aborted).toBe(false)
+  expect(summaryReads()).toHaveLength(1)
+  expect(summariesReadCount(api)).toBe(beforeHistoryReads)
+  expect(api.fetchMock.mock.calls).toHaveLength(beforeRequests)
+  expect(api.fetchMock.mock.calls.filter(([url]) => String(url).endsWith('/comparison'))).toHaveLength(beforeComparisonReads)
+  expect(api.posts('/attempts')).toHaveLength(5)
+  expect(api.posts('/continue')).toHaveLength(5)
+  expect(api.posts('/diagnosis')).toHaveLength(beforeDiagnosis)
+  expect(api.posts('/transcriptions')).toHaveLength(1)
+  expect(JSON.stringify(api.detail(null))).toBe(beforeFacts)
+  expect(JSON.stringify(questions.map((_, index) => api.saved(index)))).toBe(beforeAttempts)
+  expect(JSON.stringify(Object.entries(localStorage))).toBe(beforeLocalStorage)
+  expect(JSON.stringify(Object.entries(sessionStorage))).toBe(beforeSessionStorage)
+  expect(setItem).not.toHaveBeenCalled()
+  expect(removeItem).not.toHaveBeenCalled()
+  expect(clear).not.toHaveBeenCalled()
+})
+
 test('successful Continue invalidates final points while the next-question editor remains mounted', async () => {
   const api = mockAppApi(); render(<App />); await start(); await submit('A typed finalized answer')
   await openLoadedProgress()

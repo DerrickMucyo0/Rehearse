@@ -2,6 +2,7 @@ import { useEffect, useLayoutEffect, useRef, useState } from 'react'
 import type { FormEvent } from 'react'
 import AudioAnswer from './AudioAnswer'
 import Comparison from './AttemptComparison'
+import InterviewSummary from './InterviewSummary.tsx'
 import {
   ApiError, continueQuestion, getAttempts, getComparison, getSession,
   getSemanticDiagnosis, isConflictError, SemanticDiagnosisError, startInterview, submitAttempt,
@@ -428,9 +429,12 @@ export default function Interview({ onSessionAccess, onNavigationBusyChange, onH
         </>
       )}
       {session?.status === 'completed' && (
-        <div role="status">
-          <h2>Interview Complete</h2>
-          <p>You completed all {session.questions.length} questions.</p>
+        <div>
+          <div role="status">
+            <h2>Interview Complete</h2>
+            <p>You completed all {session.questions.length} questions.</p>
+          </div>
+          {operation === null && recovery === null && <InterviewSummary key={session.id} sessionId={session.id} />}
           <button type="button" onClick={() => void start()} disabled={operation !== null || transcribing}>Start New Interview</button>
         </div>
       )}

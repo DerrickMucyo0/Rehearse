@@ -3,11 +3,30 @@ import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testi
 import { afterEach, beforeEach, expect, test, vi } from 'vitest'
 import AudioAnswer from './AudioAnswer'
 import Interview from './Interview'
+import * as historyApi from './historyApi'
+import type { HistoryDetail } from './historyApi'
 import type { Attempt, InterviewSession, SemanticDiagnosis, SpeakingMetrics } from './interviewApi'
 import type { DeliveryMetrics } from './deliveryMetrics'
 import { deliveryUnavailableText, TIMED_PAUSES_EXPLANATION, TIMED_PAUSES_LIMITATION } from './deliveryMetrics'
 
 const session: InterviewSession = { id: 'session-1', status: 'active', current_question_index: 0, current_question: 'Question', current_question_latest_attempt_number: 0, questions: ['Question'], answers: [] }
+const readHistoryDetail = historyApi.getHistoryDetail
+
+function legacyCompletedHistoryDetail(id: string): HistoryDetail {
+  const pointId = (index: number) => `00000000-0000-4000-8000-${String(index + 1).padStart(12, '0')}`
+  return {
+    summary: { session_id: id, status: 'completed', created_at: '2026-10-04T11:00:00Z',
+      completed_at: '2026-10-04T12:00:01Z', current_question_number: null, total_questions: 5,
+      finalized_question_count: 5, questions_practiced_count: 5, total_attempt_count: 5, total_retry_count: 0,
+      measured_final_answer_count: 0, last_submitted_at: '2026-10-04T12:00:00Z', last_saved_activity_at: '2026-10-04T12:00:01Z',
+      finalized_points: Array.from({ length: 5 }, (_, question_index) => ({ question_index, attempt_id: pointId(question_index),
+        attempt_number: 1, submitted_at: '2026-10-04T12:00:00Z', measurement: null })) },
+    questions: Array.from({ length: 5 }, (_, question_index) => ({ question_index, question_text: `Question ${question_index + 1}`,
+      finalized: true, attempt_count: 1, latest_attempt_id: pointId(question_index), latest_attempt_number: 1,
+      final_attempt_id: pointId(question_index), final_attempt_number: 1 })),
+    selected_question: null,
+  }
+}
 const semanticDiagnosis: SemanticDiagnosis = {
   diagnosis_version: 'semantic-diagnosis-v1',
   addressed_question: 'yes', addressed_question_reason: 'The answer addresses the immediate question.',
@@ -51,6 +70,10 @@ beforeEach(() => {
   vi.stubGlobal('navigator', { mediaDevices: { getUserMedia } })
   vi.stubGlobal('MediaRecorder', Recorder)
   vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new Error('Unmocked network is forbidden in tests')))
+  // These audio tests predate History's five-question/UUID transport contract.
+  // Adapt only their toy IDs; canonical identities still use the real read API.
+  vi.spyOn(historyApi, 'getHistoryDetail').mockImplementation((id, options) => id.startsWith('session-')
+    ? Promise.resolve(legacyCompletedHistoryDetail(id)) : readHistoryDetail(id, options))
 })
 afterEach(() => { cleanup(); sessionStorage.clear(); vi.unstubAllGlobals(); vi.restoreAllMocks(); vi.useRealTimers() })
 
@@ -691,6 +714,28 @@ test('a typed-only attempt never creates speaking measurements or requests the m
   expect(getUserMedia).not.toHaveBeenCalled()
   expect(fetchMock.mock.calls.every(([url]) => !String(url).endsWith('/answers'))).toBe(true)
   expect(JSON.parse(attemptWrites(fetchMock)[0][1].body)).toEqual({ expected_last_attempt_number: 0, answer: 'Typed answer', measurement_id: null })
+})
+
+test('completed audio Practice loads its mocked persisted summary once without replaying audio or answer writes', async () => {
+  const fetchMock = interviewFetch()
+  const view = render(<Interview />)
+  fireEvent.click(screen.getByRole('button', { name: 'Start Interview' }))
+  await screen.findByRole('textbox')
+  fireEvent.change(screen.getByRole('textbox'), { target: { value: 'Typed completion answer' } })
+  await submitThenContinue()
+  await screen.findByRole('heading', { name: 'Interview Complete' })
+  const summary = await screen.findByRole('region', { name: 'Interview summary' })
+  await within(summary).findByText('5 / 5')
+  expect(within(summary).queryByRole('alert')).toBeNull()
+  view.rerender(<Interview />)
+  expect(historyApi.getHistoryDetail).toHaveBeenCalledTimes(1)
+  expect(historyApi.getHistoryDetail).toHaveBeenCalledWith(session.id, { signal: expect.any(AbortSignal) })
+  expect(attemptWrites(fetchMock)).toHaveLength(1)
+  expect(fetchMock.mock.calls.filter(([url, options]) => String(url).endsWith('/continue') && options?.method === 'POST')).toHaveLength(1)
+  expect(fetchMock.mock.calls.filter(([url]) => String(url).endsWith('/transcriptions'))).toHaveLength(0)
+  expect(getUserMedia).not.toHaveBeenCalled()
+  expect(screen.queryByRole('region', { name: 'Speaking measurements' })).toBeNull()
+  expect(summary.textContent).not.toContain('Typed completion answer')
 })
 
 test.each([

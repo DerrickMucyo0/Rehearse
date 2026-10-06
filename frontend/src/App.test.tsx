@@ -358,6 +358,126 @@ test.each([
   expect(api.creations()).toBe(1)
 })
 
+test.each([
+  ['success', 'History'], ['error', 'History'],
+  ['success', 'Progress'], ['error', 'Progress'],
+] as const)('completed summary %s preserves mounted Practice and existing facts while hidden in %s', async (result, hiddenView) => {
+  const api = mockAppApi()
+  const pending = deferred<Response>()
+  const summaryPath = `/api/sessions/${SESSION_ID}/history-detail`
+  const summaryReads = () => api.fetchMock.mock.calls.filter(([url]) => String(url).includes('/history-detail'))
+  api.intercept((url) => url === summaryPath ? pending.promise : undefined)
+  const view = render(<App />); await start()
+  expect(screen.queryByRole('region', { name: 'Interview summary' })).toBeNull()
+  for (let index = 0; index < questions.length; index += 1) {
+    await submit(`PRIVATE_SUMMARY_ANSWER_${index}`)
+    if (index === 0) {
+      for (const answer of ['PRIVATE_SUMMARY_RETRY_ONE', 'PRIVATE_SUMMARY_RETRY_TWO']) {
+        fireEvent.click(screen.getByRole('button', { name: /^Retry(?: Again)?$/ }))
+        await submit(answer)
+      }
+    }
+    expect(screen.queryByRole('region', { name: 'Interview summary' })).toBeNull()
+    expect(summaryReads()).toHaveLength(0)
+    fireEvent.click(screen.getByRole('button', { name: 'Continue' }))
+    if (index + 1 < questions.length) {
+      await screen.findByText(`Question ${index + 2} of 5`)
+      await waitFor(() => expect((nav('History') as HTMLButtonElement).disabled).toBe(false))
+    }
+  }
+  await screen.findByRole('heading', { name: 'Interview Complete' })
+  await waitFor(() => expect(summaryReads()).toHaveLength(1))
+  const [path, options] = summaryReads()[0]
+  expect(path).toBe(summaryPath)
+  expect(options?.method).toBeUndefined()
+  expect(options?.body).toBeUndefined()
+  expect(options?.cache).toBe('no-store')
+  const signal = options?.signal
+  const summary = screen.getByRole('region', { name: 'Interview summary' })
+  expect(summary.getAttribute('aria-busy')).toBe('true')
+  expect(within(summary).getByRole('status')).toBeTruthy()
+  expect((screen.getByRole('button', { name: 'Start New Interview' }) as HTMLButtonElement).disabled).toBe(false)
+  await waitFor(() => expect((nav('History') as HTMLButtonElement).disabled).toBe(false))
+  go('History'); await screen.findByRole('button', { name: 'Open session' })
+  go('Progress')
+  await within(screen.getByRole('region', { name: 'Progress' })).findByText('Saved attempts', { exact: true })
+  if (hiddenView === 'History') { go('History'); await screen.findByRole('heading', { name: 'History' }) }
+  const visiblePanel = screen.getByRole('region', { name: hiddenView === 'History' ? 'Remembered session history' : 'Progress' })
+  const beforePanel = visiblePanel.innerHTML
+  const beforeFacts = JSON.stringify(api.detail(null))
+  const beforeAttempts = JSON.stringify(questions.map((_, index) => api.saved(index)))
+  const beforeRequests = api.fetchMock.mock.calls.length
+  const beforeDiagnosis = api.posts('/diagnosis').length
+  const beforeLocalStorage = JSON.stringify(Object.entries(localStorage))
+  const beforeSessionStorage = JSON.stringify(Object.entries(sessionStorage))
+  const setItem = vi.spyOn(Storage.prototype, 'setItem')
+  const removeItem = vi.spyOn(Storage.prototype, 'removeItem')
+  const clear = vi.spyOn(Storage.prototype, 'clear')
+  expect(screen.queryByRole('region', { name: 'Interview summary' })).toBeNull()
+  expect(signal?.aborted).toBe(false)
+
+  await act(async () => pending.resolve(result === 'success'
+    ? response(api.detail(null)) : response({ detail: 'PRIVATE_SUMMARY_BACKEND_DETAIL' }, 503)))
+  view.rerender(<App />)
+  expect(visiblePanel.innerHTML).toBe(beforePanel)
+  expect(screen.queryByRole('region', { name: 'Interview summary' })).toBeNull()
+  expect(api.fetchMock.mock.calls).toHaveLength(beforeRequests)
+  go('Practice')
+  expect(screen.getByRole('heading', { name: 'Interview Complete' })).toBeTruthy()
+  expect(screen.getByRole('region', { name: 'Interview summary' })).toBe(summary)
+  expect(summary.getAttribute('aria-busy')).toBe('false')
+  if (result === 'success') {
+    expect(within(summary).queryByRole('alert')).toBeNull()
+    expect(within(summary).getByText('Questions completed', { exact: true }).nextElementSibling?.textContent).toBe('5 / 5')
+    expect(within(summary).getByText('Total attempts', { exact: true }).nextElementSibling?.textContent).toBe('7')
+    expect(within(summary).getByText('Total retries', { exact: true }).nextElementSibling?.textContent).toBe('2')
+    const rows = within(summary).getAllByRole('article')
+    expect(rows.map((row) => within(row).getByRole('heading', { level: 4 }).textContent)).toEqual([
+      'Question 1', 'Question 2', 'Question 3', 'Question 4', 'Question 5',
+    ])
+    rows.forEach((row, index) => {
+      expect(within(row).getByText(questions[index], { exact: true })).toBeTruthy()
+      expect(within(row).getByText('Final attempt', { exact: true }).nextElementSibling?.textContent).toBe(index === 0 ? '3' : '1')
+      expect(within(row).getByText('Retries', { exact: true }).nextElementSibling?.textContent).toBe(index === 0 ? '2' : '0')
+      expect(within(row).getByText('Speaking measurements: Unavailable — No measurement')).toBeTruthy()
+      expect(within(row).getByText('Timed pauses: Unavailable — No measurement')).toBeTruthy()
+    })
+  } else {
+    expect(within(summary).getByRole('alert').textContent).toBe('Interview summary is unavailable.')
+    expect(within(summary).queryByText(questions[0], { exact: true })).toBeNull()
+  }
+  expect(summary.textContent).not.toMatch(/PRIVATE_SUMMARY|interview-summary-v1|summary_version|score|confidence|NVIDIA|Nemotron|ElevenLabs/i)
+  expect(summary.textContent).not.toContain(SESSION_ID)
+  for (const attempt of questions.flatMap((_, index) => api.saved(index))) {
+    expect(summary.textContent).not.toContain(attempt.id)
+  }
+  expect(summary.textContent).not.toContain(semanticDiagnosis.addressed_question_reason)
+  expect(summary.textContent).not.toContain(personalizedDrillForFocus(semanticDiagnosis.next_focus).title)
+  expect(within(summary).queryByRole('region', { name: 'Answer feedback' })).toBeNull()
+  expect(within(summary).queryByRole('region', { name: 'Practice drill' })).toBeNull()
+  expect((screen.getByRole('button', { name: 'Start New Interview' }) as HTMLButtonElement).disabled).toBe(false)
+  go('History'); await screen.findByRole('heading', { name: 'History' })
+  go('Progress'); await screen.findByText('Objective practice history from sessions remembered on this browser.')
+  go('Practice')
+  view.rerender(<App />)
+  expect(screen.getByRole('region', { name: 'Interview summary' })).toBe(summary)
+  expect(signal?.aborted).toBe(false)
+  expect(summaryReads()).toHaveLength(1)
+  expect(api.fetchMock.mock.calls).toHaveLength(beforeRequests)
+  expect(api.posts('/attempts')).toHaveLength(7)
+  expect(api.posts('/continue')).toHaveLength(5)
+  expect(api.posts('/diagnosis')).toHaveLength(beforeDiagnosis)
+  expect(api.posts('/transcriptions')).toHaveLength(0)
+  expect(api.creations()).toBe(1)
+  expect(JSON.stringify(api.detail(null))).toBe(beforeFacts)
+  expect(JSON.stringify(questions.map((_, index) => api.saved(index)))).toBe(beforeAttempts)
+  expect(JSON.stringify(Object.entries(localStorage))).toBe(beforeLocalStorage)
+  expect(JSON.stringify(Object.entries(sessionStorage))).toBe(beforeSessionStorage)
+  expect(setItem).not.toHaveBeenCalled()
+  expect(removeItem).not.toHaveBeenCalled()
+  expect(clear).not.toHaveBeenCalled()
+})
+
 test('same-draft transcript edits retain measurement linkage across navigation', async () => {
   const api = mockAppApi(); render(<App />); await start(); await record(); await finishRecording()
   fireEvent.click(screen.getByRole('button', { name: 'Transcribe Recording' }))
