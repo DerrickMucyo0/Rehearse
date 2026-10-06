@@ -1,9 +1,9 @@
-"""Slice 2 schema only: authentication remains transitional and unenforced.
+"""Authentication schema and ownership with explicitly inserted legacy rows.
 
 All PostgreSQL writes and migration DDL roll back in the existing isolated test
 database. Synthetic metrics exercise the real session service without providers.
-TODO(auth): Nullable owners and anonymous creation must be prohibited by the later
-ownership/service slice before this branch becomes deployable authentication.
+TODO(auth): Provider and history routes remain transitional until later slices.
+Nullable schema ownership preserves historical rows, never anonymous creation.
 """
 from datetime import datetime, timedelta, timezone
 from hashlib import sha256
@@ -19,11 +19,12 @@ from sqlalchemy import DateTime, LargeBinary, MetaData, Table, Text, delete, ins
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
+from app.auth import AuthenticatedPrincipal
 from app.database_models import (
     AuthSession, Base, MEASUREMENT_VERSION, QuestionAttempt, StoredInterviewSession,
     TranscriptionMeasurement, User,
 )
-from app.sessions import AttemptRequest, ContinueRequest, InterviewSessionService, QUESTIONS
+from app.sessions import AttemptRequest, ContinueRequest, InterviewSessionService, QUESTIONS, SessionNotFound
 from app.transcription import TranscriptionResult
 from test_measurement_persistence import delivery_for, metrics_for, original_result
 
@@ -317,9 +318,9 @@ def test_user_deletion_is_restricted_without_cascading_referenced_records(connec
     assert connection.scalar(select(User.id).where(User.id == user_id)) is None
 
 
-def test_owned_session_fk_and_transitional_anonymous_creation_remain_supported(connection):
-    # This passing NULL-owner check is a transitional guard, not authentication.
-    # TODO(auth): Later service/route enforcement must close anonymous creation.
+def test_owned_session_fk_and_legacy_null_rows_remain_supported_by_schema(connection):
+    # Explicit legacy insertion proves schema compatibility. The owned service's
+    # normal start path must always persist its authenticated principal's user ID.
     user_id = add_user(connection)
     owned = add_session(connection, user_id=user_id)
     anonymous = add_session(connection, user_id=None)
@@ -506,12 +507,15 @@ def test_populated_0002_upgrade_downgrade_and_reupgrade_preserve_all_legacy_fact
 
 def test_owned_session_real_service_preserves_retry_completion_and_exact_measurement_links(connection):
     factory = sessionmaker(bind=connection, expire_on_commit=False, join_transaction_mode="create_savepoint")
-    service = InterviewSessionService(factory)
     owner = add_user(connection)
+    principal = AuthenticatedPrincipal(user_id=owner, auth_session_id=uuid4(), request_context="synthetic-owned-context")
+    service = InterviewSessionService(factory, principal)
+    legacy = add_session(connection, user_id=None)
     created = service.start()
-    # Ownership is assigned only for this regression fixture; start remains anonymous.
-    assert connection.scalar(select(StoredInterviewSession.user_id).where(StoredInterviewSession.id == created.id)) is None
-    connection.execute(update(StoredInterviewSession).where(StoredInterviewSession.id == created.id).values(user_id=owner))
+    assert connection.scalar(select(StoredInterviewSession.user_id).where(StoredInterviewSession.id == created.id)) == owner
+    assert connection.scalar(select(StoredInterviewSession.user_id).where(StoredInterviewSession.id == legacy)) is None
+    with pytest.raises(SessionNotFound, match="^Session not found\\.$"):
+        service.get(legacy)
     first_result = original_result()
     retry_result = TranscriptionResult(text="Um, uh hello", language="eng", words=[
         {"text": "Um,", "start": 2.0, "end": 2.25},

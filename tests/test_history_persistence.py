@@ -65,8 +65,8 @@ def no_provider_requests(monkeypatch):
 
 
 @pytest.fixture
-def sessions(postgres_session_factory):
-    return InterviewSessionService(postgres_session_factory)
+def sessions(postgres_session_factory, authenticated_principal):
+    return InterviewSessionService(postgres_session_factory, authenticated_principal)
 
 
 @pytest.fixture
@@ -75,11 +75,11 @@ def history(postgres_session_factory):
 
 
 @pytest.fixture
-def client(sessions, history):
-    app.dependency_overrides[get_session_service] = lambda: sessions
+def client(sessions, history, authenticated_session_override, authenticated_http_headers):
+    app.dependency_overrides[get_session_service] = authenticated_session_override(sessions)
     app.dependency_overrides[get_history_service] = lambda: history
     try:
-        with TestClient(app, raise_server_exceptions=False) as result:
+        with TestClient(app, raise_server_exceptions=False, headers=authenticated_http_headers) as result:
             yield result
     finally:
         app.dependency_overrides.pop(get_session_service, None)

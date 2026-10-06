@@ -10,6 +10,7 @@ from sqlalchemy import event, func, insert, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from app import database as database_configuration
+from app.auth_http import AUTH_REQUEST_CONTEXT_HEADER, AUTH_SESSION_COOKIE_NAME, get_auth_session_store
 from app.database import (
     DatabaseConfigurationError, create_database_engine, create_session_factory,
     get_database_session_factory,
@@ -23,13 +24,12 @@ from app.sessions import (
 
 
 @pytest.fixture
-def sessions(postgres_session_factory):
-    return InterviewSessionService(postgres_session_factory)
+def sessions(postgres_session_factory, authenticated_principal):
+    return InterviewSessionService(postgres_session_factory, authenticated_principal)
 
 
 @pytest.fixture
 def default_dependency_engines(monkeypatch):
-    get_session_service.cache_clear()
     get_database_session_factory.cache_clear()
     engines = []
     actual_create_engine = database_configuration.create_database_engine
@@ -43,7 +43,6 @@ def default_dependency_engines(monkeypatch):
     try:
         yield engines
     finally:
-        get_session_service.cache_clear()
         get_database_session_factory.cache_clear()
         for engine in engines:
             engine.dispose()
@@ -75,6 +74,7 @@ def snapshot(factory, identifier):
             QuestionAttempt.session_id == identifier,
         ).order_by(QuestionAttempt.question_index, QuestionAttempt.attempt_number)).scalars().all()
         return {
+            "user_id": record.user_id,
             "questions": record.questions,
             "index": record.current_question_index,
             "status": record.status,
@@ -88,13 +88,13 @@ def snapshot(factory, identifier):
         }
 
 
-def reconstructed_service(engine):
+def reconstructed_service(engine, authenticated_principal):
     rebuilt_engine = create_database_engine(engine.url)
-    return rebuilt_engine, InterviewSessionService(create_session_factory(rebuilt_engine))
+    return rebuilt_engine, InterviewSessionService(create_session_factory(rebuilt_engine), authenticated_principal)
 
 
 def test_created_session_survives_service_and_engine_reconstruction(sessions, postgres_engine,
-                                                                   postgres_session_factory):
+                                                                   postgres_session_factory, authenticated_principal):
     created = sessions.start()
     assert created.questions == list(QUESTIONS)
     assert created.current_question_index == 0
@@ -103,11 +103,12 @@ def test_created_session_survives_service_and_engine_reconstruction(sessions, po
     assert created.status == "active"
     assert sessions.get_attempts(created.id, 0) == []
     stored = snapshot(postgres_session_factory, created.id)
+    assert stored["user_id"] == authenticated_principal.user_id
     assert isinstance(stored["created_at"], datetime)
     assert stored["created_at"].tzinfo is not None
     assert stored["completed_at"] is None
     postgres_engine.dispose()
-    rebuilt_engine, rebuilt = reconstructed_service(postgres_engine)
+    rebuilt_engine, rebuilt = reconstructed_service(postgres_engine, authenticated_principal)
     try:
         assert rebuilt.get(created.id) == created
         assert rebuilt.get_attempts(created.id, 0) == []
@@ -117,7 +118,7 @@ def test_created_session_survives_service_and_engine_reconstruction(sessions, po
 
 
 def test_retries_append_without_advancing_and_survive_reconstruction(
-        sessions, postgres_engine, postgres_session_factory):
+        sessions, postgres_engine, postgres_session_factory, authenticated_principal):
     created = sessions.start()
     first = submit(sessions, created.id, answer="  First answer. \n")
     first_stored = snapshot(postgres_session_factory, created.id)["attempts"][0]
@@ -143,7 +144,7 @@ def test_retries_append_without_advancing_and_survive_reconstruction(
     assert stored["attempts"][0] == first_stored
     assert stored["attempts"][0][4] >= stored["created_at"]
     postgres_engine.dispose()
-    rebuilt_engine, rebuilt = reconstructed_service(postgres_engine)
+    rebuilt_engine, rebuilt = reconstructed_service(postgres_engine, authenticated_principal)
     try:
         assert rebuilt.get(created.id) == third.session
         assert rebuilt.get_attempts(created.id, 0) == attempts
@@ -153,7 +154,7 @@ def test_retries_append_without_advancing_and_survive_reconstruction(
 
 
 def test_continue_finalizes_latest_answer_and_reconstructs_all_attempts(
-        sessions, postgres_engine, postgres_session_factory):
+        sessions, postgres_engine, postgres_session_factory, authenticated_principal):
     created = sessions.start()
     submit(sessions, created.id, answer="First answer")
     submit(sessions, created.id, revision=1, answer="Latest answer")
@@ -169,7 +170,7 @@ def test_continue_finalizes_latest_answer_and_reconstructs_all_attempts(
     assert stored["attempts"] == before["attempts"]
     assert stored["completed_at"] is None
     postgres_engine.dispose()
-    rebuilt_engine, rebuilt = reconstructed_service(postgres_engine)
+    rebuilt_engine, rebuilt = reconstructed_service(postgres_engine, authenticated_principal)
     try:
         assert rebuilt.get(created.id) == updated
         assert rebuilt.get_attempts(created.id, 0) == attempts
@@ -180,7 +181,7 @@ def test_continue_finalizes_latest_answer_and_reconstructs_all_attempts(
 
 
 def test_fifth_submission_remains_active_until_continue_and_completion_survives_reconstruction(
-        sessions, postgres_engine, postgres_session_factory):
+        sessions, postgres_engine, postgres_session_factory, authenticated_principal):
     created = sessions.start()
     reach_question(sessions, created.id, 4)
     submitted = submit(sessions, created.id, 4, answer="Answer 4")
@@ -201,7 +202,7 @@ def test_fifth_submission_remains_active_until_continue_and_completion_survives_
     assert [attempt[1] for attempt in stored["attempts"]] == list(range(5))
     assert all(attempt[2] == 1 and attempt[5] is None for attempt in stored["attempts"])
     postgres_engine.dispose()
-    rebuilt_engine, rebuilt = reconstructed_service(postgres_engine)
+    rebuilt_engine, rebuilt = reconstructed_service(postgres_engine, authenticated_principal)
     try:
         assert rebuilt.get(created.id) == updated
         assert snapshot(create_session_factory(rebuilt_engine), created.id) == stored
@@ -290,7 +291,7 @@ def test_unknown_session_cannot_insert_an_attempt_or_continue(sessions, postgres
 @pytest.mark.parametrize("question", [0, 4])
 @pytest.mark.parametrize("initial_attempts", [0, 2])
 def test_flush_or_commit_failure_rolls_back_append_and_preserves_progress(
-        sessions, postgres_engine, postgres_session_factory, failure_stage, question, initial_attempts):
+        sessions, postgres_engine, postgres_session_factory, failure_stage, question, initial_attempts, authenticated_principal):
     created = sessions.start()
     reach_question(sessions, created.id, question)
     for revision in range(initial_attempts):
@@ -304,7 +305,7 @@ def test_flush_or_commit_failure_rolls_back_append_and_preserves_progress(
         raise RuntimeError("Injected transactional failure")
 
     event.listen(FailingSession, failure_stage, fail_operation)
-    failing = InterviewSessionService(sessionmaker(bind=postgres_engine, class_=FailingSession))
+    failing = InterviewSessionService(sessionmaker(bind=postgres_engine, class_=FailingSession), authenticated_principal)
     try:
         with pytest.raises(RuntimeError, match="Injected transactional failure"):
             submit(failing, created.id, question, initial_attempts, "Rejected")
@@ -320,7 +321,7 @@ def test_flush_or_commit_failure_rolls_back_append_and_preserves_progress(
 @pytest.mark.parametrize("failure_stage", ["after_flush_postexec", "before_commit"])
 @pytest.mark.parametrize("question", [0, 4])
 def test_flush_or_commit_failure_rolls_back_continue_and_completion(
-        sessions, postgres_engine, postgres_session_factory, failure_stage, question):
+        sessions, postgres_engine, postgres_session_factory, failure_stage, question, authenticated_principal):
     created = sessions.start()
     reach_question(sessions, created.id, question)
     submit(sessions, created.id, question, answer="Persisted answer")
@@ -333,7 +334,7 @@ def test_flush_or_commit_failure_rolls_back_continue_and_completion(
         raise RuntimeError("Injected transactional failure")
 
     event.listen(FailingSession, failure_stage, fail_operation)
-    failing = InterviewSessionService(sessionmaker(bind=postgres_engine, class_=FailingSession))
+    failing = InterviewSessionService(sessionmaker(bind=postgres_engine, class_=FailingSession), authenticated_principal)
     try:
         with pytest.raises(RuntimeError, match="Injected transactional failure"):
             advance(failing, created.id, question)
@@ -380,12 +381,13 @@ def test_existing_attempt_cannot_be_overwritten_by_initial_revision(sessions, po
 
 
 @pytest.mark.parametrize("answer", ["before\x00after", "\x00", "  answer\x00  "])
-def test_embedded_nul_is_http_422_without_any_database_mutation(sessions, postgres_session_factory, answer):
+def test_embedded_nul_is_http_422_without_any_database_mutation(
+        sessions, postgres_session_factory, answer, authenticated_session_override, authenticated_http_headers):
     created = sessions.start()
     before = snapshot(postgres_session_factory, created.id)
-    app.dependency_overrides[get_session_service] = lambda: sessions
+    app.dependency_overrides[get_session_service] = authenticated_session_override(sessions)
     try:
-        with TestClient(app) as client:
+        with TestClient(app, headers=authenticated_http_headers) as client:
             response = client.post(f"/api/sessions/{created.id}/questions/0/attempts", json={
                 "expected_last_attempt_number": 0, "answer": answer,
             })
@@ -468,15 +470,15 @@ def test_service_operations_return_connections_on_success_and_error(sessions, po
 
 
 def test_default_dependency_requires_application_url_and_never_falls_back_to_test_url(
-        postgres_engine, monkeypatch, default_dependency_engines):
+        postgres_engine, monkeypatch, default_dependency_engines, authenticated_principal):
     monkeypatch.setenv("TEST_DATABASE_URL", postgres_engine.url.render_as_string(hide_password=False))
     monkeypatch.delenv("DATABASE_URL", raising=False)
     with pytest.raises(DatabaseConfigurationError, match="DATABASE_URL must be explicitly configured"):
-        get_session_service()
-    assert get_session_service.cache_info().currsize == get_database_session_factory.cache_info().currsize == 0
+        get_session_service(principal=authenticated_principal)
+    assert get_database_session_factory.cache_info().currsize == 0
     assert default_dependency_engines == []
     monkeypatch.setenv("DATABASE_URL", postgres_engine.url.render_as_string(hide_password=False))
-    configured = get_session_service()
+    configured = get_session_service(principal=authenticated_principal)
     assert isinstance(configured, InterviewSessionService)
     assert len(default_dependency_engines) == 1
     configured_engine = default_dependency_engines[0]
@@ -485,15 +487,29 @@ def test_default_dependency_requires_application_url_and_never_falls_back_to_tes
     assert configured_engine.echo is False
     assert configured_engine.hide_parameters is True
     assert configured_engine.pool.checkedout() == 0
-    assert get_session_service() is configured
+    rebound = get_session_service(principal=authenticated_principal)
+    assert rebound is not configured
+    assert get_database_session_factory().kw["bind"] is configured_engine
     assert len(default_dependency_engines) == 1
 
 
 def test_default_http_dependency_persists_without_service_override(
-        postgres_session_factory, postgres_engine, monkeypatch, default_dependency_engines):
+        postgres_session_factory, postgres_engine, monkeypatch, default_dependency_engines, authenticated_principal):
     monkeypatch.setenv("DATABASE_URL", postgres_engine.url.render_as_string(hide_password=False))
     assert get_session_service not in app.dependency_overrides
-    with TestClient(app) as client:
+    credential = "synthetic-default-dependency-credential"
+
+    class AuthStore:
+        def resolve(self, *, credential):
+            assert credential == "synthetic-default-dependency-credential"
+            return authenticated_principal
+
+    monkeypatch.setitem(app.dependency_overrides, get_auth_session_store, lambda: AuthStore())
+    headers = {
+        "Cookie": f"{AUTH_SESSION_COOKIE_NAME}={credential}",
+        AUTH_REQUEST_CONTEXT_HEADER: authenticated_principal.request_context,
+    }
+    with TestClient(app, headers=headers) as client:
         created = client.post("/api/sessions")
         assert created.status_code == 201
         location = created.headers["Location"]
@@ -507,8 +523,7 @@ def test_default_http_dependency_persists_without_service_override(
         assert submitted.json()["session"]["answers"] == []
         assert submitted.json()["session"]["current_question_latest_attempt_number"] == 1
         assert len(default_dependency_engines) == 1
-        # Rebuild both production dependencies to exercise persistence across engines.
-        get_session_service.cache_clear()
+        # Rebuild the shared factory; request services are already created anew.
         get_database_session_factory.cache_clear()
         first_engine.dispose()
         reloaded = client.get(location)

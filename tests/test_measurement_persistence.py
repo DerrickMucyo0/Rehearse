@@ -23,7 +23,7 @@ from app.database_models import (
 )
 from app.delivery_metrics import measure_delivery
 from app.main import app
-from app.session_routes import get_session_service
+from app.session_routes import get_session_service, get_transitional_provider_session_service
 from app.sessions import (
     AttemptRequest, ContinueRequest, InterviewSessionService, SessionConflict, SessionNotFound,
 )
@@ -70,16 +70,18 @@ class FakeTranscriber:
 
 
 @pytest.fixture
-def setup(postgres_session_factory):
-    service = InterviewSessionService(postgres_session_factory)
+def setup(postgres_session_factory, authenticated_principal, authenticated_session_override, authenticated_http_headers):
+    service = InterviewSessionService(postgres_session_factory, authenticated_principal)
     fake = FakeTranscriber()
-    app.dependency_overrides[get_session_service] = lambda: service
+    app.dependency_overrides[get_session_service] = authenticated_session_override(service)
+    app.dependency_overrides[get_transitional_provider_session_service] = lambda: service
     app.dependency_overrides[get_transcription_service] = lambda: fake
     try:
-        with TestClient(app, raise_server_exceptions=False) as client:
+        with TestClient(app, raise_server_exceptions=False, headers=authenticated_http_headers) as client:
             yield client, service, fake
     finally:
         app.dependency_overrides.pop(get_session_service, None)
+        app.dependency_overrides.pop(get_transitional_provider_session_service, None)
         app.dependency_overrides.pop(get_transcription_service, None)
 
 
@@ -222,7 +224,7 @@ def test_measurement_storage_contains_no_audio_transcript_or_word_timing_columns
 
 
 def test_measurement_survives_engine_and_service_reconstruction(
-        setup, postgres_engine, postgres_session_factory):
+        setup, postgres_engine, postgres_session_factory, authenticated_principal):
     client, service, _ = setup
     created = service.start()
     response = transcribe(client, created.id)
@@ -232,7 +234,7 @@ def test_measurement_survives_engine_and_service_reconstruction(
     postgres_engine.dispose()
     rebuilt_engine = create_database_engine(postgres_engine.url)
     rebuilt_factory = create_session_factory(rebuilt_engine)
-    rebuilt_service = InterviewSessionService(rebuilt_factory)
+    rebuilt_service = InterviewSessionService(rebuilt_factory, authenticated_principal)
     try:
         assert measurement_rows(rebuilt_factory) == expected_rows
         updated = rebuilt_service.submit_attempt(created.id, 0, AttemptRequest(
@@ -429,7 +431,7 @@ def test_fifth_attempt_links_then_explicit_continue_completes(setup, postgres_se
 @pytest.mark.parametrize("failure_stage", ["after_flush_postexec", "before_commit"])
 @pytest.mark.parametrize("initial_answers", [0, 4])
 def test_link_flush_or_commit_failure_rolls_back_attempt_progress_and_completion(
-        setup, postgres_engine, postgres_session_factory, failure_stage, initial_answers):
+        setup, postgres_engine, postgres_session_factory, failure_stage, initial_answers, authenticated_principal):
     _, service, fake = setup
     created = service.start()
     advance(service, created.id, initial_answers)
@@ -444,7 +446,7 @@ def test_link_flush_or_commit_failure_rolls_back_attempt_progress_and_completion
         raise RuntimeError("Injected transactional failure")
 
     event.listen(FailingSession, failure_stage, fail)
-    failing = InterviewSessionService(sessionmaker(bind=postgres_engine, class_=FailingSession))
+    failing = InterviewSessionService(sessionmaker(bind=postgres_engine, class_=FailingSession), authenticated_principal)
     try:
         with pytest.raises(RuntimeError, match="Injected transactional failure"):
             failing.submit_attempt(created.id, initial_answers, AttemptRequest(
@@ -492,7 +494,7 @@ def test_metric_calculation_failure_creates_no_measurement(setup, postgres_sessi
 
 @pytest.mark.parametrize("failure_stage", ["after_flush_postexec", "before_commit"])
 def test_measurement_flush_or_commit_failure_does_not_leave_a_partial_row(
-        setup, postgres_engine, postgres_session_factory, failure_stage):
+        setup, postgres_engine, postgres_session_factory, failure_stage, authenticated_principal):
     _, service, fake = setup
     created = service.start()
     before = stored_state(postgres_session_factory, created.id)
@@ -504,7 +506,7 @@ def test_measurement_flush_or_commit_failure_does_not_leave_a_partial_row(
         raise RuntimeError("Injected measurement transaction failure")
 
     event.listen(FailingSession, failure_stage, fail)
-    failing = InterviewSessionService(sessionmaker(bind=postgres_engine, class_=FailingSession))
+    failing = InterviewSessionService(sessionmaker(bind=postgres_engine, class_=FailingSession), authenticated_principal)
     try:
         with pytest.raises(RuntimeError, match="Injected measurement transaction failure"):
             failing.create_measurement(created.id, 0, metrics_for(fake.result),
@@ -776,7 +778,7 @@ def test_stale_transcription_revision_rejected_before_provider(setup, postgres_s
 
 @pytest.mark.parametrize("failure_stage", ["after_flush_postexec", "before_commit"])
 def test_failed_measured_retry_keeps_prior_attempt_and_measurement_unchanged(
-        setup, postgres_engine, postgres_session_factory, failure_stage):
+        setup, postgres_engine, postgres_session_factory, failure_stage, authenticated_principal):
     _, service, fake = setup
     created = service.start()
     first_id = service.create_measurement(
@@ -798,7 +800,7 @@ def test_failed_measured_retry_keeps_prior_attempt_and_measurement_unchanged(
         raise RuntimeError("Injected retry failure")
 
     event.listen(FailingSession, failure_stage, fail)
-    failing = InterviewSessionService(sessionmaker(bind=postgres_engine, class_=FailingSession))
+    failing = InterviewSessionService(sessionmaker(bind=postgres_engine, class_=FailingSession), authenticated_principal)
     try:
         with pytest.raises(RuntimeError, match="Injected retry failure"):
             failing.submit_attempt(created.id, 0, AttemptRequest(

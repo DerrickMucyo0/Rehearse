@@ -6,6 +6,7 @@ from pydantic import BaseModel, ConfigDict, Field, StringConstraints, computed_f
 from sqlalchemy import and_, func, select
 from sqlalchemy.orm import Session, sessionmaker
 
+from app.auth import AuthenticatedPrincipal
 from app.comparisons import (
     AttemptComparison, ComparedAttempt, MeasurementSnapshot, compare_delivery_measurements,
     compare_measurements, delivery_snapshot,
@@ -90,18 +91,14 @@ class InvalidComparisonSelection(Exception):
     pass
 
 
-class InterviewSessionService:
-    """PostgreSQL storage; each operation owns and closes its ORM transaction."""
+class _SessionPersistence:
+    """Shared transaction mechanics; subclasses supply the root lookup scope."""
 
     def __init__(self, session_factory: sessionmaker[Session]) -> None:
         self._session_factory = session_factory
 
-    def start(self) -> InterviewSession:
-        with self._session_factory.begin() as database:
-            stored = StoredInterviewSession(questions=QUESTIONS)
-            database.add(stored)
-            database.flush()
-            return self._response(stored, [])
+    def _session_predicate(self, session_id: UUID):
+        raise NotImplementedError
 
     def get(self, session_id: UUID) -> InterviewSession:
         with self._session_factory.begin() as database:
@@ -116,7 +113,7 @@ class InterviewSessionService:
                     QuestionAttempt.session_id == StoredInterviewSession.id,
                     QuestionAttempt.question_index == question_index,
                 ))
-                .where(StoredInterviewSession.id == session_id)
+                .where(self._session_predicate(session_id))
                 .order_by(QuestionAttempt.attempt_number)
             ).all()
             if not rows:
@@ -289,10 +286,9 @@ class InterviewSessionService:
         if expected_last_attempt_number is not None:
             self._check_revision(session.current_question_latest_attempt_number, expected_last_attempt_number)
 
-    @staticmethod
-    def _locked_session(database: Session, session_id: UUID) -> StoredInterviewSession:
+    def _locked_session(self, database: Session, session_id: UUID) -> StoredInterviewSession:
         stored = database.scalar(
-            select(StoredInterviewSession).where(StoredInterviewSession.id == session_id).with_for_update()
+            select(StoredInterviewSession).where(self._session_predicate(session_id)).with_for_update()
         )
         if stored is None:
             raise SessionNotFound("Session not found.")
@@ -309,9 +305,8 @@ class InterviewSessionService:
         if expected != latest:
             raise SessionConflict("Attempt revision does not match the current question.")
 
-    @staticmethod
     def _read_question_attempts(
-        database: Session, session_id: UUID, question_index: int,
+        self, database: Session, session_id: UUID, question_index: int,
     ) -> tuple[StoredInterviewSession, dict[int, tuple[QuestionAttempt, TranscriptionMeasurement | None]]]:
         # One statement selects the immutable question snapshot, scoped attempts
         # and their exact linked measurements. No read lock or latest-measurement
@@ -328,7 +323,7 @@ class InterviewSessionService:
                 TranscriptionMeasurement.session_id == QuestionAttempt.session_id,
                 TranscriptionMeasurement.question_index == QuestionAttempt.question_index,
             ))
-            .where(StoredInterviewSession.id == session_id)
+            .where(self._session_predicate(session_id))
             .order_by(QuestionAttempt.attempt_number)
         ).all()
         if not rows:
@@ -346,7 +341,7 @@ class InterviewSessionService:
         rows = database.execute(
             select(StoredInterviewSession, QuestionAttempt)
             .outerjoin(QuestionAttempt, QuestionAttempt.session_id == StoredInterviewSession.id)
-            .where(StoredInterviewSession.id == session_id)
+            .where(self._session_predicate(session_id))
             .order_by(QuestionAttempt.question_index, QuestionAttempt.attempt_number)
         ).all()
         if not rows:
@@ -411,4 +406,77 @@ class InterviewSessionService:
             questions=list(stored.questions),
             answers=[latest[index].answer_text for index in range(stored.current_question_index) if index in latest],
             current_question_latest_attempt_number=current.attempt_number if current is not None else 0,
+        )
+
+
+class InterviewSessionService(_SessionPersistence):
+    """One authenticated owner; every operation closes its own transaction.
+
+    Authentication belongs to the HTTP/store boundary. This service authorizes
+    by filtering the root session in the same SELECT, including row locks, before
+    interpreting child rows, question state, revisions or measurement references.
+    The shared factory carries no identity; this service is never globally cached.
+    """
+
+    def __init__(
+        self, session_factory: sessionmaker[Session], principal: AuthenticatedPrincipal,
+    ) -> None:
+        if type(principal) is not AuthenticatedPrincipal:
+            raise TypeError("An authenticated principal is required.")
+        super().__init__(session_factory)
+        self._principal = principal
+
+    def _session_predicate(self, session_id: UUID):
+        return and_(
+            StoredInterviewSession.id == session_id,
+            StoredInterviewSession.user_id == self._principal.user_id,
+        )
+
+    def start(self) -> InterviewSession:
+        with self._session_factory.begin() as database:
+            stored = StoredInterviewSession(questions=QUESTIONS, user_id=self._principal.user_id)
+            database.add(stored)
+            database.flush()
+            return self._response(stored, [])
+
+
+class _TransitionalProviderPersistence(_SessionPersistence):
+    def _session_predicate(self, session_id: UUID):
+        return StoredInterviewSession.id == session_id
+
+
+class TransitionalProviderSessionService:
+    """Temporary UUID access for audio/transcription/diagnosis until Slice 6.
+
+    Deliberately separate from the mandatory owner-bound core service. Expose
+    only the existing provider context/measurement operations: no anonymous
+    session creation, attempt submission, finalization, list or comparison API.
+    This compatibility boundary is not authorization and must not be adopted by
+    core routes. Provider authentication and post-inference revalidation remain
+    explicitly deferred; there are no transactions across provider work here.
+    """
+
+    def __init__(self, session_factory: sessionmaker[Session]) -> None:
+        self._storage = _TransitionalProviderPersistence(session_factory)
+
+    def get(self, session_id: UUID) -> InterviewSession:
+        return self._storage.get(session_id)
+
+    def get_diagnosis_context(
+        self, session_id: UUID, question_index: int, attempt_number: int,
+    ) -> DiagnosisContext:
+        return self._storage.get_diagnosis_context(session_id, question_index, attempt_number)
+
+    def validate_current_question(
+        self, session_id: UUID, question_index: int, expected_last_attempt_number: int | None = None,
+    ) -> None:
+        self._storage.validate_current_question(session_id, question_index, expected_last_attempt_number)
+
+    def create_measurement(
+        self, session_id: UUID, question_index: int, metrics: SpeakingMetrics,
+        *, expected_last_attempt_number: int, delivery_metrics: DeliveryMetrics | None = None,
+    ) -> UUID:
+        return self._storage.create_measurement(
+            session_id, question_index, metrics,
+            expected_last_attempt_number=expected_last_attempt_number, delivery_metrics=delivery_metrics,
         )

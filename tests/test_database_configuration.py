@@ -2,6 +2,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
 import inspect
 from threading import Barrier, Event
+from uuid import uuid4
 
 import pytest
 from sqlalchemy.engine import make_url
@@ -19,9 +20,8 @@ TEST = "postgresql+psycopg://rehearse_test:PRIVATE_SENTINEL@localhost/rehearse_t
 
 @pytest.fixture
 def shared_factory_engines(monkeypatch):
-    from app import database, session_routes
+    from app import database
 
-    session_routes.get_session_service.cache_clear()
     database.get_database_session_factory.cache_clear()
     engines = []
     actual_create_engine = database.create_database_engine
@@ -35,7 +35,6 @@ def shared_factory_engines(monkeypatch):
     try:
         yield engines
     finally:
-        session_routes.get_session_service.cache_clear()
         database.get_database_session_factory.cache_clear()
         for engine in engines:
             engine.dispose()
@@ -206,6 +205,7 @@ def test_both_consumers_share_one_lazy_factory_without_request_or_session_state(
 ):
     import psycopg
     from app import auth_http, database, session_routes
+    from app.auth import AuthenticatedPrincipal
 
     monkeypatch.setenv("DATABASE_URL", APPLICATION)
     monkeypatch.setenv("TEST_DATABASE_URL", TEST)
@@ -220,9 +220,9 @@ def test_both_consumers_share_one_lazy_factory_without_request_or_session_state(
         factory_calls.append((engine, factory))
         return factory
 
-    def interview_service(factory):
+    def interview_service(factory, principal):
         service = object()
-        service_calls.append((factory, service))
+        service_calls.append((factory, principal, service))
         return service
 
     def authentication_store(factory, *, session_lifetime):
@@ -241,7 +241,14 @@ def test_both_consumers_share_one_lazy_factory_without_request_or_session_state(
     assert tuple(inspect.signature(helper).parameters) == ()
     assert helper.cache_info().currsize == 0
 
-    service = session_routes.get_session_service()
+    first_principal = AuthenticatedPrincipal(
+        user_id=uuid4(), auth_session_id=uuid4(), request_context="first-login-context",
+    )
+    second_principal = AuthenticatedPrincipal(
+        user_id=uuid4(), auth_session_id=uuid4(), request_context="replacement-login-context",
+    )
+    service = session_routes.get_session_service(first_principal)
+    replacement_service = session_routes.get_session_service(second_principal)
     stores = []
     for credential in ("first-login-credential", "replacement-login-credential"):
         request = Request({
@@ -251,15 +258,21 @@ def test_both_consumers_share_one_lazy_factory_without_request_or_session_state(
         stores.append(auth_http.get_auth_session_store(request))
     factory = helper()
     assert isinstance(factory, sessionmaker) and not isinstance(factory, Session)
-    assert len(shared_factory_engines) == len(factory_calls) == len(service_calls) == 1
+    assert len(shared_factory_engines) == len(factory_calls) == 1
     engine = shared_factory_engines[0]
     assert factory_calls == [(engine, factory)]
-    assert service_calls == [(factory, service)]
+    assert service_calls == [
+        (factory, first_principal, service), (factory, second_principal, replacement_service),
+    ]
+    assert replacement_service is not service
     assert store_calls == [(factory, timedelta(hours=8), store) for store in stores]
     assert engine.url == get_database_url({"DATABASE_URL": APPLICATION})
     assert engine.echo is False and engine.hide_parameters is True
     assert engine.pool.checkedout() == 0
-    assert session_routes.get_session_service() is service
+    repeated_service = session_routes.get_session_service(first_principal)
+    assert repeated_service is not service and repeated_service is not replacement_service
+    assert service_calls[-1] == (factory, first_principal, repeated_service)
+    assert len(service_calls) == 3
     monkeypatch.setenv("DATABASE_URL", TEST)
     assert helper() is factory
     assert len(shared_factory_engines) == len(factory_calls) == 1

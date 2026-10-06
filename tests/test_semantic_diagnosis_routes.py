@@ -181,7 +181,7 @@ def setup():
         dependencies.append("diagnoser")
         return adapter
 
-    app.dependency_overrides[routes.get_session_service] = session_override
+    app.dependency_overrides[routes.get_transitional_provider_session_service] = session_override
     app.dependency_overrides[get_semantic_diagnosis_adapter] = adapter_override
     with TestClient(app, raise_server_exceptions=True) as client:
         yield client, reader, adapter, expected, events, dependencies
@@ -522,9 +522,9 @@ def test_real_threadpool_read_finishes_before_application_adapter_and_synthetic_
 
 
 def test_http_postgres_transaction_and_connection_end_in_worker_before_semantic_application(
-    postgres_engine, postgres_session_factory, monkeypatch,
+    postgres_engine, postgres_session_factory, authenticated_principal, monkeypatch,
 ):
-    setup_service = InterviewSessionService(postgres_session_factory)
+    setup_service = InterviewSessionService(postgres_session_factory, authenticated_principal)
     created = setup_service.start()
     expected_answer = "Authoritative persisted answer for the async route boundary."
     submitted = setup_service.submit_attempt(created.id, 0, AttemptRequest(
@@ -544,7 +544,9 @@ def test_http_postgres_transaction_and_connection_end_in_worker_before_semantic_
     class ReadSession(Session):
         pass
 
-    service = InterviewSessionService(sessionmaker(bind=postgres_engine, class_=ReadSession))
+    service = InterviewSessionService(
+        sessionmaker(bind=postgres_engine, class_=ReadSession), authenticated_principal,
+    )
     actual_read = service.get_diagnosis_context
     actual_application = routes.diagnose_application_context
     read_calls, reader_threads, returned, transactions, ended, statements, events = [], [], [], [], [], [], []
@@ -615,7 +617,7 @@ def test_http_postgres_transaction_and_connection_end_in_worker_before_semantic_
     for name in ("start", "get", "get_attempts", "get_comparison", "submit_attempt", "continue_question", "create_measurement"):
         monkeypatch.setattr(service, name, forbidden_mutation)
     monkeypatch.setattr(routes, "diagnose_application_context", observed_application)
-    app.dependency_overrides[routes.get_session_service] = lambda: service
+    app.dependency_overrides[routes.get_transitional_provider_session_service] = lambda: service
     app.dependency_overrides[get_semantic_diagnosis_adapter] = lambda: adapter
     event.listen(ReadSession, "after_transaction_create", transaction_created)
     event.listen(ReadSession, "after_transaction_end", transaction_ended)
@@ -689,7 +691,7 @@ def test_route_is_post_only_with_semantic_response_no_body_or_query_and_exact_de
         "session_id", "question_index", "attempt_number",
     ]
     assert [dependency.call for dependency in route.dependant.dependencies] == [
-        routes.get_session_service, get_semantic_diagnosis_adapter,
+        routes.get_transitional_provider_session_service, get_semantic_diagnosis_adapter,
     ]
     adapter_type, dependency = get_args(routes.SemanticDiagnosisService)
     assert adapter_type is SemanticDiagnosisAdapter

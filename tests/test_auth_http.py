@@ -1,4 +1,4 @@
-"""Isolated HTTP authentication boundary, without application route enforcement.
+"""HTTP authentication boundary and owned core-route response contracts.
 
 The probe app exists only in this module. Stores are injected; the one PostgreSQL
 integration reuses the dedicated fixture and checks that auth never reads history.
@@ -10,7 +10,7 @@ from datetime import datetime, timedelta, timezone
 from hashlib import sha256
 from threading import Barrier
 import traceback
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import httpx
 import pytest
@@ -29,7 +29,7 @@ from app.auth_http import (
 )
 from app.auth_persistence import PostgreSQLAuthSessionStore
 from app.database import DatabaseConfigurationError
-from app.database_models import AuthSession, User
+from app.database_models import AuthSession, StoredInterviewSession, User
 
 TOKEN_A = "PRIVATE_BROWSER_TOKEN_A_" + "a" * 43
 TOKEN_B = "PRIVATE_BROWSER_TOKEN_B_" + "b" * 43
@@ -524,20 +524,20 @@ def test_health_keeps_its_existing_bytes_and_headers_without_authentication(monk
     }
 
 
-def test_anonymous_session_routes_keep_existing_cache_headers(postgres_session_factory, monkeypatch):
+def test_authenticated_session_routes_preserve_response_bytes_and_add_private_cache_headers(
+    postgres_session_factory, authenticated_principal, monkeypatch,
+):
     from app.main import app
-    from app.session_routes import get_session_service
-    from app.sessions import InterviewSessionService, QUESTIONS
+    from app import session_routes
+    from app.sessions import QUESTIONS
 
-    def forbidden(*args, **kwargs):
-        raise AssertionError("Existing anonymous session routes must not execute authentication.")
-
-    service = InterviewSessionService(postgres_session_factory)
-    monkeypatch.setitem(app.dependency_overrides, get_session_service, lambda: service)
-    monkeypatch.setitem(app.dependency_overrides, get_auth_session_store, forbidden)
-    monkeypatch.setitem(app.dependency_overrides, require_authenticated_principal, forbidden)
+    store = FakeStore()
+    store.principals = {TOKEN_A: authenticated_principal}
+    monkeypatch.setattr(session_routes, "get_database_session_factory", lambda: postgres_session_factory)
+    monkeypatch.setitem(app.dependency_overrides, get_auth_session_store, lambda: store)
+    headers = request_headers(TOKEN_A, authenticated_principal.request_context)
     with TestClient(app) as client:
-        created = client.post("/api/sessions")
+        created = client.post("/api/sessions", headers=headers)
         assert created.status_code == 201
         body = created.json()
         location = f"/api/sessions/{body['id']}"
@@ -546,14 +546,18 @@ def test_anonymous_session_routes_keep_existing_cache_headers(postgres_session_f
             "questions": list(QUESTIONS), "answers": [],
             "current_question_latest_attempt_number": 0, "current_question": QUESTIONS[0],
         }
-        read = client.get(location)
+        read = client.get(location, headers=headers)
     assert read.status_code == 200
     assert read.content == created.content
     baseline_headers = {
         "content-length": str(len(created.content)), "content-type": "application/json",
+        "cache-control": "no-store",
     }
     assert dict(created.headers) == {**baseline_headers, "location": location}
     assert dict(read.headers) == baseline_headers
+    assert store.calls == [TOKEN_A, TOKEN_A]
+    with postgres_session_factory() as database:
+        assert database.get(StoredInterviewSession, UUID(body["id"])).user_id == authenticated_principal.user_id
 
 
 @pytest.mark.parametrize("constructor_lifetime", [

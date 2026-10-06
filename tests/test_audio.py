@@ -6,19 +6,24 @@ from fastapi.testclient import TestClient
 
 from app.audio import MAX_AUDIO_BYTES, MAX_BODY_BYTES
 from app.main import app
-from app.session_routes import get_session_service
+from app.session_routes import get_session_service, get_transitional_provider_session_service
 from app.sessions import InterviewSessionService
 
 
 @pytest.fixture
-def client(postgres_session_factory) -> Iterator[TestClient]:
-    service = InterviewSessionService(postgres_session_factory)
-    app.dependency_overrides[get_session_service] = lambda: service
+def client(
+    postgres_session_factory, authenticated_principal,
+    authenticated_http_headers, authenticated_session_override,
+) -> Iterator[TestClient]:
+    service = InterviewSessionService(postgres_session_factory, authenticated_principal)
+    app.dependency_overrides[get_session_service] = authenticated_session_override(service)
+    app.dependency_overrides[get_transitional_provider_session_service] = lambda: service
     try:
-        with TestClient(app) as test_client:
+        with TestClient(app, headers=authenticated_http_headers) as test_client:
             yield test_client
     finally:
         app.dependency_overrides.pop(get_session_service)
+        app.dependency_overrides.pop(get_transitional_provider_session_service)
 
 
 def upload(client, session_id, index=0, content=b'audio bytes', content_type='audio/webm;codecs=opus'):
@@ -145,7 +150,7 @@ def test_rechecks_current_question_after_transfer(client, monkeypatch):
     from app.sessions import AttemptRequest, ContinueRequest
 
     original = routes.bounded_multipart_request
-    service = app.dependency_overrides[get_session_service]()
+    service = app.dependency_overrides[get_transitional_provider_session_service]()
     session = service.start()
 
     async def advance_during_transfer(request):

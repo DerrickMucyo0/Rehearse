@@ -622,7 +622,7 @@ def test_total_deadline_preserves_application_http_504_and_persisted_context(
 ):
     from fastapi.testclient import TestClient
     from app.main import app
-    from app.session_routes import get_session_service
+    from app.session_routes import get_transitional_provider_session_service
     from app.semantic_diagnosis_composition import get_semantic_diagnosis_adapter
 
     deadlines, requests, reads = [], [], []
@@ -648,7 +648,7 @@ def test_total_deadline_preserves_application_http_504_and_persisted_context(
     monkeypatch.setattr(provider, "asyncio", SimpleNamespace(timeout=immediate_deadline))
     original_overrides = app.dependency_overrides.copy()
     try:
-        app.dependency_overrides[get_session_service] = lambda: reader
+        app.dependency_overrides[get_transitional_provider_session_service] = lambda: reader
         app.dependency_overrides[get_semantic_diagnosis_adapter] = lambda: adapter
         with TestClient(app) as client:
             response = client.post(

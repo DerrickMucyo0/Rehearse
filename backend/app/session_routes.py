@@ -1,5 +1,4 @@
 from contextlib import asynccontextmanager
-from functools import lru_cache
 from typing import Annotated, Literal
 from uuid import UUID
 
@@ -8,6 +7,7 @@ from pydantic import Field
 from starlette.concurrency import run_in_threadpool
 
 from app.audio import AudioAccepted, bounded_multipart_request, validated_audio
+from app.auth_http import AuthenticatedPrincipalDependency
 from app.comparisons import AttemptComparison
 from app.database import get_database_session_factory
 from app.delivery_metrics import DeliveryMetrics, measure_delivery
@@ -31,6 +31,7 @@ from app.sessions import (
     InterviewSessionService,
     SessionConflict,
     SessionNotFound,
+    TransitionalProviderSessionService,
 )
 
 from app.transcription import (
@@ -41,14 +42,24 @@ from app.transcription import (
 router = APIRouter(prefix="/api/sessions", tags=["sessions"])
 
 
-@lru_cache(maxsize=1)
-def get_session_service() -> InterviewSessionService:
-    # Pool the engine, never an ORM Session. Configuration uses DATABASE_URL only
-    # and is resolved on first use, preserving database-free imports and health.
-    return InterviewSessionService(get_database_session_factory())
+def get_session_service(principal: AuthenticatedPrincipalDependency) -> InterviewSessionService:
+    # Share only the factory. A service/principal belongs to this authenticated
+    # request, never a process cache; each operation owns its short transaction.
+    return InterviewSessionService(get_database_session_factory(), principal)
 
 
 SessionService = Annotated[InterviewSessionService, Depends(get_session_service)]
+
+
+def get_transitional_provider_session_service() -> TransitionalProviderSessionService:
+    # Slice 6 will secure provider preflight and post-inference revalidation.
+    # Core routes must never use this deliberately isolated UUID compatibility path.
+    return TransitionalProviderSessionService(get_database_session_factory())
+
+
+TransitionalProviderService = Annotated[
+    TransitionalProviderSessionService, Depends(get_transitional_provider_session_service),
+]
 SemanticDiagnosisService = Annotated[
     SemanticDiagnosisAdapter,
     Depends(get_semantic_diagnosis_adapter),
@@ -116,7 +127,7 @@ async def diagnose_attempt(
     session_id: UUID,
     question_index: Annotated[int, Path(ge=0)],
     attempt_number: Annotated[int, Path(ge=1)],
-    sessions: SessionService,
+    sessions: TransitionalProviderService,
     diagnoser: SemanticDiagnosisService,
 ) -> SemanticDiagnosis:
     try:
@@ -155,7 +166,7 @@ def get_comparison(
 
 @asynccontextmanager
 async def current_audio(
-    session_id: UUID, request: Request, sessions: InterviewSessionService,
+    session_id: UUID, request: Request, sessions: TransitionalProviderSessionService,
     *, require_attempt_revision: bool = False,
 ):
     try:
@@ -173,7 +184,7 @@ async def current_audio(
 
 
 @router.post("/{session_id}/audio", response_model=AudioAccepted)
-async def accept_audio(session_id: UUID, request: Request, sessions: SessionService) -> AudioAccepted:
+async def accept_audio(session_id: UUID, request: Request, sessions: TransitionalProviderService) -> AudioAccepted:
     async with current_audio(session_id, request, sessions) as (_, metadata, _):
         return metadata
 
@@ -195,7 +206,7 @@ class SessionTranscription(TranscriptionResult):
 
 @router.post("/{session_id}/transcriptions", response_model=SessionTranscription)
 async def transcribe_audio(
-    session_id: UUID, request: Request, sessions: SessionService,
+    session_id: UUID, request: Request, sessions: TransitionalProviderService,
     transcriber: Annotated[TranscriptionService, Depends(get_transcription_service)],
 ) -> SessionTranscription:
     async with current_audio(
