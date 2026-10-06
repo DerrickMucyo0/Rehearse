@@ -25,6 +25,25 @@ export interface AttemptSubmission {
   session: InterviewSession
 }
 
+export interface SemanticDiagnosis {
+  addressed_question: 'yes' | 'partially' | 'no'
+  addressed_question_reason: string
+  strengths: string[]
+  missing_information: string[]
+  structure: 'clear' | 'mixed' | 'unclear' | 'insufficient_content'
+  structure_feedback: string
+  next_focus:
+    | 'answer_the_question'
+    | 'specificity'
+    | 'supporting_detail'
+    | 'structure'
+    | 'completeness'
+    | 'conciseness'
+    | 'maintain_strengths'
+  next_focus_reason: string
+  retry_instruction: string
+}
+
 export type TimingUnavailableReason = 'missing_timings' | 'timing_coverage_mismatch' | 'invalid_timing' | 'invalid_timing_order' | 'unusable_span'
 export type MetricUnavailableReason = 'no_measurement' | 'unsupported_language' | TimingUnavailableReason
 export type ComparisonUnavailableReason = 'measurement_version_mismatch' | 'measurement_source_incompatible' | 'before_unavailable' | 'after_unavailable' | 'both_unavailable'
@@ -88,6 +107,16 @@ export class ApiError extends Error {
     this.name = 'ApiError'
     this.status = status
     this.ambiguousWrite = ambiguousWrite
+  }
+}
+
+export class SemanticDiagnosisError extends Error {
+  readonly status: number | null
+
+  constructor(message: string, status: number | null = null) {
+    super(message)
+    this.name = 'SemanticDiagnosisError'
+    this.status = status
   }
 }
 
@@ -174,6 +203,63 @@ export function continueQuestion(session: InterviewSession): Promise<InterviewSe
   return request(`${questionPath(session)}/continue`, (value): value is InterviewSession =>
     validSession(value) && value.id === session.id && value.current_question_index === session.current_question_index + 1,
   jsonBody({ expected_last_attempt_number: session.current_question_latest_attempt_number }))
+}
+
+function validSemanticDiagnosis(value: unknown): value is SemanticDiagnosis {
+  const keys = ['addressed_question', 'addressed_question_reason', 'strengths', 'missing_information',
+    'structure', 'structure_feedback', 'next_focus', 'next_focus_reason', 'retry_instruction']
+  const text = (field: unknown): field is string => typeof field === 'string' && field.trim().length > 0
+  const list = (field: unknown): field is string[] => Array.isArray(field) && field.every(text)
+  return object(value) && Object.keys(value).length === keys.length && keys.every((key) => Object.hasOwn(value, key)) &&
+    ['yes', 'partially', 'no'].includes(value.addressed_question as string) &&
+    text(value.addressed_question_reason) && list(value.strengths) && list(value.missing_information) &&
+    ['clear', 'mixed', 'unclear', 'insufficient_content'].includes(value.structure as string) &&
+    text(value.structure_feedback) &&
+    ['answer_the_question', 'specificity', 'supporting_detail', 'structure', 'completeness', 'conciseness', 'maintain_strengths']
+      .includes(value.next_focus as string) && text(value.next_focus_reason) && text(value.retry_instruction)
+}
+
+export async function getSemanticDiagnosis(
+  sessionId: string,
+  questionIndex: number,
+  attemptNumber: number,
+  signal: AbortSignal,
+): Promise<SemanticDiagnosis> {
+  const timeoutMessage = 'Feedback took too long. You can still retry or continue.'
+  const malformedMessage = 'Unable to generate feedback right now. You can still retry or continue.'
+  const timeout = AbortSignal.timeout(75000)
+  const checkCancellation = () => {
+    if (signal.aborted) throw new DOMException('Feedback request cancelled.', 'AbortError')
+    if (timeout.aborted) throw new SemanticDiagnosisError(timeoutMessage)
+  }
+  checkCancellation()
+  let response: Response
+  try {
+    response = await fetch(`/api/sessions/${sessionId}/questions/${questionIndex}/attempts/${attemptNumber}/diagnosis`, {
+      method: 'POST', signal: AbortSignal.any([signal, timeout]),
+    })
+  } catch {
+    checkCancellation()
+    throw new SemanticDiagnosisError('Unable to load feedback right now. You can still retry or continue.')
+  }
+  checkCancellation()
+  if (!response.ok) {
+    const messages: Record<number, string> = {
+      404: 'Feedback is no longer available for this attempt.',
+      502: malformedMessage,
+      503: 'Feedback is unavailable right now. You can still retry or continue.',
+      504: timeoutMessage,
+    }
+    throw new SemanticDiagnosisError(messages[response.status] ?? malformedMessage, response.status)
+  }
+  let result: unknown
+  try { result = await response.json() } catch {
+    checkCancellation()
+    throw new SemanticDiagnosisError(malformedMessage, response.status)
+  }
+  checkCancellation()
+  if (!validSemanticDiagnosis(result)) throw new SemanticDiagnosisError(malformedMessage, response.status)
+  return result
 }
 
 export function getAttempts(session: InterviewSession): Promise<Attempt[]> {

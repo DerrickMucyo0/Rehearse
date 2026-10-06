@@ -4,9 +4,9 @@ import AudioAnswer from './AudioAnswer'
 import Comparison from './AttemptComparison'
 import {
   ApiError, continueQuestion, getAttempts, getComparison, getSession,
-  isConflictError, startInterview, submitAttempt,
+  getSemanticDiagnosis, isConflictError, SemanticDiagnosisError, startInterview, submitAttempt,
 } from './interviewApi'
-import type { Attempt, AttemptComparison, InterviewSession } from './interviewApi'
+import type { Attempt, AttemptComparison, InterviewSession, SemanticDiagnosis } from './interviewApi'
 
 const SESSION_KEY = 'rehearse.session_id'
 type Mode = 'composing' | 'review'
@@ -21,6 +21,38 @@ interface Recovery {
   questionIndex?: number
   revision?: number
   kind: 'submit' | 'continue' | 'transcription' | 'conflict' | 'restore' | 'review'
+}
+
+type DiagnosisTarget = {
+  sessionId: string
+  questionIndex: number
+  attemptNumber: number
+  attemptId: string
+}
+type DiagnosisState =
+  | { status: 'idle' }
+  | { status: 'loading'; target: DiagnosisTarget }
+  | { status: 'success'; target: DiagnosisTarget; diagnosis: SemanticDiagnosis }
+  | { status: 'error'; target: DiagnosisTarget; message: string }
+
+const addressedLabels: Record<SemanticDiagnosis['addressed_question'], string> = {
+  yes: 'Yes', partially: 'Partially', no: 'No',
+}
+const structureLabels: Record<SemanticDiagnosis['structure'], string> = {
+  clear: 'Clear', mixed: 'Mixed', unclear: 'Unclear', insufficient_content: 'Not enough content',
+}
+const focusLabels: Record<SemanticDiagnosis['next_focus'], string> = {
+  answer_the_question: 'Answer the question', specificity: 'Specificity', supporting_detail: 'Supporting detail',
+  structure: 'Structure', completeness: 'Completeness', conciseness: 'Conciseness', maintain_strengths: 'Maintain strengths',
+}
+
+function ownsDiagnosis(view: SavedView | null, target: DiagnosisTarget): boolean {
+  const latest = view?.attempts.at(-1)
+  return view?.mode === 'review' && view.session.status === 'active' &&
+    view.session.id === target.sessionId && view.session.current_question_index === target.questionIndex &&
+    view.session.current_question_latest_attempt_number === target.attemptNumber &&
+    latest?.id === target.attemptId && latest.question_index === target.questionIndex &&
+    latest.attempt_number === target.attemptNumber
 }
 
 function storedSessionId(): string | null {
@@ -75,6 +107,11 @@ export default function Interview({ onSessionAccess, onNavigationBusyChange, onH
   const [audioBusy, setAudioBusy] = useState(false)
   const [error, setError] = useState('')
   const [recovery, setRecovery] = useState<Recovery | null>(null)
+  const [diagnosis, setDiagnosis] = useState<DiagnosisState>({ status: 'idle' })
+  const currentView = useRef<SavedView | null>(null)
+  const diagnosisController = useRef<AbortController | null>(null)
+  const diagnosisGeneration = useRef(0)
+  const diagnosisOwner = useRef<DiagnosisTarget | null>(null)
   const locked = useRef(Boolean(restoreId))
   const mounted = useRef(true)
   const accessCallback = useRef(onSessionAccess)
@@ -84,6 +121,7 @@ export default function Interview({ onSessionAccess, onNavigationBusyChange, onH
   const session = view?.session
   const blocked = operation !== null || transcribing || recovery !== null
   const navigationBlocked = blocked || audioBusy
+  const feedback = diagnosis.status !== 'idle' && ownsDiagnosis(view, diagnosis.target) ? diagnosis : null
 
   useLayoutEffect(() => {
     onNavigationBusyChange?.(navigationBlocked)
@@ -91,14 +129,14 @@ export default function Interview({ onSessionAccess, onNavigationBusyChange, onH
 
   useEffect(() => {
     mounted.current = true
-    return () => { mounted.current = false }
+    return () => { mounted.current = false; invalidateDiagnosis() }
   }, [])
   useEffect(() => {
     if (!restoreId) return
     let active = true
     void readSavedView(restoreId).then((saved) => {
       if (active) {
-        setView(saved)
+        showView(saved)
         accessCallback.current?.(saved.session.id)
       }
     }).catch((cause: unknown) => {
@@ -116,18 +154,55 @@ export default function Interview({ onSessionAccess, onNavigationBusyChange, onH
     return () => { active = false }
   }, [restoreId])
 
+  function invalidateDiagnosis() {
+    diagnosisGeneration.current += 1
+    const pending = diagnosisController.current
+    diagnosisController.current = null
+    diagnosisOwner.current = null
+    pending?.abort()
+    if (mounted.current) setDiagnosis({ status: 'idle' })
+  }
+  function showView(saved: SavedView) {
+    currentView.current = saved
+    if (diagnosisOwner.current && !ownsDiagnosis(saved, diagnosisOwner.current)) invalidateDiagnosis()
+    setView(saved)
+  }
+  function requestDiagnosis(target: DiagnosisTarget) {
+    if (!mounted.current || !ownsDiagnosis(currentView.current, target)) return
+    invalidateDiagnosis()
+    const pending = new AbortController()
+    const generation = diagnosisGeneration.current
+    diagnosisController.current = pending
+    diagnosisOwner.current = target
+    setDiagnosis({ status: 'loading', target })
+    const current = () => mounted.current && !pending.signal.aborted &&
+      diagnosisGeneration.current === generation && diagnosisOwner.current === target &&
+      ownsDiagnosis(currentView.current, target)
+    void getSemanticDiagnosis(target.sessionId, target.questionIndex, target.attemptNumber, pending.signal)
+      .then((result) => {
+        if (current()) setDiagnosis({ status: 'success', target, diagnosis: result })
+      }).catch((cause: unknown) => {
+        if (!current() || (cause instanceof DOMException && cause.name === 'AbortError')) return
+        setDiagnosis({ status: 'error', target, message: cause instanceof SemanticDiagnosisError
+          ? cause.message : 'Unable to load feedback right now. You can still retry or continue.' })
+      }).finally(() => {
+        if (current() && diagnosisController.current === pending) diagnosisController.current = null
+      })
+  }
+
   function clearDraft() {
     setDraft({ text: '', measurementId: null })
     setDraftGeneration((current) => current + 1)
     setTranscribing(false)
   }
   function install(saved: SavedView) {
-    setView(saved)
+    showView(saved)
     rememberSession(saved.session.id)
     clearDraft()
   }
   async function start() {
     if (locked.current || transcribing) return
+    invalidateDiagnosis()
     locked.current = true
     setOperation('Starting…')
     setError('')
@@ -145,6 +220,7 @@ export default function Interview({ onSessionAccess, onNavigationBusyChange, onH
     }
   }
   async function reconcileConflict(context: Recovery) {
+    invalidateDiagnosis()
     clearDraft()
     try {
       const saved = await readSavedView(context.sessionId)
@@ -163,16 +239,21 @@ export default function Interview({ onSessionAccess, onNavigationBusyChange, onH
     if (!view || locked.current || blocked || session?.status !== 'active') return
     if (kind === 'submit' && (view.mode !== 'composing' || !draft.text.trim())) return
     if (kind === 'continue' && (view.mode !== 'review' || !view.attempts.length)) return
+    invalidateDiagnosis()
     const context = recoveryFor(view, kind)
     locked.current = true
     setOperation(kind === 'submit' ? 'Submitting…' : 'Continuing…')
     setError('')
     let acknowledged = false
+    let submittedTarget: DiagnosisTarget | null = null
+    let diagnosisAfterSubmit: DiagnosisTarget | null = null
     try {
       if (kind === 'submit') {
         const result = await submitAttempt(view.session, draft.text.trim(), draft.measurementId)
         acknowledged = true
         if (!mounted.current) return
+        submittedTarget = { sessionId: result.session.id, questionIndex: result.attempt.question_index,
+          attemptNumber: result.attempt.attempt_number, attemptId: result.attempt.id }
         install({ session: result.session, attempts: [...view.attempts, result.attempt], comparison: null, mode: 'review' })
         factsCallback.current?.()
       } else {
@@ -183,7 +264,11 @@ export default function Interview({ onSessionAccess, onNavigationBusyChange, onH
         factsCallback.current?.()
       }
       const saved = await readSavedView(view.session.id)
-      if (mounted.current) { install(saved); setRecovery(null) }
+      if (mounted.current) {
+        install(saved)
+        setRecovery(null)
+        if (submittedTarget && ownsDiagnosis(saved, submittedTarget)) diagnosisAfterSubmit = submittedTarget
+      }
     } catch (cause) {
       if (!mounted.current) return
       if (!acknowledged && isConflictError(cause)) {
@@ -200,6 +285,8 @@ export default function Interview({ onSessionAccess, onNavigationBusyChange, onH
     } finally {
       if (mounted.current) { locked.current = false; setOperation(null) }
     }
+    // Feedback has its own lifecycle; its failures never classify a persisted write.
+    if (diagnosisAfterSubmit) requestDiagnosis(diagnosisAfterSubmit)
   }
   function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
@@ -207,18 +294,20 @@ export default function Interview({ onSessionAccess, onNavigationBusyChange, onH
   }
   function retry() {
     if (!view || locked.current || blocked) return
+    invalidateDiagnosis()
     clearDraft()
     setError('')
-    setView({ ...view, mode: 'composing' })
+    showView({ ...view, mode: 'composing' })
   }
   function cancelRetry() {
     if (!view || locked.current || blocked) return
     clearDraft()
     setError('')
-    setView({ ...view, mode: 'review' })
+    showView({ ...view, mode: 'review' })
   }
   async function recheck() {
     if (!recovery || locked.current) return
+    invalidateDiagnosis()
     locked.current = true
     setOperation('Rechecking saved state…')
     try {
@@ -227,7 +316,7 @@ export default function Interview({ onSessionAccess, onNavigationBusyChange, onH
       const unchangedDraft = (recovery.kind === 'submit' || recovery.kind === 'transcription') &&
         saved.session.status === 'active' && saved.session.current_question_index === recovery.questionIndex &&
         saved.session.current_question_latest_attempt_number === recovery.revision
-      if (unchangedDraft) setView({ ...saved, mode: 'composing' })
+      if (unchangedDraft) showView({ ...saved, mode: 'composing' })
       else install(saved)
       if (recovery.kind === 'restore') accessCallback.current?.(saved.session.id)
       // Recovery reads may reveal a committed write whose response was lost.
@@ -300,6 +389,29 @@ export default function Interview({ onSessionAccess, onNavigationBusyChange, onH
           {view.mode === 'review' && (
             <>
               {view.comparison && <Comparison comparison={view.comparison} />}
+              {feedback && <section aria-label="Answer feedback" aria-busy={feedback.status === 'loading'}>
+                <h3>Answer feedback</h3>
+                {feedback.status === 'loading' && <p role="status">Generating answer feedback…</p>}
+                {feedback.status === 'error' && <p role="alert">{feedback.message}</p>}
+                {feedback.status === 'success' && <>
+                  <dl><dt>Question addressed</dt><dd>{addressedLabels[feedback.diagnosis.addressed_question]}</dd></dl>
+                  <p>{feedback.diagnosis.addressed_question_reason}</p>
+                  {feedback.diagnosis.strengths.length > 0 && <>
+                    <h4>Strengths</h4>
+                    <ul>{feedback.diagnosis.strengths.map((item, index) => <li key={index}>{item}</li>)}</ul>
+                  </>}
+                  {feedback.diagnosis.missing_information.length > 0 && <>
+                    <h4>Missing information</h4>
+                    <ul>{feedback.diagnosis.missing_information.map((item, index) => <li key={index}>{item}</li>)}</ul>
+                  </>}
+                  <dl><dt>Structure</dt><dd>{structureLabels[feedback.diagnosis.structure]}</dd></dl>
+                  <p>{feedback.diagnosis.structure_feedback}</p>
+                  <dl><dt>Next focus</dt><dd>{focusLabels[feedback.diagnosis.next_focus]}</dd></dl>
+                  <p>{feedback.diagnosis.next_focus_reason}</p>
+                  <h4>Retry instruction</h4>
+                  <p>{feedback.diagnosis.retry_instruction}</p>
+                </>}
+              </section>}
               <div className="attempt-actions">
                 <button type="button" onClick={retry} disabled={blocked}>{view.attempts.length > 1 ? 'Retry Again' : 'Retry'}</button>
                 <button type="button" onClick={() => void mutate('continue')} disabled={blocked || view.attempts.length === 0}>Continue</button>

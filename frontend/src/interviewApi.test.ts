@@ -1,6 +1,6 @@
 import { afterEach, expect, test, vi } from 'vitest'
-import { ApiError, continueQuestion, getAttempts, getComparison, getSession, isConflictError, startInterview, submitAttempt, transcribeAudio, uploadAudio } from './interviewApi'
-import type { Attempt, DeliveryComparison, DeliveryMetricChange, InterviewSession, MetricChange } from './interviewApi'
+import { ApiError, continueQuestion, getAttempts, getComparison, getSemanticDiagnosis, getSession, isConflictError, SemanticDiagnosisError, startInterview, submitAttempt, transcribeAudio, uploadAudio } from './interviewApi'
+import type { Attempt, DeliveryComparison, DeliveryMetricChange, InterviewSession, MetricChange, SemanticDiagnosis } from './interviewApi'
 import { DELIVERY_TIMING_REASONS } from './deliveryMetrics'
 import type { DeliveryMetrics } from './deliveryMetrics'
 
@@ -290,4 +290,210 @@ test.each([
   const error = await getComparison(session).catch((cause: unknown) => cause)
   expect(error).toMatchObject({ name: 'ApiError', ambiguousWrite: false })
   expect((error as Error).message).not.toContain('private-value')
+})
+
+const diagnosis: SemanticDiagnosis = {
+  addressed_question: 'partially', addressed_question_reason: 'The answer covers the actions but not the result.',
+  strengths: ['The actions are concrete.'], missing_information: ['Explain the result.'],
+  structure: 'mixed', structure_feedback: 'State the result after the actions.', next_focus: 'completeness',
+  next_focus_reason: 'The result completes the account.', retry_instruction: 'Keep the actions and add the result.',
+}
+const privateDiagnosisMarker = 'PRIVATE_DIAGNOSIS_DETAIL_API_KEY_TRACEBACK'
+const malformedDiagnosisMessage = 'Unable to generate feedback right now. You can still retry or continue.'
+function diagnose(signal = new AbortController().signal) {
+  return getSemanticDiagnosis(session.id, 2, 4, signal)
+}
+
+test('requests exactly one bodyless semantic diagnosis POST for the specified persisted attempt', async () => {
+  const fetchMock = mockResponse(json(diagnosis))
+  const result = await diagnose()
+  expect(result).toEqual(diagnosis)
+  expect(Object.keys(result).sort()).toEqual(Object.keys(diagnosis).sort())
+  expect(fetchMock).toHaveBeenCalledTimes(1)
+  expect(fetchMock.mock.calls[0][0]).toBe('/api/sessions/session-1/questions/2/attempts/4/diagnosis')
+  const options = fetchMock.mock.calls[0][1] as RequestInit
+  expect(options.method).toBe('POST')
+  expect(Object.keys(options).sort()).toEqual(['method', 'signal'])
+  expect(options.body).toBeUndefined()
+  expect(options.headers).toBeUndefined()
+  expect(JSON.stringify(options)).not.toContain(session.current_question)
+  expect(JSON.stringify(options)).not.toContain(attempt.answer)
+})
+
+test('accepts empty semantic lists without inventing strengths or missing information', async () => {
+  const result = { ...diagnosis, strengths: [], missing_information: [] }
+  mockResponse(json(result))
+  expect(await diagnose()).toEqual(result)
+})
+
+test.each(['yes', 'partially', 'no'] as const)('accepts the addressed-question literal %s unchanged', async (value) => {
+  const result = { ...diagnosis, addressed_question: value }
+  mockResponse(json(result))
+  expect(await diagnose()).toEqual(result)
+})
+
+test.each(['clear', 'mixed', 'unclear', 'insufficient_content'] as const)('accepts the structure literal %s unchanged', async (value) => {
+  const result = { ...diagnosis, structure: value }
+  mockResponse(json(result))
+  expect(await diagnose()).toEqual(result)
+})
+
+test.each(['answer_the_question', 'specificity', 'supporting_detail', 'structure', 'completeness', 'conciseness', 'maintain_strengths'] as const)(
+  'accepts the next-focus literal %s unchanged', async (value) => {
+    const result = { ...diagnosis, next_focus: value }
+    mockResponse(json(result))
+    expect(await diagnose()).toEqual(result)
+  },
+)
+
+test.each(Object.keys(diagnosis))('rejects a missing semantic diagnosis field %s without exposing payload content', async (field) => {
+  const result: Record<string, unknown> = { ...diagnosis, addressed_question_reason: privateDiagnosisMarker }
+  delete result[field]
+  const fetchMock = mockResponse(json(result))
+  const error = await diagnose().catch((cause: unknown) => cause)
+  expect(error).toBeInstanceOf(SemanticDiagnosisError)
+  expect(error).toMatchObject({ status: 200, message: malformedDiagnosisMessage })
+  expect((error as Error).message).not.toContain(privateDiagnosisMarker)
+  expect(error).not.toHaveProperty('ambiguousWrite')
+  expect(fetchMock).toHaveBeenCalledTimes(1)
+})
+
+test.each([
+  null, [], 'semantic text', {},
+  { ...diagnosis, provider: privateDiagnosisMarker },
+  { ...diagnosis, addressed_question: true }, { ...diagnosis, addressed_question: 'sometimes' },
+  { ...diagnosis, structure: 'excellent' }, { ...diagnosis, structure: 1 },
+  { ...diagnosis, next_focus: 'confidence' }, { ...diagnosis, next_focus: null },
+  { ...diagnosis, strengths: 'Strong answer' }, { ...diagnosis, strengths: [1] },
+  { ...diagnosis, strengths: [null] }, { ...diagnosis, strengths: [' '] },
+  { ...diagnosis, missing_information: null }, { ...diagnosis, missing_information: [false] },
+  { ...diagnosis, missing_information: [{}] }, { ...diagnosis, missing_information: [''] },
+  { ...diagnosis, addressed_question_reason: 1 }, { ...diagnosis, addressed_question_reason: '' },
+  { ...diagnosis, structure_feedback: null }, { ...diagnosis, structure_feedback: ' ' },
+  { ...diagnosis, next_focus_reason: [] }, { ...diagnosis, next_focus_reason: '' },
+  { ...diagnosis, retry_instruction: {} }, { ...diagnosis, retry_instruction: ' ' },
+])('rejects malformed semantic diagnosis types/enums without coercion (case %#)', async (result) => {
+  const fetchMock = mockResponse(json(result))
+  const error = await diagnose().catch((cause: unknown) => cause)
+  expect(error).toBeInstanceOf(SemanticDiagnosisError)
+  expect(error).toMatchObject({ status: 200, message: malformedDiagnosisMessage })
+  expect((error as Error).message).not.toContain(privateDiagnosisMarker)
+  expect(error).not.toHaveProperty('ambiguousWrite')
+  expect(fetchMock).toHaveBeenCalledTimes(1)
+})
+
+test('a malformed JSON diagnosis response gets a fixed error without raw text or replay', async () => {
+  const fetchMock = mockResponse(new Response(privateDiagnosisMarker))
+  const error = await diagnose().catch((cause: unknown) => cause)
+  expect(error).toMatchObject({ name: 'SemanticDiagnosisError', status: 200, message: malformedDiagnosisMessage })
+  expect((error as Error).message).not.toContain(privateDiagnosisMarker)
+  expect(fetchMock).toHaveBeenCalledTimes(1)
+})
+
+test.each([
+  [404, 'Feedback is no longer available for this attempt.'],
+  [502, malformedDiagnosisMessage],
+  [503, 'Feedback is unavailable right now. You can still retry or continue.'],
+  [504, 'Feedback took too long. You can still retry or continue.'],
+  [422, malformedDiagnosisMessage], [500, malformedDiagnosisMessage],
+] as const)('semantic HTTP %s uses fixed feedback text without reading the private body', async (status, message) => {
+  const response = json({ detail: privateDiagnosisMarker }, status)
+  const jsonSpy = vi.spyOn(response, 'json')
+  const fetchMock = mockResponse(response)
+  const error = await diagnose().catch((cause: unknown) => cause)
+  expect(error).toBeInstanceOf(SemanticDiagnosisError)
+  expect(error).toMatchObject({ status, message })
+  expect((error as Error).message).not.toContain(privateDiagnosisMarker)
+  expect(error).not.toHaveProperty('ambiguousWrite')
+  expect(jsonSpy).not.toHaveBeenCalled()
+  expect(fetchMock).toHaveBeenCalledTimes(1)
+})
+
+test('semantic network failure discards private exception text without retrying or marking an uncertain write', async () => {
+  const fetchMock = vi.fn().mockRejectedValue(new Error(privateDiagnosisMarker))
+  vi.stubGlobal('fetch', fetchMock)
+  const error = await diagnose().catch((cause: unknown) => cause)
+  expect(error).toMatchObject({ name: 'SemanticDiagnosisError', status: null,
+    message: 'Unable to load feedback right now. You can still retry or continue.' })
+  expect((error as Error).message).not.toContain(privateDiagnosisMarker)
+  expect(error).not.toHaveProperty('ambiguousWrite')
+  expect(fetchMock).toHaveBeenCalledTimes(1)
+})
+
+test('semantic diagnosis honors a pre-aborted caller without any fetch or generic error', async () => {
+  const controller = new AbortController()
+  controller.abort(new Error(privateDiagnosisMarker))
+  const fetchMock = vi.fn()
+  vi.stubGlobal('fetch', fetchMock)
+  const error = await diagnose(controller.signal).catch((cause: unknown) => cause)
+  expect(error).toMatchObject({ name: 'AbortError', message: 'Feedback request cancelled.' })
+  expect(error).not.toBeInstanceOf(SemanticDiagnosisError)
+  expect((error as Error).message).not.toContain(privateDiagnosisMarker)
+  expect(fetchMock).not.toHaveBeenCalled()
+})
+
+test('caller cancellation reaches the semantic fetch signal and remains an AbortError', async () => {
+  const controller = new AbortController()
+  let fetchSignal: AbortSignal | undefined
+  const fetchMock = vi.fn((_url: string, options: RequestInit) => new Promise<Response>((_resolve, reject) => {
+    fetchSignal = options.signal as AbortSignal
+    fetchSignal.addEventListener('abort', () => reject(fetchSignal?.reason), { once: true })
+  }))
+  vi.stubGlobal('fetch', fetchMock)
+  const pending = diagnose(controller.signal).catch((cause: unknown) => cause)
+  expect(fetchSignal?.aborted).toBe(false)
+  controller.abort(new Error(privateDiagnosisMarker))
+  const error = await pending
+  expect(fetchSignal?.aborted).toBe(true)
+  expect(error).toMatchObject({ name: 'AbortError', message: 'Feedback request cancelled.' })
+  expect(error).not.toBeInstanceOf(SemanticDiagnosisError)
+  expect((error as Error).message).not.toContain(privateDiagnosisMarker)
+  expect(fetchMock).toHaveBeenCalledTimes(1)
+})
+
+test('cancellation rejects a late semantic response even when a fetch mock ignores abort', async () => {
+  const controller = new AbortController()
+  let resolve!: (value: Response) => void
+  const fetchMock = vi.fn(() => new Promise<Response>((done) => { resolve = done }))
+  vi.stubGlobal('fetch', fetchMock)
+  const pending = diagnose(controller.signal).catch((cause: unknown) => cause)
+  controller.abort(new Error(privateDiagnosisMarker))
+  resolve(json(diagnosis))
+  expect(await pending).toMatchObject({ name: 'AbortError', message: 'Feedback request cancelled.' })
+  expect(fetchMock).toHaveBeenCalledTimes(1)
+})
+
+test('cancellation while reading semantic JSON remains an AbortError rather than malformed feedback', async () => {
+  const controller = new AbortController()
+  let reject!: (cause: unknown) => void
+  const response = json(diagnosis)
+  const jsonSpy = vi.spyOn(response, 'json').mockImplementation(() => new Promise((_resolve, fail) => { reject = fail }))
+  mockResponse(response)
+  const pending = diagnose(controller.signal).catch((cause: unknown) => cause)
+  await vi.waitFor(() => expect(jsonSpy).toHaveBeenCalledTimes(1))
+  controller.abort(new Error(privateDiagnosisMarker))
+  reject(new Error(privateDiagnosisMarker))
+  expect(await pending).toMatchObject({ name: 'AbortError', message: 'Feedback request cancelled.' })
+})
+
+test('semantic timeout combines with caller cancellation and reports a fixed timeout without replay', async () => {
+  const timeout = new AbortController()
+  const timeoutSpy = vi.spyOn(AbortSignal, 'timeout').mockReturnValue(timeout.signal)
+  const controller = new AbortController()
+  let fetchSignal: AbortSignal | undefined
+  const fetchMock = vi.fn((_url: string, options: RequestInit) => new Promise<Response>((_resolve, reject) => {
+    fetchSignal = options.signal as AbortSignal
+    fetchSignal.addEventListener('abort', () => reject(fetchSignal?.reason), { once: true })
+  }))
+  vi.stubGlobal('fetch', fetchMock)
+  const pending = diagnose(controller.signal).catch((cause: unknown) => cause)
+  timeout.abort(new DOMException(privateDiagnosisMarker, 'TimeoutError'))
+  const error = await pending
+  expect(timeoutSpy).toHaveBeenCalledWith(75000)
+  expect(fetchSignal?.aborted).toBe(true)
+  expect(controller.signal.aborted).toBe(false)
+  expect(error).toMatchObject({ name: 'SemanticDiagnosisError', status: null,
+    message: 'Feedback took too long. You can still retry or continue.' })
+  expect((error as Error).message).not.toContain(privateDiagnosisMarker)
+  expect(fetchMock).toHaveBeenCalledTimes(1)
 })
