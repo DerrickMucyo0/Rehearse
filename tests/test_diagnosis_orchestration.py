@@ -25,7 +25,7 @@ from app.database_models import (
 )
 from app.delivery_metrics import DeliveryMetrics
 from app.diagnosis import DiagnosisContext
-from app.diagnosis_orchestration import DiagnosisContextReader, diagnose_persisted_attempt
+from app.diagnosis_orchestration import DiagnosisContextReader, diagnose_context, diagnose_persisted_attempt
 from app.semantic_diagnosis import SemanticDiagnosis
 from app.semantic_diagnosis_adapter import (
     SemanticDiagnosisAdapter, SemanticDiagnosisAdapterContractError, request_semantic_diagnosis,
@@ -200,6 +200,88 @@ def test_orchestration_public_signature_is_async_and_provider_neutral():
     }
 
 
+def test_context_orchestration_signature_is_async_and_requires_only_adapter_and_context():
+    assert inspect.iscoroutinefunction(diagnose_context)
+    signature = inspect.signature(diagnose_context)
+    assert tuple(signature.parameters) == ("adapter", "context")
+    assert all(
+        parameter.kind is inspect.Parameter.POSITIONAL_OR_KEYWORD
+        and parameter.default is inspect.Parameter.empty
+        for parameter in signature.parameters.values()
+    )
+    assert get_type_hints(diagnose_context) == {
+        "adapter": SemanticDiagnosisAdapter, "context": DiagnosisContext,
+        "return": tuple[DiagnosisContext, SemanticDiagnosis],
+    }
+
+
+def test_context_orchestration_preserves_exact_models_and_calls_existing_boundary_once(monkeypatch):
+    supplied, expected = context(), diagnosis()
+    events, boundary_calls = [], []
+    adapter = RecordingAdapter(expected, events)
+
+    async def observed_boundary(supplied_adapter, supplied_context):
+        boundary_calls.append((supplied_adapter, supplied_context))
+        events.append("boundary_begin")
+        result = await request_semantic_diagnosis(supplied_adapter, supplied_context)
+        events.append("boundary_end")
+        return result
+
+    def forbidden_read(*args, **kwargs):
+        pytest.fail("Context-only orchestration must not access a persisted reader.")
+
+    monkeypatch.setattr(orchestration, "request_semantic_diagnosis", observed_boundary)
+    monkeypatch.setattr(DiagnosisContextReader, "get_diagnosis_context", forbidden_read)
+    monkeypatch.setattr(InterviewSessionService, "get_diagnosis_context", forbidden_read)
+    result = asyncio.run(diagnose_context(adapter, supplied))
+
+    assert type(result) is tuple and len(result) == 2
+    assert result[0] is supplied and result[1] is expected
+    assert len(boundary_calls) == len(adapter.calls) == 1
+    assert boundary_calls[0][0] is adapter and boundary_calls[0][1] is supplied
+    assert adapter.calls[0] is supplied
+    assert events == ["boundary_begin", "adapter_begin", "adapter_end", "boundary_end"]
+
+
+@pytest.mark.parametrize("error_type", (
+    RuntimeError, ValueError, SentinelFailure, asyncio.CancelledError, SentinelBaseFailure,
+    SemanticDiagnosisAdapterContractError,
+))
+def test_context_adapter_exception_propagates_exact_object_without_retry_or_fallback(error_type):
+    supplied = context()
+    original_error = error_type("Synthetic context adapter failure.")
+    adapter = RecordingAdapter(original_error)
+
+    with pytest.raises(error_type) as error:
+        asyncio.run(diagnose_context(adapter, supplied))
+
+    assert error.value is original_error
+    assert len(adapter.calls) == 1 and adapter.calls[0] is supplied
+    assert adapter.events == ["adapter_begin"]
+
+
+def test_persisted_orchestration_reads_once_then_delegates_exact_context_once(monkeypatch):
+    supplied, expected = context(), diagnosis()
+    reader, adapter = RecordingReader(supplied), UntouchedAdapter()
+    expected_result = (supplied, expected)
+    context_calls = []
+
+    async def observed_context(supplied_adapter, supplied_context):
+        assert reader.active is False
+        assert reader.events == ["reader_begin", "reader_end"]
+        context_calls.append((supplied_adapter, supplied_context))
+        return expected_result
+
+    monkeypatch.setattr(orchestration, "diagnose_context", observed_context)
+    result = run(reader, adapter)
+
+    assert result is expected_result
+    assert_reader_called_once(reader)
+    assert len(context_calls) == 1
+    assert context_calls[0][0] is adapter and context_calls[0][1] is supplied
+    assert adapter.accesses == 0
+
+
 def test_reader_arguments_are_forwarded_once_without_normalization_or_replacement():
     class ForwardedInt(int):
         def __int__(self):
@@ -344,7 +426,8 @@ def test_orchestration_uses_no_offline_eval_or_objective_calculators():
     assert len(adapter.calls) == 1 and adapter.calls[0] is supplied
 
 
-def test_context_and_diagnosis_are_never_inspected_serialized_copied_or_reconstructed(monkeypatch):
+@pytest.mark.parametrize("context_only", (False, True), ids=("persisted-attempt", "context-only"))
+def test_context_and_diagnosis_are_never_inspected_serialized_copied_or_reconstructed(monkeypatch, context_only):
     supplied, expected = context(), diagnosis()
     before = supplied.model_dump(), expected.model_dump()
     reader, adapter = RecordingReader(supplied), RecordingAdapter(expected)
@@ -370,12 +453,15 @@ def test_context_and_diagnosis_are_never_inspected_serialized_copied_or_reconstr
                 "model_construct", "model_copy", "model_dump", "model_dump_json",
             ):
                 guarded.setattr(model, name, forbidden)
-        result = run(reader, adapter)
+        result = asyncio.run(diagnose_context(adapter, supplied)) if context_only else run(reader, adapter)
 
     assert accesses == []
     assert result[0] is supplied and result[1] is expected
     assert (supplied.model_dump(), expected.model_dump()) == before
-    assert_reader_called_once(reader)
+    if context_only:
+        assert reader.calls == []
+    else:
+        assert_reader_called_once(reader)
     assert len(adapter.calls) == 1 and adapter.calls[0] is supplied
 
 
@@ -411,7 +497,8 @@ def complete_without_suspension(coroutine):
         raise AssertionError("The fake reader and adapter must complete without suspension.")
 
 
-def test_fake_orchestration_has_no_external_side_effects(monkeypatch, capsys, caplog):
+@pytest.mark.parametrize("context_only", (False, True), ids=("persisted-attempt", "context-only"))
+def test_fake_orchestration_has_no_external_side_effects(monkeypatch, capsys, caplog, context_only):
     import builtins
     from collections.abc import Mapping
     import datetime
@@ -489,15 +576,22 @@ def test_fake_orchestration_has_no_external_side_effects(monkeypatch, capsys, ca
             if owner is not None:
                 for name in names:
                     guarded.setattr(owner, name, forbidden)
+        if context_only:
+            guarded.setattr(DiagnosisContextReader, "get_diagnosis_context", forbidden)
+            guarded.setattr(InterviewSessionService, "get_diagnosis_context", forbidden)
         guarded.setattr(builtins, "__import__", forbidden)
-        result = complete_without_suspension(diagnose_persisted_attempt(
+        operation = diagnose_context(adapter, supplied) if context_only else diagnose_persisted_attempt(
             reader, adapter, session_id=SESSION_ID, question_index=0, attempt_number=1,
-        ))
+        )
+        result = complete_without_suspension(operation)
 
     # Restore all global clock/import/environment guards before pytest assertions.
     assert calls == []
     assert result[0] is supplied and result[1] is expected
-    assert_reader_called_once(reader)
+    if context_only:
+        assert reader.calls == []
+    else:
+        assert_reader_called_once(reader)
     assert len(adapter.calls) == 1 and adapter.calls[0] is supplied
     captured = capsys.readouterr()
     assert captured.out == captured.err == ""

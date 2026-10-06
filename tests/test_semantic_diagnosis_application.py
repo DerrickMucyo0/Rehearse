@@ -25,7 +25,11 @@ from sqlalchemy import orm
 from app import database, sessions
 from app import semantic_diagnosis_application as application
 from app.diagnosis import DiagnosisContext
-from app.diagnosis_orchestration import DiagnosisContextReader, diagnose_persisted_attempt
+from app.diagnosis_orchestration import (
+    DiagnosisContextReader,
+    diagnose_context,
+    diagnose_persisted_attempt,
+)
 from app.nvidia_semantic_diagnosis import (
     NVIDIANemotronSemanticDiagnosisClient,
     NVIDIASemanticDiagnosisFailed,
@@ -264,6 +268,110 @@ def test_session_not_found_propagates_exact_object_without_adapter_access():
     assert adapter.accesses == 0
 
 
+def test_context_only_async_signature_matches_context_orchestration():
+    function = application.diagnose_application_context
+    assert inspect.iscoroutinefunction(function)
+    signature = inspect.signature(function)
+    assert signature == inspect.signature(diagnose_context)
+    assert tuple(signature.parameters) == ("adapter", "context")
+    for parameter in signature.parameters.values():
+        assert parameter.kind is inspect.Parameter.POSITIONAL_OR_KEYWORD
+        assert parameter.default is inspect.Parameter.empty
+    assert get_type_hints(function) == {
+        "adapter": SemanticDiagnosisAdapter,
+        "context": DiagnosisContext,
+        "return": tuple[DiagnosisContext, SemanticDiagnosis],
+    }
+
+
+def test_context_only_success_delegates_once_preserving_exact_tuple_without_model_access(monkeypatch):
+    supplied, expected = context(), diagnosis()
+    expected_tuple = (supplied, expected)
+    adapter = object()
+    calls = []
+
+    async def observed(*args, **kwargs):
+        calls.append((args, kwargs))
+        return expected_tuple
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("The application must not access, copy, serialize, or validate models.")
+
+    monkeypatch.setattr(application, "diagnose_context", observed)
+    with monkeypatch.context() as guard:
+        for model in (DiagnosisContext, SemanticDiagnosis):
+            for name in (
+                "__getattribute__", "__copy__", "__deepcopy__", "model_copy",
+                "model_dump", "model_dump_json", "model_validate", "model_validate_json",
+            ):
+                guard.setattr(model, name, forbidden)
+        result = complete_without_suspension(application.diagnose_application_context(adapter, supplied))
+    assert len(calls) == 1
+    args, kwargs = calls[0]
+    assert len(args) == 2 and args[0] is adapter and args[1] is supplied
+    assert kwargs == {}
+    assert result is expected_tuple
+    assert result[0] is supplied and result[1] is expected
+
+
+def test_context_only_real_orchestration_calls_adapter_once_with_exact_objects():
+    supplied, expected = context(), diagnosis()
+    adapter = RecordingAdapter(expected)
+    result = asyncio.run(application.diagnose_application_context(adapter, supplied))
+    assert len(adapter.calls) == 1 and adapter.calls[0] is supplied
+    assert adapter.events == ["adapter_begin", "adapter_end"]
+    assert result[0] is supplied and result[1] is expected
+
+
+@pytest.mark.parametrize("original,neutral,message", KNOWN_FAILURES, ids=FAILURE_IDS)
+def test_context_only_known_failures_are_private_and_normalized_once(
+    original, neutral, message, monkeypatch, capsys, caplog,
+):
+    supplied = context()
+    adapter = RecordingAdapter(original)
+    orchestration_calls = []
+
+    async def observed(*args, **kwargs):
+        orchestration_calls.append((args, kwargs))
+        return await diagnose_context(*args, **kwargs)
+
+    monkeypatch.setattr(application, "diagnose_context", observed)
+    with pytest.raises(neutral) as caught:
+        asyncio.run(application.diagnose_application_context(adapter, supplied))
+    error = caught.value
+    assert type(error) is neutral
+    assert error.args == (message,)
+    assert str(error) == message
+    assert error.__cause__ is None
+    assert error.__context__ is None
+    assert error.__dict__ == {}
+    rendered = "".join(traceback.format_exception(error))
+    for public_text in (str(error), repr(error), rendered):
+        assert "synthetic private" not in public_text
+        assert "NVIDIA" not in public_text
+        assert original.args[0] not in public_text
+    assert len(orchestration_calls) == 1
+    args, kwargs = orchestration_calls[0]
+    assert len(args) == 2 and args[0] is adapter and args[1] is supplied
+    assert kwargs == {}
+    assert len(adapter.calls) == 1 and adapter.calls[0] is supplied
+    assert capsys.readouterr() == ("", "")
+    assert caplog.records == []
+
+
+@pytest.mark.parametrize("error_type", (
+    ValueError, RuntimeError, PrivateException, asyncio.CancelledError, PrivateBaseException,
+))
+def test_context_only_unknown_failures_and_cancellation_propagate_exactly_without_retry(error_type):
+    original = error_type("synthetic private unknown detail")
+    supplied = context()
+    adapter = RecordingAdapter(original)
+    with pytest.raises(error_type) as caught:
+        asyncio.run(application.diagnose_application_context(adapter, supplied))
+    assert caught.value is original
+    assert len(adapter.calls) == 1 and adapter.calls[0] is supplied
+
+
 @pytest.mark.parametrize("original,neutral,message", KNOWN_FAILURES, ids=FAILURE_IDS)
 def test_known_failures_are_private_and_normalized_once_through_real_orchestration(
     original, neutral, message, monkeypatch, capsys, caplog,
@@ -318,14 +426,18 @@ def test_unknown_failures_and_cancellation_propagate_exactly_without_retry(origi
 
 
 @pytest.mark.parametrize("failure", (None, *range(len(KNOWN_FAILURES))), ids=("success", *FAILURE_IDS))
+@pytest.mark.parametrize("entrypoint", ("attempt", "context"))
 def test_warmed_application_has_no_external_side_effects_or_output(
-    failure, monkeypatch, capsys, caplog,
+    failure, entrypoint, monkeypatch, capsys, caplog,
 ):
     supplied, expected = context(), diagnosis()
     adapter_result = expected if failure is None else KNOWN_FAILURES[failure][0]
     reader, adapter = RecordingReader(supplied), RecordingAdapter(adapter_result)
-    coroutine = application.diagnose_application_attempt(
-        reader, adapter, session_id=SESSION_ID, question_index=2, attempt_number=3,
+    coroutine = (
+        application.diagnose_application_attempt(
+            reader, adapter, session_id=SESSION_ID, question_index=2, attempt_number=3,
+        ) if entrypoint == "attempt"
+        else application.diagnose_application_context(adapter, supplied)
     )
     violations = []
 
@@ -402,7 +514,7 @@ def test_warmed_application_has_no_external_side_effects_or_output(
         _, neutral, message = KNOWN_FAILURES[failure]
         assert type(caught) is neutral and str(caught) == message
         assert caught.__cause__ is None and caught.__context__ is None
-    assert reader.calls == [(SESSION_ID, 2, 3)]
+    assert reader.calls == ([(SESSION_ID, 2, 3)] if entrypoint == "attempt" else [])
     assert len(adapter.calls) == 1 and adapter.calls[0] is supplied
     assert capsys.readouterr() == ("", "")
     assert caplog.records == []
@@ -414,7 +526,9 @@ def test_runtime_ast_has_only_neutral_exceptions_single_delegation_and_closed_fa
     allowed_imports = {
         "uuid": {"UUID"},
         "app.diagnosis": {"DiagnosisContext"},
-        "app.diagnosis_orchestration": {"DiagnosisContextReader", "diagnose_persisted_attempt"},
+        "app.diagnosis_orchestration": {
+            "DiagnosisContextReader", "diagnose_context", "diagnose_persisted_attempt",
+        },
         "app.nvidia_semantic_diagnosis": {
             "NVIDIASemanticDiagnosisUnavailable", "NVIDIASemanticDiagnosisTimeout",
             "NVIDIASemanticDiagnosisFailed",
@@ -435,7 +549,7 @@ def test_runtime_ast_has_only_neutral_exceptions_single_delegation_and_closed_fa
         assert {name.name for name in node.names} == allowed_imports[node.module]
         assert all(name.asname is None for name in node.names)
     declarations = statements[len(allowed_imports):]
-    assert len(declarations) == 4
+    assert len(declarations) == 5
     neutral_names = {
         "SemanticDiagnosisUnavailable", "SemanticDiagnosisTimeout", "SemanticDiagnosisFailed",
     }
@@ -446,11 +560,14 @@ def test_runtime_ast_has_only_neutral_exceptions_single_delegation_and_closed_fa
         assert ast.dump(node.bases[0]) == ast.dump(ast.Name(id="RuntimeError", ctx=ast.Load()))
         assert len(node.bases) == 1 and node.keywords == [] and node.decorator_list == []
         assert len(node.body) == 1 and isinstance(node.body[0], ast.Pass)
-    function = declarations[3]
-    assert isinstance(function, ast.AsyncFunctionDef)
-    assert function.name == "diagnose_application_attempt" and function.decorator_list == []
+    functions = declarations[3:]
+    assert all(isinstance(function, ast.AsyncFunctionDef) for function in functions)
+    assert [function.name for function in functions] == [
+        "diagnose_application_attempt", "diagnose_application_context",
+    ]
+    assert all(function.decorator_list == [] for function in functions)
     assert sum(isinstance(node, ast.ClassDef) for node in ast.walk(tree)) == 3
-    assert sum(isinstance(node, ast.AsyncFunctionDef) for node in ast.walk(tree)) == 1
+    assert sum(isinstance(node, ast.AsyncFunctionDef) for node in ast.walk(tree)) == 2
     assert not any(isinstance(node, ast.FunctionDef) for node in ast.walk(tree))
     forbidden_nodes = (
         ast.Import, ast.Attribute, ast.For, ast.AsyncFor, ast.While, ast.With, ast.AsyncWith,
@@ -458,56 +575,59 @@ def test_runtime_ast_has_only_neutral_exceptions_single_delegation_and_closed_fa
     )
     assert not any(isinstance(node, forbidden_nodes) for node in ast.walk(tree))
     assert not any(isinstance(node, ast.Constant) and type(node.value) is int for node in ast.walk(tree))
-    calls = [node for node in ast.walk(function) if isinstance(node, ast.Call)]
-    assert len(calls) == 4
-    assert all(isinstance(node.func, ast.Name) for node in calls)
-    assert {node.func.id for node in calls} == {"diagnose_persisted_attempt", *neutral_names}
-    orchestration_call = next(node for node in calls if node.func.id == "diagnose_persisted_attempt")
-    assert ast.dump(orchestration_call) == ast.dump(ast.Call(
-        func=ast.Name(id="diagnose_persisted_attempt", ctx=ast.Load()),
-        args=[ast.Name(id="reader", ctx=ast.Load()), ast.Name(id="adapter", ctx=ast.Load())],
-        keywords=[ast.keyword(arg=name, value=ast.Name(id=name, ctx=ast.Load())) for name in (
-            "session_id", "question_index", "attempt_number",
-        )],
-    ))
-    awaits = [node for node in ast.walk(function) if isinstance(node, ast.Await)]
-    assert len(awaits) == 1 and awaits[0].value is orchestration_call
-    tries = [node for node in ast.walk(function) if isinstance(node, ast.Try)]
-    assert len(tries) == 1
-    guarded = tries[0]
-    assert guarded.orelse == [] and guarded.finalbody == []
-    assert len(guarded.body) == 1 and isinstance(guarded.body[0], ast.Return)
-    assert guarded.body[0].value is awaits[0]
-    expected_handlers = (
-        ({"NVIDIASemanticDiagnosisUnavailable"}, "unavailable"),
-        ({"NVIDIASemanticDiagnosisTimeout"}, "timeout"),
-        ({"NVIDIASemanticDiagnosisFailed", "SemanticDiagnosisJSONContractError",
-          "SemanticDiagnosisAdapterContractError"}, "failed"),
-    )
-    assert len(guarded.handlers) == len(expected_handlers)
-    for handler, (names, category) in zip(guarded.handlers, expected_handlers):
-        assert handler.name is None
-        caught_types = handler.type.elts if isinstance(handler.type, ast.Tuple) else [handler.type]
-        assert all(isinstance(node, ast.Name) for node in caught_types)
-        assert {node.id for node in caught_types} == names
-        assert len(handler.body) == 1
-        assert ast.dump(handler.body[0]) == ast.dump(ast.Assign(
-            targets=[ast.Name(id="failure", ctx=ast.Store())], value=ast.Constant(value=category),
+    for function in functions:
+        persisted = function.name == "diagnose_application_attempt"
+        delegation = "diagnose_persisted_attempt" if persisted else "diagnose_context"
+        arguments = ("reader", "adapter") if persisted else ("adapter", "context")
+        keywords = ("session_id", "question_index", "attempt_number") if persisted else ()
+        calls = [node for node in ast.walk(function) if isinstance(node, ast.Call)]
+        assert len(calls) == 4
+        assert all(isinstance(node.func, ast.Name) for node in calls)
+        assert {node.func.id for node in calls} == {delegation, *neutral_names}
+        orchestration_call = next(node for node in calls if node.func.id == delegation)
+        assert ast.dump(orchestration_call) == ast.dump(ast.Call(
+            func=ast.Name(id=delegation, ctx=ast.Load()),
+            args=[ast.Name(id=name, ctx=ast.Load()) for name in arguments],
+            keywords=[ast.keyword(arg=name, value=ast.Name(id=name, ctx=ast.Load())) for name in keywords],
         ))
-    # Known types are caught without retaining the original; all public raises
-    # occur after the handler and contain only their fixed public messages.
-    messages = {
-        "SemanticDiagnosisUnavailable": "Semantic diagnosis is not configured.",
-        "SemanticDiagnosisTimeout": "Semantic diagnosis timed out.",
-        "SemanticDiagnosisFailed": "Unable to generate semantic diagnosis.",
-    }
-    raises = [node for node in ast.walk(function) if isinstance(node, ast.Raise)]
-    assert len(raises) == 3
-    for node in raises:
-        assert node.exc.func.id in messages
-        assert node.exc.keywords == []
-        assert len(node.exc.args) == 1 and node.exc.args[0].value == messages[node.exc.func.id]
-        assert isinstance(node.cause, ast.Constant) and node.cause.value is None
+        awaits = [node for node in ast.walk(function) if isinstance(node, ast.Await)]
+        assert len(awaits) == 1 and awaits[0].value is orchestration_call
+        tries = [node for node in ast.walk(function) if isinstance(node, ast.Try)]
+        assert len(tries) == 1
+        guarded = tries[0]
+        assert guarded.orelse == [] and guarded.finalbody == []
+        assert len(guarded.body) == 1 and isinstance(guarded.body[0], ast.Return)
+        assert guarded.body[0].value is awaits[0]
+        expected_handlers = (
+            ({"NVIDIASemanticDiagnosisUnavailable"}, "unavailable"),
+            ({"NVIDIASemanticDiagnosisTimeout"}, "timeout"),
+            ({"NVIDIASemanticDiagnosisFailed", "SemanticDiagnosisJSONContractError",
+              "SemanticDiagnosisAdapterContractError"}, "failed"),
+        )
+        assert len(guarded.handlers) == len(expected_handlers)
+        for handler, (names, category) in zip(guarded.handlers, expected_handlers):
+            assert handler.name is None
+            caught_types = handler.type.elts if isinstance(handler.type, ast.Tuple) else [handler.type]
+            assert all(isinstance(node, ast.Name) for node in caught_types)
+            assert {node.id for node in caught_types} == names
+            assert len(handler.body) == 1
+            assert ast.dump(handler.body[0]) == ast.dump(ast.Assign(
+                targets=[ast.Name(id="failure", ctx=ast.Store())], value=ast.Constant(value=category),
+            ))
+        # Known types are caught without retaining the original; all public raises
+        # occur after the handler and contain only their fixed public messages.
+        messages = {
+            "SemanticDiagnosisUnavailable": "Semantic diagnosis is not configured.",
+            "SemanticDiagnosisTimeout": "Semantic diagnosis timed out.",
+            "SemanticDiagnosisFailed": "Unable to generate semantic diagnosis.",
+        }
+        raises = [node for node in ast.walk(function) if isinstance(node, ast.Raise)]
+        assert len(raises) == 3
+        for node in raises:
+            assert node.exc.func.id in messages
+            assert node.exc.keywords == []
+            assert len(node.exc.args) == 1 and node.exc.args[0].value == messages[node.exc.func.id]
+            assert isinstance(node.cause, ast.Constant) and node.cause.value is None
     for forbidden in (
         "FastAPI", "APIRouter", "Depends", "HTTPException", "starlette", "SQLAlchemy",
         "database", "sessions", "os.environ", "httpx", "logging", "retry", "backoff", "sleep",

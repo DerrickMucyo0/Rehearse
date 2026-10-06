@@ -17,7 +17,7 @@ from app.semantic_diagnosis_application import (
     SemanticDiagnosisFailed,
     SemanticDiagnosisTimeout,
     SemanticDiagnosisUnavailable,
-    diagnose_application_attempt,
+    diagnose_application_context,
 )
 from app.semantic_diagnosis_composition import get_semantic_diagnosis_adapter
 from app.speaking_metrics import SpeakingMetrics, measure_transcription
@@ -120,15 +120,16 @@ async def diagnose_attempt(
     diagnoser: SemanticDiagnosisService,
 ) -> SemanticDiagnosis:
     try:
-        _, diagnosis = await diagnose_application_attempt(
-            sessions,
-            diagnoser,
-            session_id=session_id,
-            question_index=question_index,
-            attempt_number=attempt_number,
+        context = await run_in_threadpool(
+            sessions.get_diagnosis_context,
+            session_id,
+            question_index,
+            attempt_number,
         )
     except SessionNotFound as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+    try:
+        _, diagnosis = await diagnose_application_context(diagnoser, context)
     except SemanticDiagnosisUnavailable:
         raise HTTPException(status_code=503, detail="Semantic diagnosis is not configured.") from None
     except SemanticDiagnosisTimeout:

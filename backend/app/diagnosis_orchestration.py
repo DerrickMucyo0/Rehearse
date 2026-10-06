@@ -22,6 +22,14 @@ class DiagnosisContextReader(Protocol):
         ...
 
 
+async def diagnose_context(
+    adapter: SemanticDiagnosisAdapter,
+    context: DiagnosisContext,
+) -> tuple[DiagnosisContext, SemanticDiagnosis]:
+    diagnosis = await request_semantic_diagnosis(adapter, context)
+    return context, diagnosis
+
+
 async def diagnose_persisted_attempt(
     reader: DiagnosisContextReader,
     adapter: SemanticDiagnosisAdapter,
@@ -32,5 +40,4 @@ async def diagnose_persisted_attempt(
 ) -> tuple[DiagnosisContext, SemanticDiagnosis]:
     """Read once, then request once, returning the exact supplied objects."""
     context = reader.get_diagnosis_context(session_id, question_index, attempt_number)
-    diagnosis = await request_semantic_diagnosis(adapter, context)
-    return (context, diagnosis)
+    return await diagnose_context(adapter, context)
