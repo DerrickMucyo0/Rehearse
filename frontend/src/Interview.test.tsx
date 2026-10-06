@@ -2,11 +2,37 @@
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { afterEach, beforeEach, expect, test, vi } from 'vitest'
 import Interview from './Interview'
+import * as historyApi from './historyApi'
+import type { HistoryDetail } from './historyApi'
 import { personalizedDrillForFocus } from './personalizedDrills'
 import type { Attempt, AttemptComparison, DeliveryMetricChange, InterviewSession, MetricChange, SemanticDiagnosis } from './interviewApi'
 
 const storageKey = 'rehearse.session_id'
 const questions = ['Question one', 'Question two', 'Question three', 'Question four', 'Question five']
+const summarySessionId = '11111111-1111-4111-8111-111111111111'
+const nextSummarySessionId = '22222222-2222-4222-8222-222222222222'
+const readHistoryDetail = historyApi.getHistoryDetail
+const summaryAttemptId = (questionIndex: number, number: number) =>
+  `00000000-0000-4000-8000-${String((questionIndex + 1) * 100 + number).padStart(12, '0')}`
+
+function completedHistoryDetail(id = summarySessionId, counts = [1, 1, 1, 1, 1], numbers = counts): HistoryDetail {
+  const totalAttempts = counts.reduce((total, count) => total + count, 0)
+  return {
+    summary: { session_id: id, status: 'completed', created_at: '2026-10-04T11:00:00Z',
+      completed_at: '2026-10-04T12:00:01Z', current_question_number: null, total_questions: 5,
+      finalized_question_count: 5, questions_practiced_count: 5, total_attempt_count: totalAttempts,
+      total_retry_count: totalAttempts - 5, measured_final_answer_count: 0,
+      last_submitted_at: '2026-10-04T12:00:00Z', last_saved_activity_at: '2026-10-04T12:00:01Z',
+      finalized_points: counts.map((_, question_index) => ({ question_index,
+        attempt_id: summaryAttemptId(question_index, numbers[question_index]), attempt_number: numbers[question_index],
+        submitted_at: '2026-10-04T12:00:00Z', measurement: null })) },
+    questions: counts.map((attempt_count, question_index) => ({ question_index, question_text: questions[question_index],
+      finalized: true, attempt_count, latest_attempt_id: summaryAttemptId(question_index, numbers[question_index]),
+      latest_attempt_number: numbers[question_index], final_attempt_id: summaryAttemptId(question_index, numbers[question_index]),
+      final_attempt_number: numbers[question_index] })),
+    selected_question: null,
+  }
+}
 const diagnosis: SemanticDiagnosis = {
   diagnosis_version: 'semantic-diagnosis-v1',
   addressed_question: 'partially', addressed_question_reason: 'The example addresses part of the question.',
@@ -41,7 +67,8 @@ function mockSessionApi(initial = freshSession()) {
   let intercept: ((url: string, options?: RequestInit) => Promise<Response> | Response | undefined) | undefined
   function saved(questionIndex = session.current_question_index) { return attempts.get(questionIndex) ?? [] }
   function append(answer: string, measurementId: string | null = null, attemptNumber = session.current_question_latest_attempt_number + 1) {
-    const attempt: SavedAttempt = { id: `attempt-${session.current_question_index}-${attemptNumber}`,
+    const attempt: SavedAttempt = { id: session.id.startsWith('session-')
+      ? `attempt-${session.current_question_index}-${attemptNumber}` : summaryAttemptId(session.current_question_index, attemptNumber),
       question_index: session.current_question_index, attempt_number: attemptNumber, answer,
       submitted_at: '2026-10-04T12:00:00Z', measurement_id: measurementId }
     attempts.set(session.current_question_index, [...saved(), attempt])
@@ -107,6 +134,12 @@ function mockSessionApi(initial = freshSession()) {
       if (match[2] === 'comparison') return response(comparison(questionIndex))
     }
     if (url === `/api/sessions/${session.id}` && (!options?.method || options.method === 'GET')) return response(session)
+    if (url === `/api/sessions/${session.id}/history-detail` && (!options?.method || options.method === 'GET')) {
+      expect(session.status).toBe('completed')
+      const counts = questions.map((_, index) => Math.max(1, saved(index).length))
+      const numbers = questions.map((_, index) => saved(index).at(-1)?.attempt_number ?? 1)
+      return response(completedHistoryDetail(session.id, counts, numbers))
+    }
     throw new Error(`Unexpected mocked endpoint: ${url}`)
   })
   vi.stubGlobal('fetch', fetchMock)
@@ -121,6 +154,10 @@ function mockSessionApi(initial = freshSession()) {
 beforeEach(() => {
   sessionStorage.clear()
   vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new Error('Unmocked network is forbidden')))
+  // Existing Practice fixtures use opaque toy IDs. Keep that legacy exception at
+  // the History helper boundary; canonical summary tests use the real validator.
+  vi.spyOn(historyApi, 'getHistoryDetail').mockImplementation((id, options) => id.startsWith('session-')
+    ? Promise.resolve(completedHistoryDetail(id)) : readHistoryDetail(id, options))
 })
 afterEach(() => { cleanup(); sessionStorage.clear(); vi.unstubAllGlobals(); vi.restoreAllMocks() })
 async function start() {
@@ -1225,4 +1262,269 @@ test.each(['success', 'error'] as const)('late diagnosis %s is ignored after unm
   expectNoDrill()
   expect(api.posts('/diagnosis')).toHaveLength(1)
   expect(api.creations()).toBe(2)
+})
+
+function finalQuestionSession(): InterviewSession {
+  return { ...freshSession(summarySessionId), current_question_index: 4, current_question: questions[4],
+    answers: ['Saved one', 'Saved two', 'Saved three', 'Saved four'] }
+}
+
+function completedSummarySession(): InterviewSession {
+  return { ...freshSession(summarySessionId), status: 'completed', current_question_index: 5, current_question: null,
+    answers: ['Saved one', 'Saved two', 'Saved three', 'Saved four', 'Saved five'] }
+}
+
+function summaryFact(label: string) {
+  const summary = screen.getByRole('region', { name: 'Interview summary' })
+  return within(summary).getByText(label, { selector: 'dt', exact: true }).nextElementSibling?.textContent
+}
+
+async function restoreFinalReview(api: ReturnType<typeof mockSessionApi>) {
+  await restore(api)
+  await waitFor(() => expect((screen.getByRole('button', { name: 'Continue' }) as HTMLButtonElement).disabled).toBe(false))
+}
+
+test('an incomplete restored interview never requests or displays a completed summary', async () => {
+  const api = mockSessionApi(freshSession(summarySessionId))
+  await restore(api)
+  await screen.findByRole('textbox', { name: 'Your answer' })
+  expect(screen.queryByRole('region', { name: 'Interview summary' })).toBeNull()
+  expect(historyApi.getHistoryDetail).not.toHaveBeenCalled()
+  expect(api.gets('/history-detail')).toHaveLength(0)
+  expect(api.posts('/attempts')).toHaveLength(0)
+  expect(api.posts('/continue')).toHaveLength(0)
+})
+
+test('a newly submitted fifth answer remains provisional without any summary read until Continue', async () => {
+  const api = mockSessionApi(finalQuestionSession())
+  await restore(api)
+  await submit('Provisional final answer')
+  await screen.findByRole('region', { name: 'Answer feedback' })
+  expect(api.session().status).toBe('active')
+  expect(screen.queryByRole('heading', { name: 'Interview Complete' })).toBeNull()
+  expect(screen.queryByRole('region', { name: 'Interview summary' })).toBeNull()
+  expect(historyApi.getHistoryDetail).not.toHaveBeenCalled()
+  expect(api.gets('/history-detail')).toHaveLength(0)
+  expect(api.posts('/attempts')).toHaveLength(1)
+  expect(api.posts('/continue')).toHaveLength(0)
+})
+
+test.each([
+  { saved: 1, finalNumber: 1, retries: 0 },
+  { saved: 3, finalNumber: 12, retries: 2 },
+])('successful final Continue loads one persisted summary with $retries row-count retries', async ({ saved, finalNumber, retries }) => {
+  const api = mockSessionApi(finalQuestionSession())
+  for (let index = 0; index < saved; index += 1) {
+    api.append(`Saved final attempt ${index + 1}`, null, index === saved - 1 ? finalNumber : index + 1)
+  }
+  await restoreFinalReview(api)
+  expect(historyApi.getHistoryDetail).not.toHaveBeenCalled()
+  fireEvent.click(screen.getByRole('button', { name: 'Continue' }))
+  await screen.findByRole('heading', { name: 'Interview Complete' })
+  await waitFor(() => expect(summaryFact('Questions completed')).toBe('5 / 5'))
+  expect(summaryFact('Total attempts')).toBe(String(5 + retries))
+  expect(summaryFact('Total retries')).toBe(String(retries))
+  const summary = screen.getByRole('region', { name: 'Interview summary' })
+  expect(within(summary).getAllByRole('heading', { level: 4 }).map((heading) => heading.textContent))
+    .toEqual(['Question 1', 'Question 2', 'Question 3', 'Question 4', 'Question 5'])
+  const finalRow = within(summary).getByRole('article', { name: 'Summary for Question 5' })
+  expect(within(finalRow).getByText('Final attempt', { selector: 'dt' }).nextElementSibling?.textContent).toBe(String(finalNumber))
+  expect(within(finalRow).getByText('Retries', { selector: 'dt' }).nextElementSibling?.textContent).toBe(String(retries))
+  expect(within(summary).getAllByText('Speaking measurements: Unavailable — No measurement')).toHaveLength(5)
+  expect(historyApi.getHistoryDetail).toHaveBeenCalledTimes(1)
+  expect(api.gets('/history-detail')).toHaveLength(1)
+  const [url, options] = api.gets('/history-detail')[0]
+  expect(url).toBe(`/api/sessions/${summarySessionId}/history-detail`)
+  expect(options?.body).toBeUndefined()
+  expect(options?.cache).toBe('no-store')
+  expect(api.posts('/continue')).toHaveLength(1)
+  expect(postedBody(api, '/continue').expected_last_attempt_number).toBe(finalNumber)
+  expect(api.posts('/attempts')).toHaveLength(0)
+  expect(api.posts('/diagnosis')).toHaveLength(0)
+  expectNoDrill()
+  expect(summary.textContent).not.toContain('Saved final attempt')
+})
+
+test('restoring a completed interview loads one read-only summary and rerender does not refetch it', async () => {
+  const api = mockSessionApi(completedSummarySession())
+  sessionStorage.setItem(storageKey, summarySessionId)
+  const sessionWrites = vi.spyOn(Storage.prototype, 'setItem')
+  const view = render(<Interview />)
+  await screen.findByRole('heading', { name: 'Interview Complete' })
+  await waitFor(() => expect(summaryFact('Total attempts')).toBe('5'))
+  view.rerender(<Interview />)
+  expect(historyApi.getHistoryDetail).toHaveBeenCalledTimes(1)
+  expect(api.gets('/history-detail')).toHaveLength(1)
+  expect(api.gets('/attempts')).toHaveLength(0)
+  expect(api.gets('/comparison')).toHaveLength(0)
+  expect(api.fetchMock.mock.calls.filter(([, options]) => options?.method === 'POST')).toHaveLength(0)
+  for (const [key, value] of sessionWrites.mock.calls) {
+    expect(key).toBe(storageKey)
+    expect(value).toBe(summarySessionId)
+  }
+  expect(sessionStorage.getItem(storageKey)).toBe(summarySessionId)
+  expect(JSON.stringify(sessionStorage)).not.toContain('Questions completed')
+  expectNoDrill()
+})
+
+test.each([400, 503])('failed final Continue (%i) never starts a summary read', async (status) => {
+  const api = mockSessionApi(finalQuestionSession())
+  api.append('Saved final answer')
+  await restoreFinalReview(api)
+  api.intercept((url, options) => url.endsWith('/continue') && options?.method === 'POST'
+    ? response({ detail: 'PRIVATE_CONTINUE_ERROR' }, status) : undefined)
+  fireEvent.click(screen.getByRole('button', { name: 'Continue' }))
+  await screen.findByRole('alert')
+  expect(api.session().status).toBe('active')
+  expect(screen.queryByRole('heading', { name: 'Interview Complete' })).toBeNull()
+  expect(screen.queryByRole('region', { name: 'Interview summary' })).toBeNull()
+  expect(historyApi.getHistoryDetail).not.toHaveBeenCalled()
+  expect(api.gets('/history-detail')).toHaveLength(0)
+  expect(api.posts('/continue')).toHaveLength(1)
+  expect(api.posts('/attempts')).toHaveLength(0)
+})
+
+test('an acknowledged final Continue waits for coherent recovery before reading the summary', async () => {
+  const api = mockSessionApi(finalQuestionSession())
+  api.append('Saved final answer')
+  await restoreFinalReview(api)
+  let acknowledged = false
+  let failRead = true
+  api.intercept((url, options) => {
+    if (!acknowledged && url.endsWith('/continue') && options?.method === 'POST') {
+      acknowledged = true
+      return response(api.advance())
+    }
+    if (acknowledged && failRead && url === `/api/sessions/${summarySessionId}` && options?.method !== 'POST') {
+      failRead = false
+      return Promise.reject(new TypeError('Reconciliation read unavailable'))
+    }
+    return undefined
+  })
+  fireEvent.click(screen.getByRole('button', { name: 'Continue' }))
+  await screen.findByRole('button', { name: 'Recheck saved state' })
+  expect(screen.getByRole('heading', { name: 'Interview Complete' })).toBeTruthy()
+  expect(screen.queryByRole('region', { name: 'Interview summary' })).toBeNull()
+  expect(historyApi.getHistoryDetail).not.toHaveBeenCalled()
+  expect(api.gets('/history-detail')).toHaveLength(0)
+  fireEvent.click(screen.getByRole('button', { name: 'Recheck saved state' }))
+  await waitFor(() => expect(summaryFact('Questions completed')).toBe('5 / 5'))
+  expect(api.gets('/history-detail')).toHaveLength(1)
+  expect(api.posts('/continue')).toHaveLength(1)
+  expect(api.posts('/attempts')).toHaveLength(0)
+})
+
+test('a failed completed-session refresh performs no summary read until saved state is rechecked', async () => {
+  const api = mockSessionApi(completedSummarySession())
+  api.intercept((url) => url === `/api/sessions/${summarySessionId}`
+    ? Promise.reject(new TypeError('Restore read unavailable')) : undefined)
+  sessionStorage.setItem(storageKey, summarySessionId)
+  render(<Interview />)
+  await screen.findByRole('button', { name: 'Recheck saved state' })
+  expect(screen.queryByRole('region', { name: 'Interview summary' })).toBeNull()
+  expect(historyApi.getHistoryDetail).not.toHaveBeenCalled()
+  expect(api.gets('/history-detail')).toHaveLength(0)
+  api.intercept(undefined)
+  fireEvent.click(screen.getByRole('button', { name: 'Recheck saved state' }))
+  await waitFor(() => expect(summaryFact('Questions completed')).toBe('5 / 5'))
+  expect(api.gets('/history-detail')).toHaveLength(1)
+  expect(api.fetchMock.mock.calls.filter(([, options]) => options?.method === 'POST')).toHaveLength(0)
+})
+
+test('summary read failure preserves completion, never replays writes, and leaves restart available', async () => {
+  const api = mockSessionApi(finalQuestionSession())
+  api.append('Saved final answer')
+  await restoreFinalReview(api)
+  api.intercept((url) => url.endsWith('/history-detail')
+    ? response({ detail: 'PRIVATE_SUMMARY_BACKEND_BODY' }, 503) : undefined)
+  fireEvent.click(screen.getByRole('button', { name: 'Continue' }))
+  const summary = await screen.findByRole('region', { name: 'Interview summary' })
+  expect((await within(summary).findByRole('alert')).textContent).toBe('Interview summary is unavailable.')
+  expect(document.body.textContent).not.toContain('PRIVATE_SUMMARY_BACKEND_BODY')
+  expect(screen.getByRole('heading', { name: 'Interview Complete' })).toBeTruthy()
+  expect(screen.queryByRole('button', { name: 'Recheck saved state' })).toBeNull()
+  expect((screen.getByRole('button', { name: 'Start New Interview' }) as HTMLButtonElement).disabled).toBe(false)
+  expect(api.posts('/continue')).toHaveLength(1)
+  expect(api.posts('/attempts')).toHaveLength(0)
+  expect(api.posts('/diagnosis')).toHaveLength(0)
+  expect(api.gets('/history-detail')).toHaveLength(1)
+  expect(sessionStorage.getItem(storageKey)).toBe(summarySessionId)
+  fireEvent.click(screen.getByRole('button', { name: 'Start New Interview' }))
+  await screen.findByText('Question 1 of 5')
+  expect(screen.queryByRole('region', { name: 'Interview summary' })).toBeNull()
+  expect(screen.queryByText('Interview summary is unavailable.')).toBeNull()
+  expect(api.posts('/continue')).toHaveLength(1)
+})
+
+test.each(['success', 'error'] as const)('restart immediately aborts and ignores old summary %s while session creation is pending', async (settlement) => {
+  const api = mockSessionApi(completedSummarySession())
+  const pending = deferredResponse()
+  const creation = deferredResponse()
+  let summarySignal!: AbortSignal
+  api.intercept((url, options) => {
+    if (url.endsWith('/history-detail')) {
+      summarySignal = options!.signal as AbortSignal
+      // Deliberately settle after abort to exercise ownership as well as transport cancellation.
+      return pending.promise
+    }
+    if (url === '/api/sessions' && options?.method === 'POST') return creation.promise
+    return undefined
+  })
+  sessionStorage.setItem(storageKey, summarySessionId)
+  const view = render(<Interview />)
+  await screen.findByText('Loading interview summary…')
+  expect((screen.getByRole('button', { name: 'Start New Interview' }) as HTMLButtonElement).disabled).toBe(false)
+  view.rerender(<Interview />)
+  expect(api.gets('/history-detail')).toHaveLength(1)
+  fireEvent.click(screen.getByRole('button', { name: 'Start New Interview' }))
+  expect(summarySignal.aborted).toBe(true)
+  expect(screen.queryByRole('region', { name: 'Interview summary' })).toBeNull()
+  expect((screen.getByRole('button', { name: 'Start New Interview' }) as HTMLButtonElement).disabled).toBe(true)
+  const oldDetail = completedHistoryDetail()
+  oldDetail.questions[0].question_text = 'STALE_SUMMARY_SUCCESS'
+  await act(async () => {
+    if (settlement === 'success') pending.resolve(response(oldDetail))
+    else pending.reject(new TypeError('STALE_SUMMARY_FAILURE'))
+  })
+  expect(document.body.textContent).not.toContain('STALE_SUMMARY')
+  expect(screen.queryByText('Interview summary is unavailable.')).toBeNull()
+  expect((screen.getByRole('button', { name: 'Start New Interview' }) as HTMLButtonElement).disabled).toBe(true)
+  const next = freshSession(nextSummarySessionId)
+  api.setSession(next)
+  await act(async () => creation.resolve(response(next, 201)))
+  await screen.findByText('Question 1 of 5')
+  expect(sessionStorage.getItem(storageKey)).toBe(nextSummarySessionId)
+  expect(screen.queryByRole('region', { name: 'Interview summary' })).toBeNull()
+  expect(document.body.textContent).not.toContain('STALE_SUMMARY')
+  expect(api.gets('/history-detail')).toHaveLength(1)
+  expect(api.posts('/attempts')).toHaveLength(0)
+  expect(api.posts('/continue')).toHaveLength(0)
+})
+
+test.each(['success', 'error'] as const)('unmount aborts the summary and ignores its late %s in a fresh Practice mount', async (settlement) => {
+  const api = mockSessionApi(completedSummarySession())
+  const pending = deferredResponse()
+  let summarySignal!: AbortSignal
+  api.intercept((url, options) => {
+    if (!url.endsWith('/history-detail')) return undefined
+    summarySignal = options!.signal as AbortSignal
+    return pending.promise
+  })
+  sessionStorage.setItem(storageKey, summarySessionId)
+  const original = render(<Interview />)
+  await screen.findByText('Loading interview summary…')
+  original.unmount()
+  expect(summarySignal.aborted).toBe(true)
+  sessionStorage.clear()
+  render(<Interview />)
+  await screen.findByRole('button', { name: 'Start Interview' })
+  await act(async () => {
+    if (settlement === 'success') pending.resolve(response(completedHistoryDetail()))
+    else pending.reject(new TypeError('STALE_UNMOUNT_SUMMARY'))
+  })
+  expect(screen.queryByRole('region', { name: 'Interview summary' })).toBeNull()
+  expect(screen.queryByRole('alert')).toBeNull()
+  expect(document.body.textContent).not.toContain('STALE_UNMOUNT_SUMMARY')
+  expect(api.gets('/history-detail')).toHaveLength(1)
+  expect(api.fetchMock.mock.calls.filter(([, options]) => options?.method === 'POST')).toHaveLength(0)
 })
