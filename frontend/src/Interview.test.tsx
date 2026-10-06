@@ -7,6 +7,7 @@ import type { Attempt, AttemptComparison, DeliveryMetricChange, InterviewSession
 const storageKey = 'rehearse.session_id'
 const questions = ['Question one', 'Question two', 'Question three', 'Question four', 'Question five']
 const diagnosis: SemanticDiagnosis = {
+  diagnosis_version: 'semantic-diagnosis-v1',
   addressed_question: 'partially', addressed_question_reason: 'The example addresses part of the question.',
   strengths: ['The personal contribution is concrete.'], missing_information: ['Explain the result of the work.'],
   structure: 'mixed', structure_feedback: 'Connect the action to its result.', next_focus: 'supporting_detail',
@@ -740,6 +741,7 @@ test('diagnosis waits for coherent saved review, then renders semantic feedback 
     diagnosis.structure_feedback, diagnosis.next_focus_reason, diagnosis.retry_instruction]) {
     expect(within(feedback()).getByText(text, { exact: true })).toBeTruthy()
   }
+  expect(screen.queryByText(/diagnosis_version|semantic-diagnosis-v1/)).toBeNull()
   expect(within(feedback()).queryByText('Persisted answer', { exact: true })).toBeNull()
   expect(within(feedback()).queryByText(/Words per minute|Recognized words|Timed pauses/)).toBeNull()
   expect(api.posts('/attempts')).toHaveLength(1)

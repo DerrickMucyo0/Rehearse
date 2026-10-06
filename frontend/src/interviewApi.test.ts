@@ -3,6 +3,7 @@ import { ApiError, continueQuestion, getAttempts, getComparison, getSemanticDiag
 import type { Attempt, DeliveryComparison, DeliveryMetricChange, InterviewSession, MetricChange, SemanticDiagnosis } from './interviewApi'
 import { DELIVERY_TIMING_REASONS } from './deliveryMetrics'
 import type { DeliveryMetrics } from './deliveryMetrics'
+import semanticDiagnosisContract from './fixtures/semanticDiagnosis.v1.json?raw'
 
 const session: InterviewSession = {
   id: 'session-1', status: 'active', current_question_index: 2, current_question: 'Third',
@@ -293,6 +294,7 @@ test.each([
 })
 
 const diagnosis: SemanticDiagnosis = {
+  diagnosis_version: 'semantic-diagnosis-v1',
   addressed_question: 'partially', addressed_question_reason: 'The answer covers the actions but not the result.',
   strengths: ['The actions are concrete.'], missing_information: ['Explain the result.'],
   structure: 'mixed', structure_feedback: 'State the result after the actions.', next_focus: 'completeness',
@@ -308,6 +310,7 @@ test('requests exactly one bodyless semantic diagnosis POST for the specified pe
   const fetchMock = mockResponse(json(diagnosis))
   const result = await diagnose()
   expect(result).toEqual(diagnosis)
+  expect(result.diagnosis_version).toBe('semantic-diagnosis-v1')
   expect(Object.keys(result).sort()).toEqual(Object.keys(diagnosis).sort())
   expect(fetchMock).toHaveBeenCalledTimes(1)
   expect(fetchMock.mock.calls[0][0]).toBe('/api/sessions/session-1/questions/2/attempts/4/diagnosis')
@@ -319,6 +322,24 @@ test('requests exactly one bodyless semantic diagnosis POST for the specified pe
   expect(JSON.stringify(options)).not.toContain(session.current_question)
   expect(JSON.stringify(options)).not.toContain(attempt.answer)
 })
+
+test('accepts the shared backend SemanticDiagnosis contract fixture unchanged', async () => {
+  const fetchMock = mockResponse(new Response(semanticDiagnosisContract))
+  const result = await diagnose()
+  expect(result).toEqual(JSON.parse(semanticDiagnosisContract))
+  expect(result.diagnosis_version).toBe('semantic-diagnosis-v1')
+  expect(fetchMock).toHaveBeenCalledTimes(1)
+})
+
+test.each(['semantic-diagnosis-v2', 'SEMANTIC-DIAGNOSIS-V1', 'semantic-diagnosis-v1 ', '', null, false, 1, {}, []])(
+  'rejects an incorrect diagnosis version without coercion or replay (case %#)', async (version) => {
+    const fetchMock = mockResponse(json({ ...diagnosis, diagnosis_version: version }))
+    await expect(diagnose()).rejects.toMatchObject({
+      name: 'SemanticDiagnosisError', status: 200, message: malformedDiagnosisMessage,
+    })
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+  },
+)
 
 test('accepts empty semantic lists without inventing strengths or missing information', async () => {
   const result = { ...diagnosis, strengths: [], missing_information: [] }

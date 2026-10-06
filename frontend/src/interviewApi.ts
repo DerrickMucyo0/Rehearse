@@ -26,6 +26,7 @@ export interface AttemptSubmission {
 }
 
 export interface SemanticDiagnosis {
+  diagnosis_version: 'semantic-diagnosis-v1'
   addressed_question: 'yes' | 'partially' | 'no'
   addressed_question_reason: string
   strengths: string[]
@@ -206,11 +207,12 @@ export function continueQuestion(session: InterviewSession): Promise<InterviewSe
 }
 
 function validSemanticDiagnosis(value: unknown): value is SemanticDiagnosis {
-  const keys = ['addressed_question', 'addressed_question_reason', 'strengths', 'missing_information',
+  const keys = ['diagnosis_version', 'addressed_question', 'addressed_question_reason', 'strengths', 'missing_information',
     'structure', 'structure_feedback', 'next_focus', 'next_focus_reason', 'retry_instruction']
   const text = (field: unknown): field is string => typeof field === 'string' && field.trim().length > 0
   const list = (field: unknown): field is string[] => Array.isArray(field) && field.every(text)
   return object(value) && Object.keys(value).length === keys.length && keys.every((key) => Object.hasOwn(value, key)) &&
+    value.diagnosis_version === 'semantic-diagnosis-v1' &&
     ['yes', 'partially', 'no'].includes(value.addressed_question as string) &&
     text(value.addressed_question_reason) && list(value.strengths) && list(value.missing_information) &&
     ['clear', 'mixed', 'unclear', 'insufficient_content'].includes(value.structure as string) &&

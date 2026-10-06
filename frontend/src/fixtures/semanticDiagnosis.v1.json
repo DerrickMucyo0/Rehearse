@@ -1,0 +1,12 @@
+{
+  "diagnosis_version": "semantic-diagnosis-v1",
+  "addressed_question": "partially",
+  "addressed_question_reason": "The answer covers the actions but not the result.",
+  "strengths": ["The actions are concrete."],
+  "missing_information": ["Explain the result."],
+  "structure": "mixed",
+  "structure_feedback": "State the result after the actions.",
+  "next_focus": "completeness",
+  "next_focus_reason": "The result completes the account.",
+  "retry_instruction": "Keep the actions and add the result."
+}

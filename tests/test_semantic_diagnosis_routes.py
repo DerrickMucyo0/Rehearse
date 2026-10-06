@@ -3,6 +3,7 @@
 import ast
 import asyncio
 import inspect
+import json
 from pathlib import Path
 import socket
 from threading import get_ident
@@ -37,7 +38,10 @@ from app.semantic_diagnosis_application import (
     SemanticDiagnosisUnavailable,
 )
 from app.semantic_diagnosis_composition import get_semantic_diagnosis_adapter
-from app.semantic_diagnosis_json import SemanticDiagnosisJSONContractError
+from app.semantic_diagnosis_json import (
+    SemanticDiagnosisJSONContractError,
+    parse_semantic_diagnosis_json,
+)
 from app.sessions import AttemptRequest, InterviewSessionService, SessionNotFound
 
 
@@ -187,6 +191,32 @@ def url(session_id=SESSION_ID, question_index=2, attempt_number=3):
     return ROUTE_PATH.format(
         session_id=session_id, question_index=question_index, attempt_number=attempt_number,
     )
+
+
+def test_post_matches_shared_versioned_frontend_contract_fixture(setup, capsys, caplog):
+    client, reader, adapter, _, events, dependencies = setup
+    fixture_path = (
+        Path(__file__).resolve().parents[1]
+        / "frontend/src/fixtures/semanticDiagnosis.v1.json"
+    )
+    payload = fixture_path.read_text(encoding="utf-8")
+    fixture = json.loads(payload)
+    adapter.result = parse_semantic_diagnosis_json(payload)
+
+    response = client.post(url())
+
+    assert response.status_code == 200
+    assert response.json() == fixture
+    assert response.json()["diagnosis_version"] == "semantic-diagnosis-v1"
+    assert set(response.json()) == set(SemanticDiagnosis.model_fields)
+    assert reader.calls == [(SESSION_ID, 2, 3)]
+    assert len(adapter.calls) == 1 and adapter.calls[0] is reader.context
+    assert dependencies == ["sessions", "diagnoser"]
+    assert events == ["reader_begin", "reader_end", "adapter_begin", "adapter_end"]
+    assert reader.mutations == []
+    assert "PRIVATE-PERSISTED" not in response.text
+    assert "PRIVATE-PERSISTED" not in caplog.text
+    assert capsys.readouterr() == ("", "")
 
 
 @pytest.mark.parametrize("with_unused_input", (False, True), ids=("no-body", "unused-body-and-query"))

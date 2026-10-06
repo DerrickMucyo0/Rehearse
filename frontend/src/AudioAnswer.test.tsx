@@ -9,6 +9,7 @@ import { deliveryUnavailableText, TIMED_PAUSES_EXPLANATION, TIMED_PAUSES_LIMITAT
 
 const session: InterviewSession = { id: 'session-1', status: 'active', current_question_index: 0, current_question: 'Question', current_question_latest_attempt_number: 0, questions: ['Question'], answers: [] }
 const semanticDiagnosis: SemanticDiagnosis = {
+  diagnosis_version: 'semantic-diagnosis-v1',
   addressed_question: 'yes', addressed_question_reason: 'The answer addresses the immediate question.',
   strengths: [], missing_information: [], structure: 'clear', structure_feedback: 'The account is easy to follow.',
   next_focus: 'maintain_strengths', next_focus_reason: 'Keep the clear account.', retry_instruction: 'Keep the clear account.',

@@ -16,6 +16,7 @@ const metrics: SpeakingMetrics = { source: 'original_transcription', recognized_
 const deliveryMetrics = { version: 'pause-metrics-v1', source: 'original_transcription', pause_count: 2,
   total_pause_duration_seconds: 1.5, longest_pause_seconds: 0.8, unavailable_reason: null }
 const semanticDiagnosis: SemanticDiagnosis = {
+  diagnosis_version: 'semantic-diagnosis-v1',
   addressed_question: 'yes', addressed_question_reason: 'The answer addresses the immediate question.',
   strengths: ['The example is concrete.'], missing_information: [], structure: 'clear',
   structure_feedback: 'The actions and result are easy to follow.', next_focus: 'maintain_strengths',
