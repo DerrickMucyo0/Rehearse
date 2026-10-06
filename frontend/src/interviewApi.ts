@@ -221,6 +221,8 @@ function validSemanticDiagnosis(value: unknown): value is SemanticDiagnosis {
       .includes(value.next_focus as string) && text(value.next_focus_reason) && text(value.retry_instruction)
 }
 
+const SEMANTIC_DIAGNOSIS_TIMEOUT_MS = 135_000
+
 export async function getSemanticDiagnosis(
   sessionId: string,
   questionIndex: number,
@@ -229,7 +231,7 @@ export async function getSemanticDiagnosis(
 ): Promise<SemanticDiagnosis> {
   const timeoutMessage = 'Feedback took too long. You can still retry or continue.'
   const malformedMessage = 'Unable to generate feedback right now. You can still retry or continue.'
-  const timeout = AbortSignal.timeout(75000)
+  const timeout = AbortSignal.timeout(SEMANTIC_DIAGNOSIS_TIMEOUT_MS)
   const checkCancellation = () => {
     if (signal.aborted) throw new DOMException('Feedback request cancelled.', 'AbortError')
     if (timeout.aborted) throw new SemanticDiagnosisError(timeoutMessage)

@@ -29,7 +29,7 @@ function mockResponse(response: Response) {
   vi.stubGlobal('fetch', fetchMock)
   return fetchMock
 }
-afterEach(() => { vi.unstubAllGlobals(); vi.restoreAllMocks() })
+afterEach(() => { vi.useRealTimers(); vi.unstubAllGlobals(); vi.restoreAllMocks() })
 
 test('reads the authoritative session without submitting an answer', async () => {
   const fetchMock = mockResponse(json(session))
@@ -510,7 +510,7 @@ test('semantic timeout combines with caller cancellation and reports a fixed tim
   const pending = diagnose(controller.signal).catch((cause: unknown) => cause)
   timeout.abort(new DOMException(privateDiagnosisMarker, 'TimeoutError'))
   const error = await pending
-  expect(timeoutSpy).toHaveBeenCalledWith(75000)
+  expect(timeoutSpy).toHaveBeenCalledWith(135000)
   expect(fetchSignal?.aborted).toBe(true)
   expect(controller.signal.aborted).toBe(false)
   expect(error).toMatchObject({ name: 'SemanticDiagnosisError', status: null,
@@ -518,3 +518,60 @@ test('semantic timeout combines with caller cancellation and reports a fixed tim
   expect((error as Error).message).not.toContain(privateDiagnosisMarker)
   expect(fetchMock).toHaveBeenCalledTimes(1)
 })
+
+test('semantic diagnosis stays pending through 75 seconds and times out at exactly 135 seconds without replay', async () => {
+  vi.useFakeTimers()
+  const timeoutSpy = vi.spyOn(AbortSignal, 'timeout').mockImplementation((milliseconds) => {
+    const timeout = new AbortController()
+    setTimeout(() => timeout.abort(new DOMException(privateDiagnosisMarker, 'TimeoutError')), milliseconds)
+    return timeout.signal
+  })
+  let fetchSignal: AbortSignal | undefined
+  const fetchMock = vi.fn((_url: string, options: RequestInit) => new Promise<Response>((_resolve, reject) => {
+    fetchSignal = options.signal as AbortSignal
+    fetchSignal.addEventListener('abort', () => reject(fetchSignal?.reason), { once: true })
+  }))
+  vi.stubGlobal('fetch', fetchMock)
+  let settled = false
+  const pending = diagnose().catch((cause: unknown) => { settled = true; return cause })
+
+  await vi.advanceTimersByTimeAsync(75000)
+  expect(settled).toBe(false)
+  expect(fetchSignal?.aborted).toBe(false)
+  await vi.advanceTimersByTimeAsync(59999)
+  expect(settled).toBe(false)
+  expect(fetchSignal?.aborted).toBe(false)
+  await vi.advanceTimersByTimeAsync(1)
+
+  expect(await pending).toMatchObject({ name: 'SemanticDiagnosisError', status: null,
+    message: 'Feedback took too long. You can still retry or continue.' })
+  expect(timeoutSpy).toHaveBeenCalledExactlyOnceWith(135000)
+  expect(fetchSignal?.aborted).toBe(true)
+  expect(fetchMock).toHaveBeenCalledTimes(1)
+})
+
+test.each(['caller first', 'timeout first'] as const)(
+  'caller cancellation wins when both semantic signals abort before fetch settles (%s)', async (order) => {
+    const timeout = new AbortController()
+    vi.spyOn(AbortSignal, 'timeout').mockReturnValue(timeout.signal)
+    const controller = new AbortController()
+    let fetchSignal: AbortSignal | undefined
+    const fetchMock = vi.fn((_url: string, options: RequestInit) => new Promise<Response>((_resolve, reject) => {
+      fetchSignal = options.signal as AbortSignal
+      fetchSignal.addEventListener('abort', () => reject(fetchSignal?.reason), { once: true })
+    }))
+    vi.stubGlobal('fetch', fetchMock)
+    const pending = diagnose(controller.signal).catch((cause: unknown) => cause)
+    const abortCaller = () => controller.abort(new Error(privateDiagnosisMarker))
+    const abortTimeout = () => timeout.abort(new DOMException(privateDiagnosisMarker, 'TimeoutError'))
+    if (order === 'caller first') { abortCaller(); abortTimeout() }
+    else { abortTimeout(); abortCaller() }
+
+    const error = await pending
+    expect(error).toMatchObject({ name: 'AbortError', message: 'Feedback request cancelled.' })
+    expect(error).not.toBeInstanceOf(SemanticDiagnosisError)
+    expect((error as Error).message).not.toContain(privateDiagnosisMarker)
+    expect(fetchSignal?.aborted).toBe(true)
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+  },
+)

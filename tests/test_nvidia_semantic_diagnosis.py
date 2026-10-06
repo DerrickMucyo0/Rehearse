@@ -5,6 +5,7 @@ import asyncio
 import inspect
 import json
 from pathlib import Path
+import re
 import traceback
 from types import SimpleNamespace
 from typing import get_type_hints
@@ -126,7 +127,11 @@ def test_public_constants_and_structural_signature():
         "https://integrate.api.nvidia.com/v1/chat/completions"
     )
     assert provider.NVIDIA_SEMANTIC_DIAGNOSIS_MODEL == "nvidia/nemotron-3.5-lightning-30b-a3b"
-    assert provider.NVIDIA_SEMANTIC_DIAGNOSIS_TIMEOUT_SECONDS == 60
+    assert provider.NVIDIA_SEMANTIC_DIAGNOSIS_CONNECT_TIMEOUT_SECONDS == 60
+    assert provider.NVIDIA_SEMANTIC_DIAGNOSIS_READ_TIMEOUT_SECONDS is None
+    assert provider.NVIDIA_SEMANTIC_DIAGNOSIS_WRITE_TIMEOUT_SECONDS == 60
+    assert provider.NVIDIA_SEMANTIC_DIAGNOSIS_POOL_TIMEOUT_SECONDS == 60
+    assert provider.NVIDIA_SEMANTIC_DIAGNOSIS_TOTAL_TIMEOUT_SECONDS == 120
     assert provider.NVIDIA_SEMANTIC_DIAGNOSIS_MAX_TOKENS == 8192
     assert Client.__bases__ == (object,)
     constructor = inspect.signature(Client.__init__)
@@ -144,6 +149,20 @@ def test_public_constants_and_structural_signature():
         provider.NVIDIASemanticDiagnosisFailed,
     ):
         assert error_type.__bases__ == (RuntimeError,)
+
+
+def test_frontend_diagnosis_timeout_exceeds_backend_total_provider_deadline():
+    source = (
+        Path(__file__).resolve().parents[1] / "frontend" / "src" / "interviewApi.ts"
+    ).read_text()
+    match = re.search(
+        r"^const SEMANTIC_DIAGNOSIS_TIMEOUT_MS = ([\d_]+)$", source, re.MULTILINE,
+    )
+    assert match is not None
+    frontend_timeout_ms = int(match.group(1).replace("_", ""))
+    assert frontend_timeout_ms == 135_000
+    assert frontend_timeout_ms > provider.NVIDIA_SEMANTIC_DIAGNOSIS_TOTAL_TIMEOUT_SECONDS * 1000
+    assert "AbortSignal.timeout(SEMANTIC_DIAGNOSIS_TIMEOUT_MS)" in source
 
 
 @pytest.mark.parametrize("configured_key", [None, "", " ", "\t\r\n "])
@@ -238,7 +257,10 @@ def test_prompt_identity_exact_http_contract_and_no_context_inspection(context, 
     assert len(constructions) == 1
     args, kwargs = constructions[0]
     assert args == ()
-    assert kwargs == {"transport": transport, "timeout": 60}
+    assert kwargs == {
+        "transport": transport,
+        "timeout": httpx.Timeout(connect=60, read=None, write=60, pool=60),
+    }
     assert len(requests) == 1
     request = requests[0]
     assert request.method == "POST"
@@ -247,7 +269,7 @@ def test_prompt_identity_exact_http_contract_and_no_context_inspection(context, 
     assert request.headers["Accept"] == "application/json"
     assert request.headers["Content-Type"] == "application/json"
     assert request.extensions["timeout"] == {
-        "connect": 60, "read": 60, "write": 60, "pool": 60,
+        "connect": 60, "read": None, "write": 60, "pool": 60,
     }
     body = json.loads(request.content)
     assert body == {
@@ -565,6 +587,119 @@ def test_timeout_errors_are_private_and_never_retried(error_type, context, capsy
     )
 
 
+def test_total_deadline_cancels_single_http_operation_and_normalizes_privately(
+    context, monkeypatch, capsys, caplog,
+):
+    deadlines, requests, cancellations = [], [], []
+    real_timeout = asyncio.timeout
+
+    def immediate_deadline(seconds):
+        deadlines.append(seconds)
+        # Exercise the real timeout mechanism on the next event-loop turn.
+        return real_timeout(0)
+
+    async def stalled(request):
+        requests.append(request)
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancellations.append(True)
+            raise
+        raise AssertionError("A cancelled operation must not finish.")
+
+    monkeypatch.setattr(provider, "asyncio", SimpleNamespace(timeout=immediate_deadline))
+    with pytest.raises(provider.NVIDIASemanticDiagnosisTimeout) as caught:
+        run_request(httpx.MockTransport(stalled), context)
+    assert deadlines == [120]
+    assert len(requests) == 1 and cancellations == [True]
+    assert_private_failure(
+        caught.value, provider.NVIDIASemanticDiagnosisTimeout, TIMEOUT_MESSAGE, capsys, caplog,
+    )
+
+
+def test_total_deadline_preserves_application_http_504_and_persisted_context(
+    context, monkeypatch, capsys, caplog,
+):
+    from fastapi.testclient import TestClient
+    from app.main import app
+    from app.session_routes import get_session_service
+    from app.semantic_diagnosis_composition import get_semantic_diagnosis_adapter
+
+    deadlines, requests, reads = [], [], []
+    real_timeout = asyncio.timeout
+    before = context.model_dump()
+
+    def immediate_deadline(seconds):
+        deadlines.append(seconds)
+        return real_timeout(0)
+
+    async def stalled(request):
+        requests.append(request)
+        await asyncio.Event().wait()
+        raise AssertionError("A cancelled operation must not finish.")
+
+    class Reader:
+        def get_diagnosis_context(self, session_id, question_index, attempt_number):
+            reads.append((session_id, question_index, attempt_number))
+            return context
+
+    reader = Reader()
+    adapter = JSONSemanticDiagnosisAdapter(Client(transport=httpx.MockTransport(stalled)))
+    monkeypatch.setattr(provider, "asyncio", SimpleNamespace(timeout=immediate_deadline))
+    original_overrides = app.dependency_overrides.copy()
+    try:
+        app.dependency_overrides[get_session_service] = lambda: reader
+        app.dependency_overrides[get_semantic_diagnosis_adapter] = lambda: adapter
+        with TestClient(app) as client:
+            response = client.post(
+                "/api/sessions/00000000-0000-4000-8000-000000000017/questions/4/attempts/2/diagnosis"
+            )
+    finally:
+        app.dependency_overrides.clear()
+        app.dependency_overrides.update(original_overrides)
+    assert response.status_code == 504
+    assert response.json() == {"detail": "Semantic diagnosis timed out."}
+    assert deadlines == [120] and len(requests) == len(reads) == 1
+    assert reads == [(UUID("00000000-0000-4000-8000-000000000017"), 4, 2)]
+    assert context.model_dump() == before
+    public = response.text + json.dumps(dict(response.headers)) + caplog.text
+    for marker in (
+        FAKE_KEY, PRIVATE_BODY, PRIVATE_HEADER, PRIVATE_METADATA,
+        PRIVATE_NETWORK, PRIVATE_CONTENT, PRIVATE_QUESTION, "upstream_status", "category",
+    ):
+        assert marker not in public
+    assert capsys.readouterr() == ("", "")
+
+
+def test_caller_cancellation_of_pending_http_propagates_without_timeout_or_retry(context):
+    requests, cancellations = [], []
+
+    async def scenario():
+        entered = asyncio.Event()
+
+        async def stalled(request):
+            requests.append(request)
+            entered.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cancellations.append(True)
+                raise
+            raise AssertionError("A cancelled operation must not finish.")
+
+        task = asyncio.create_task(Client(transport=httpx.MockTransport(stalled)).request(context))
+        await entered.wait()
+        task.cancel(PRIVATE_NETWORK)
+        with pytest.raises(asyncio.CancelledError) as caught:
+            await task
+        assert type(caught.value) is asyncio.CancelledError
+        assert caught.value.args == (PRIVATE_NETWORK,)
+        assert task.cancelled()
+
+    asyncio.run(scenario())
+    assert len(requests) == 1 and cancellations == [True]
+
+
 class SyntheticBaseFailure(BaseException):
     pass
 
@@ -718,7 +853,7 @@ def test_source_stays_transport_only_with_closed_imports_and_no_retry_or_state_p
             assert node.level == 0
             imports.append(node.module)
     assert set(imports) <= {
-        "os", "httpx", "app.diagnosis", "app.semantic_diagnosis_prompt",
+        "asyncio", "os", "httpx", "app.diagnosis", "app.semantic_diagnosis_prompt",
         "app.semantic_diagnosis_failure",
     }
     assert {"httpx", "app.semantic_diagnosis_prompt"} <= set(imports)
@@ -760,6 +895,26 @@ def test_source_stays_transport_only_with_closed_imports_and_no_retry_or_state_p
         if isinstance(node, ast.AsyncFunctionDef) and node.name == "request"
     )
     assert environment_reads[0] in list(ast.walk(request_node))
+    deadlines = [
+        node for node in ast.walk(request_node)
+        if isinstance(node, ast.AsyncWith)
+        and isinstance(node.items[0].context_expr, ast.Call)
+        and isinstance(node.items[0].context_expr.func, ast.Attribute)
+        and isinstance(node.items[0].context_expr.func.value, ast.Name)
+        and node.items[0].context_expr.func.value.id == "asyncio"
+    ]
+    assert len(deadlines) == 1
+    deadline = deadlines[0]
+    assert ast.dump(deadline.items[0].context_expr) == ast.dump(ast.Call(
+        func=ast.Attribute(value=ast.Name(id="asyncio", ctx=ast.Load()), attr="timeout", ctx=ast.Load()),
+        args=[ast.Name(id="NVIDIA_SEMANTIC_DIAGNOSIS_TOTAL_TIMEOUT_SECONDS", ctx=ast.Load())],
+        keywords=[],
+    ))
+    posts = [
+        node for node in ast.walk(request_node)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "post"
+    ]
+    assert len(posts) == 1 and posts[0] in list(ast.walk(deadline))
     all_strings = {
         node.value for node in ast.walk(tree)
         if isinstance(node, ast.Constant) and isinstance(node.value, str)
