@@ -19,6 +19,11 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from app.main import app
 from app import session_routes as routes
+from app.auth import AuthenticatedPrincipal, AuthenticationFailure, AuthenticationFailureKind
+from app.auth_http import (
+    AUTH_REQUEST_CONTEXT_HEADER, AUTH_SESSION_COOKIE_NAME,
+    AuthenticatedPrincipalDependency, get_auth_session_store, require_authenticated_principal,
+)
 from app.diagnosis import DiagnosisContext
 from app.database_models import QuestionAttempt, StoredInterviewSession, TranscriptionMeasurement
 from app.nvidia_semantic_diagnosis import (
@@ -125,7 +130,7 @@ class RecordingReader:
 
     def forbidden_mutation(self, *args, **kwargs):
         self.mutations.append("mutation")
-        raise AssertionError("Diagnosis must not write, advance, or independently reread a session.")
+        raise AssertionError("Diagnosis must not write, advance, or read unrelated session state.")
 
     start = get = get_attempts = get_comparison = forbidden_mutation
     submit_attempt = continue_question = create_measurement = forbidden_mutation
@@ -167,13 +172,43 @@ class UnknownFailure(RuntimeError):
 
 
 @pytest.fixture
-def setup():
+def route_auth(offline_boundaries_and_clean_overrides):
+    principal = AuthenticatedPrincipal(
+        user_id=UUID("00000000-0000-4000-8000-000000000014"),
+        auth_session_id=UUID("00000000-0000-4000-8000-000000000015"),
+        request_context="synthetic-semantic-route-context",
+    )
+    credential = "synthetic-semantic-route-credential"
+
+    class Store:
+        def resolve(self, *, credential):
+            if credential != "synthetic-semantic-route-credential":
+                raise AuthenticationFailure(AuthenticationFailureKind.UNAUTHENTICATED)
+            return principal
+
+        def revalidate(self, *, principal):
+            assert principal is expected_principal
+
+    expected_principal = principal
+    store = Store()
+    app.dependency_overrides[get_auth_session_store] = lambda: store
+    headers = {
+        "Cookie": f"{AUTH_SESSION_COOKIE_NAME}={credential}",
+        AUTH_REQUEST_CONTEXT_HEADER: principal.request_context,
+    }
+    return principal, headers, store
+
+
+@pytest.fixture
+def setup(route_auth):
+    expected_principal, headers, _ = route_auth
     supplied, expected, events = context(), diagnosis(), []
     reader = RecordingReader(supplied, events)
     adapter = RecordingAdapter(expected, reader, events)
     dependencies = []
 
-    def session_override():
+    def session_override(principal: AuthenticatedPrincipalDependency):
+        assert principal == expected_principal
         dependencies.append("sessions")
         return reader
 
@@ -181,9 +216,9 @@ def setup():
         dependencies.append("diagnoser")
         return adapter
 
-    app.dependency_overrides[routes.get_transitional_provider_session_service] = session_override
+    app.dependency_overrides[routes.get_session_service] = session_override
     app.dependency_overrides[get_semantic_diagnosis_adapter] = adapter_override
-    with TestClient(app, raise_server_exceptions=True) as client:
+    with TestClient(app, raise_server_exceptions=True, headers=headers) as client:
         yield client, reader, adapter, expected, events, dependencies
 
 
@@ -221,10 +256,12 @@ def test_post_matches_shared_versioned_frontend_contract_fixture(setup, capsys, 
     assert response.json() == fixture
     assert response.json()["diagnosis_version"] == "semantic-diagnosis-v1"
     assert set(response.json()) == set(SemanticDiagnosis.model_fields)
-    assert reader.calls == [(SESSION_ID, 2, 3)]
+    assert reader.calls == [(SESSION_ID, 2, 3)] * 2
     assert len(adapter.calls) == 1 and adapter.calls[0] is reader.context
     assert dependencies == ["sessions", "diagnoser"]
-    assert events == ["reader_begin", "reader_end", "adapter_begin", "adapter_end"]
+    assert events == [
+        "reader_begin", "reader_end", "adapter_begin", "adapter_end", "reader_begin", "reader_end",
+    ]
     assert reader.mutations == []
     assert "PRIVATE-PERSISTED" not in response.text
     assert "PRIVATE-PERSISTED" not in caplog.text
@@ -262,14 +299,16 @@ def test_post_uses_one_exact_persisted_context_and_only_returns_semantic_diagnos
     args, kwargs = application_calls[0]
     assert len(args) == 2 and args[0] is adapter and args[1] is supplied
     assert kwargs == {}
-    assert reader.calls == [(SESSION_ID, 2, 3)]
+    assert reader.calls == [(SESSION_ID, 2, 3)] * 2
     assert type(reader.calls[0][0]) is UUID
     assert len(adapter.calls) == 1 and adapter.calls[0] is supplied
     assert len(application_results) == 1
     assert application_results[0][0] is supplied and application_results[0][1] is expected
-    assert len(reader.threads) == len(adapter.threads) == 1
-    assert reader.threads[0] != adapter.threads[0]
-    assert events == ["reader_begin", "reader_end", "adapter_begin", "adapter_end"]
+    assert len(reader.threads) == 2 and len(adapter.threads) == 1
+    assert all(thread != adapter.threads[0] for thread in reader.threads)
+    assert events == [
+        "reader_begin", "reader_end", "adapter_begin", "adapter_end", "reader_begin", "reader_end",
+    ]
     assert reader.mutations == [] and reader.state == before_state
     assert supplied.model_dump() == before_context
     for marker in ("PRIVATE-PERSISTED", "SPOOFED", PRIVATE):
@@ -294,7 +333,7 @@ def test_dependency_factory_override_is_honored_freshly_for_each_post(setup):
     assert len(created) == 2 and created[0] is not created[1]
     assert all(len(adapter.calls) == 1 and adapter.calls[0] is reader.context for adapter in created)
     assert dependencies == ["sessions", "sessions"]
-    assert len(reader.calls) == 2 and reader.mutations == []
+    assert reader.calls == [(SESSION_ID, 2, 3)] * 4 and reader.mutations == []
 
 
 def test_missing_attempt_returns_404_without_accessing_adapter_or_application(setup, monkeypatch):
@@ -447,7 +486,7 @@ def test_unknown_persisted_reader_failures_propagate_without_application_or_adap
 
 
 def test_real_threadpool_read_finishes_before_application_adapter_and_synthetic_provider_on_event_loop(
-    setup, monkeypatch,
+    setup, route_auth, monkeypatch,
 ):
     client, reader, _, expected, events, _ = setup
     actual_threadpool = routes.run_in_threadpool
@@ -459,7 +498,10 @@ def test_real_threadpool_read_finishes_before_application_adapter_and_synthetic_
         route_threads.append(get_ident())
         route_loops.append(asyncio.get_running_loop())
         threadpool_calls.append((function, args, kwargs))
-        events.append("route_before_read")
+        events.append(
+            "route_before_read" if function == reader.get_diagnosis_context
+            else "route_before_auth_revalidation"
+        )
         return await actual_threadpool(function, *args, **kwargs)
 
     async def observed_application(adapter, supplied):
@@ -504,25 +546,33 @@ def test_real_threadpool_read_finishes_before_application_adapter_and_synthetic_
     response = client.post(url())
     assert response.status_code == 200
     assert response.json() == expected.model_dump(mode="json")
-    assert len(threadpool_calls) == 1
+    assert len(threadpool_calls) == 3
     function, args, kwargs = threadpool_calls[0]
     assert function == reader.get_diagnosis_context
     assert args == (SESSION_ID, 2, 3) and kwargs == {}
-    assert reader.calls == [args]
-    assert len(route_threads) == len(reader.threads) == 1
-    assert reader.threads[0] != route_threads[0]
+    assert threadpool_calls[1] == (
+        routes.revalidate_authenticated_principal, (route_auth[0], route_auth[2]), {},
+    )
+    assert threadpool_calls[2] == (reader.get_diagnosis_context, args, {})
+    assert reader.calls == [args, args]
+    assert len(route_threads) == 3 and len(reader.threads) == 2
+    assert all(thread == route_threads[0] for thread in route_threads)
+    assert all(loop is route_loops[0] for loop in route_loops)
+    assert all(thread != route_threads[0] for thread in reader.threads)
     assert application_calls == [(adapter, reader.context, route_threads[0])]
     assert adapter_calls == provider_calls == [(reader.context, route_threads[0])]
     assert application_calls[0][1] is adapter_calls[0][0] is provider_calls[0][0] is reader.context
     assert events == [
         "route_before_read", "reader_begin", "reader_end", "application_begin", "adapter_begin",
         "provider_begin", "provider_end", "adapter_end", "application_end",
+        "route_before_auth_revalidation", "route_before_read", "reader_begin", "reader_end",
     ]
     assert reader.mutations == []
 
 
 def test_http_postgres_transaction_and_connection_end_in_worker_before_semantic_application(
-    postgres_engine, postgres_session_factory, authenticated_principal, monkeypatch,
+    postgres_engine, postgres_session_factory, authenticated_principal,
+    authenticated_session_override, authenticated_http_headers, monkeypatch,
 ):
     setup_service = InterviewSessionService(postgres_session_factory, authenticated_principal)
     created = setup_service.start()
@@ -580,13 +630,13 @@ def test_http_postgres_transaction_and_connection_end_in_worker_before_semantic_
     def forbidden_mutation(*args, **kwargs):
         raise AssertionError("Diagnosis must not write or perform extra public session operations.")
 
-    def assert_read_closed():
-        assert len(read_calls) == len(returned) == len(transactions) == len(ended) == len(statements) == 1
+    def assert_read_closed(count=1):
+        assert len(read_calls) == len(returned) == len(transactions) == len(ended) == len(statements) == count
         assert active == set()
-        assert transactions[0][0] is ended[0][0]
-        assert transactions[0][1] is ended[0][1]
-        assert transactions[0][1].is_active is False
-        assert transactions[0][0].in_transaction() is False
+        for (database, transaction), (ended_database, ended_transaction) in zip(transactions, ended, strict=True):
+            assert database is ended_database and transaction is ended_transaction
+            assert transaction.is_active is False
+            assert database.in_transaction() is False
         assert postgres_engine.pool.checkedout() == 0
 
     async def observed_application(adapter, supplied):
@@ -617,14 +667,14 @@ def test_http_postgres_transaction_and_connection_end_in_worker_before_semantic_
     for name in ("start", "get", "get_attempts", "get_comparison", "submit_attempt", "continue_question", "create_measurement"):
         monkeypatch.setattr(service, name, forbidden_mutation)
     monkeypatch.setattr(routes, "diagnose_application_context", observed_application)
-    app.dependency_overrides[routes.get_transitional_provider_session_service] = lambda: service
+    app.dependency_overrides[routes.get_session_service] = authenticated_session_override(service)
     app.dependency_overrides[get_semantic_diagnosis_adapter] = lambda: adapter
     event.listen(ReadSession, "after_transaction_create", transaction_created)
     event.listen(ReadSession, "after_transaction_end", transaction_ended)
     event.listen(ReadSession, "before_flush", forbidden_mutation)
     event.listen(postgres_engine, "before_cursor_execute", observed_statement)
     try:
-        with TestClient(app, raise_server_exceptions=True) as client:
+        with TestClient(app, raise_server_exceptions=True, headers=authenticated_http_headers) as client:
             response = client.post(url(created.id, 0, submitted.attempt.attempt_number))
     finally:
         event.remove(postgres_engine, "before_cursor_execute", observed_statement)
@@ -632,17 +682,20 @@ def test_http_postgres_transaction_and_connection_end_in_worker_before_semantic_
         event.remove(ReadSession, "after_transaction_end", transaction_ended)
         event.remove(ReadSession, "after_transaction_create", transaction_created)
     assert response.status_code == 200 and response.json() == expected.model_dump(mode="json")
-    assert read_calls == [(created.id, 0, submitted.attempt.attempt_number)]
-    assert len(reader_threads) == len(semantic_threads) == len(application_calls) == len(adapter_calls) == 1
-    assert reader_threads[0] != semantic_threads[0]
+    assert read_calls == [(created.id, 0, submitted.attempt.attempt_number)] * 2
+    assert len(reader_threads) == 2
+    assert len(semantic_threads) == len(application_calls) == len(adapter_calls) == 1
+    assert all(thread != semantic_threads[0] for thread in reader_threads)
     assert application_calls[0][0] is adapter
     assert application_calls[0][1] is adapter_calls[0] is returned[0]
     assert events == [
         "reader_begin", "transaction_begin", "transaction_end", "reader_end", "application_begin", "adapter_begin",
+        "reader_begin", "transaction_begin", "transaction_end", "reader_end",
     ]
-    assert transactions[0][1].parent is None
-    assert statements[0].lstrip().upper().startswith("SELECT ")
-    assert "FOR UPDATE" not in statements[0].upper()
+    assert_read_closed(2)
+    assert all(transaction.parent is None for _, transaction in transactions)
+    assert all(statement.lstrip().upper().startswith("SELECT ") for statement in statements)
+    assert all("FOR UPDATE" not in statement.upper() for statement in statements)
     assert persisted_rows() == before
 
 
@@ -691,7 +744,8 @@ def test_route_is_post_only_with_semantic_response_no_body_or_query_and_exact_de
         "session_id", "question_index", "attempt_number",
     ]
     assert [dependency.call for dependency in route.dependant.dependencies] == [
-        routes.get_transitional_provider_session_service, get_semantic_diagnosis_adapter,
+        routes.get_session_service, get_semantic_diagnosis_adapter,
+        require_authenticated_principal, get_auth_session_store,
     ]
     adapter_type, dependency = get_args(routes.SemanticDiagnosisService)
     assert adapter_type is SemanticDiagnosisAdapter
@@ -699,7 +753,7 @@ def test_route_is_post_only_with_semantic_response_no_body_or_query_and_exact_de
     assert inspect.iscoroutinefunction(routes.diagnose_attempt)
     signature = inspect.signature(routes.diagnose_attempt)
     assert tuple(signature.parameters) == (
-        "session_id", "question_index", "attempt_number", "sessions", "diagnoser",
+        "session_id", "question_index", "attempt_number", "sessions", "diagnoser", "principal", "auth_store",
     )
     assert all(parameter.default is inspect.Parameter.empty for parameter in signature.parameters.values())
     assert signature.return_annotation is SemanticDiagnosis
@@ -732,19 +786,31 @@ def test_route_source_is_provider_neutral_and_delegates_once_without_lower_level
     body_nodes = [node for statement in endpoint.body for node in ast.walk(statement)]
     assert not any(isinstance(node, (ast.For, ast.AsyncFor, ast.While, ast.With, ast.AsyncWith)) for node in body_nodes)
     attributes = [node for node in body_nodes if isinstance(node, ast.Attribute)]
-    assert len(attributes) == 1
-    assert ast.dump(attributes[0]) == ast.dump(ast.Attribute(
+    assert len(attributes) == 2
+    expected_read = ast.Attribute(
         value=ast.Name(id="sessions", ctx=ast.Load()), attr="get_diagnosis_context", ctx=ast.Load(),
-    ))
+    )
+    assert all(ast.dump(attribute) == ast.dump(expected_read) for attribute in attributes)
     calls = [node for node in body_nodes if isinstance(node, ast.Call)]
     assert all(isinstance(node.func, ast.Name) for node in calls)
-    assert {node.func.id for node in calls} == {"run_in_threadpool", "diagnose_application_context", "HTTPException", "str"}
+    assert {node.func.id for node in calls} == {
+        "run_in_threadpool", "diagnose_application_context", "HTTPException", "str",
+    }
     threadpool_calls = [node for node in calls if node.func.id == "run_in_threadpool"]
-    assert len(threadpool_calls) == 1
-    assert ast.dump(threadpool_calls[0]) == ast.dump(ast.Call(
+    assert len(threadpool_calls) == 3
+    expected_read_call = ast.Call(
         func=ast.Name(id="run_in_threadpool", ctx=ast.Load()),
-        args=[ast.Attribute(value=ast.Name(id="sessions", ctx=ast.Load()), attr="get_diagnosis_context", ctx=ast.Load()),
+        args=[expected_read,
               *[ast.Name(id=name, ctx=ast.Load()) for name in ("session_id", "question_index", "attempt_number")]],
+        keywords=[],
+    )
+    assert ast.dump(threadpool_calls[0]) == ast.dump(expected_read_call)
+    assert ast.dump(threadpool_calls[2]) == ast.dump(expected_read_call)
+    assert ast.dump(threadpool_calls[1]) == ast.dump(ast.Call(
+        func=ast.Name(id="run_in_threadpool", ctx=ast.Load()),
+        args=[ast.Name(id=name, ctx=ast.Load()) for name in (
+            "revalidate_authenticated_principal", "principal", "auth_store",
+        )],
         keywords=[],
     ))
     application_calls = [node for node in calls if node.func.id == "diagnose_application_context"]
@@ -755,23 +821,28 @@ def test_route_source_is_provider_neutral_and_delegates_once_without_lower_level
         keywords=[],
     ))
     awaits = [node for node in body_nodes if isinstance(node, ast.Await)]
-    assert len(awaits) == 2
+    assert len(awaits) == 4
     assert awaits[0].value is threadpool_calls[0] and awaits[1].value is application_calls[0]
+    assert awaits[2].value is threadpool_calls[1] and awaits[3].value is threadpool_calls[2]
     operations = [node for node in endpoint.body if isinstance(node, ast.Try)]
-    assert len(operations) == 2
-    assert len(operations[0].body) == len(operations[1].body) == 1
+    assert len(operations) == 3
+    assert all(len(operation.body) == 1 for operation in operations)
     assert isinstance(operations[0].body[0], ast.Assign)
     assert operations[0].body[0].value is awaits[0]
     assert isinstance(operations[1].body[0], ast.Assign)
     assert operations[1].body[0].value is awaits[1]
+    assert isinstance(operations[2].body[0], ast.Assign)
+    assert operations[2].body[0].value is awaits[3]
     assert [handler.type.id for handler in operations[0].handlers] == ["SessionNotFound"]
     assert [handler.type.id for handler in operations[1].handlers] == [
         "SemanticDiagnosisUnavailable", "SemanticDiagnosisTimeout", "SemanticDiagnosisFailed",
     ]
+    assert [handler.type.id for handler in operations[2].handlers] == ["SessionNotFound"]
     handlers = [node for node in body_nodes if isinstance(node, ast.ExceptHandler)]
     assert all(isinstance(node.type, ast.Name) for node in handlers)
     assert [node.type.id for node in handlers] == [
         "SessionNotFound", "SemanticDiagnosisUnavailable", "SemanticDiagnosisTimeout", "SemanticDiagnosisFailed",
+        "SessionNotFound",
     ]
     returns = [node for node in body_nodes if isinstance(node, ast.Return)]
     assert len(returns) == 1 and isinstance(returns[0].value, ast.Name)

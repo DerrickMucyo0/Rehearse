@@ -91,14 +91,35 @@ class InvalidComparisonSelection(Exception):
     pass
 
 
-class _SessionPersistence:
-    """Shared transaction mechanics; subclasses supply the root lookup scope."""
+class InterviewSessionService:
+    """One authenticated owner; every operation closes its own transaction.
 
-    def __init__(self, session_factory: sessionmaker[Session]) -> None:
+    Authentication belongs to the HTTP/store boundary. This service authorizes
+    by filtering the root session in the same SELECT, including row locks, before
+    interpreting child rows, question state, revisions or measurement references.
+    The shared factory carries no identity; this service is never globally cached.
+    """
+
+    def __init__(
+        self, session_factory: sessionmaker[Session], principal: AuthenticatedPrincipal,
+    ) -> None:
+        if type(principal) is not AuthenticatedPrincipal:
+            raise TypeError("An authenticated principal is required.")
         self._session_factory = session_factory
+        self._principal = principal
 
     def _session_predicate(self, session_id: UUID):
-        raise NotImplementedError
+        return and_(
+            StoredInterviewSession.id == session_id,
+            StoredInterviewSession.user_id == self._principal.user_id,
+        )
+
+    def start(self) -> InterviewSession:
+        with self._session_factory.begin() as database:
+            stored = StoredInterviewSession(questions=QUESTIONS, user_id=self._principal.user_id)
+            database.add(stored)
+            database.flush()
+            return self._response(stored, [])
 
     def get(self, session_id: UUID) -> InterviewSession:
         with self._session_factory.begin() as database:
@@ -406,77 +427,4 @@ class _SessionPersistence:
             questions=list(stored.questions),
             answers=[latest[index].answer_text for index in range(stored.current_question_index) if index in latest],
             current_question_latest_attempt_number=current.attempt_number if current is not None else 0,
-        )
-
-
-class InterviewSessionService(_SessionPersistence):
-    """One authenticated owner; every operation closes its own transaction.
-
-    Authentication belongs to the HTTP/store boundary. This service authorizes
-    by filtering the root session in the same SELECT, including row locks, before
-    interpreting child rows, question state, revisions or measurement references.
-    The shared factory carries no identity; this service is never globally cached.
-    """
-
-    def __init__(
-        self, session_factory: sessionmaker[Session], principal: AuthenticatedPrincipal,
-    ) -> None:
-        if type(principal) is not AuthenticatedPrincipal:
-            raise TypeError("An authenticated principal is required.")
-        super().__init__(session_factory)
-        self._principal = principal
-
-    def _session_predicate(self, session_id: UUID):
-        return and_(
-            StoredInterviewSession.id == session_id,
-            StoredInterviewSession.user_id == self._principal.user_id,
-        )
-
-    def start(self) -> InterviewSession:
-        with self._session_factory.begin() as database:
-            stored = StoredInterviewSession(questions=QUESTIONS, user_id=self._principal.user_id)
-            database.add(stored)
-            database.flush()
-            return self._response(stored, [])
-
-
-class _TransitionalProviderPersistence(_SessionPersistence):
-    def _session_predicate(self, session_id: UUID):
-        return StoredInterviewSession.id == session_id
-
-
-class TransitionalProviderSessionService:
-    """Temporary UUID access for audio/transcription/diagnosis until Slice 6.
-
-    Deliberately separate from the mandatory owner-bound core service. Expose
-    only the existing provider context/measurement operations: no anonymous
-    session creation, attempt submission, finalization, list or comparison API.
-    This compatibility boundary is not authorization and must not be adopted by
-    core routes. Provider authentication and post-inference revalidation remain
-    explicitly deferred; there are no transactions across provider work here.
-    """
-
-    def __init__(self, session_factory: sessionmaker[Session]) -> None:
-        self._storage = _TransitionalProviderPersistence(session_factory)
-
-    def get(self, session_id: UUID) -> InterviewSession:
-        return self._storage.get(session_id)
-
-    def get_diagnosis_context(
-        self, session_id: UUID, question_index: int, attempt_number: int,
-    ) -> DiagnosisContext:
-        return self._storage.get_diagnosis_context(session_id, question_index, attempt_number)
-
-    def validate_current_question(
-        self, session_id: UUID, question_index: int, expected_last_attempt_number: int | None = None,
-    ) -> None:
-        self._storage.validate_current_question(session_id, question_index, expected_last_attempt_number)
-
-    def create_measurement(
-        self, session_id: UUID, question_index: int, metrics: SpeakingMetrics,
-        *, expected_last_attempt_number: int, delivery_metrics: DeliveryMetrics | None = None,
-    ) -> UUID:
-        return self._storage.create_measurement(
-            session_id, question_index, metrics,
-            expected_last_attempt_number=expected_last_attempt_number, delivery_metrics=delivery_metrics,
         )

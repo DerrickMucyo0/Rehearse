@@ -8,8 +8,10 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import FrozenInstanceError, dataclass
 from datetime import datetime, timedelta, timezone
 from hashlib import sha256
+import inspect
 from threading import Barrier
 import traceback
+from typing import get_args
 from uuid import UUID, uuid4
 
 import httpx
@@ -21,7 +23,7 @@ from sqlalchemy import event, select
 from app import auth_http
 from app.auth import (
     AuthenticatedPrincipal, AuthenticationFailure, AuthenticationFailureKind,
-    IssuedAuthSession, VerifiedExternalIdentity,
+    AuthSessionStore, IssuedAuthSession, VerifiedExternalIdentity,
 )
 from app.auth_http import (
     AUTH_REQUEST_CONTEXT_HEADER, AUTH_SESSION_COOKIE_NAME, AuthenticatedPrincipalDependency,
@@ -86,6 +88,30 @@ class FakeStore:
 
     def revalidate(self, **kwargs):
         raise AssertionError("Resolution already checks the live local authentication session")
+
+
+class RevalidationOnlyStore:
+    def __init__(self, error=None):
+        self.error = error
+        self.principals = []
+
+    def revalidate(self, *, principal):
+        self.principals.append(principal)
+        if self.error is not None:
+            raise self.error
+
+    def resolve(self, **kwargs):
+        raise AssertionError("Post-provider revalidation must not resolve another credential.")
+
+    def create(self, **kwargs):
+        raise AssertionError("Post-provider revalidation must not issue another login.")
+
+    def revoke(self, **kwargs):
+        raise AssertionError("Post-provider revalidation must not revoke a login.")
+
+    @property
+    def credential(self):
+        raise AssertionError("Post-provider revalidation must not read a raw credential.")
 
 
 def probe_app(store=UNSET):
@@ -401,6 +427,104 @@ def test_baseexception_cancellation_and_shutdown_are_not_swallowed(error):
     with pytest.raises(type(error)) as caught:
         require_authenticated_principal(request=direct_request(), response=Response(), store=store)
     assert caught.value is error
+
+
+def test_auth_store_dependency_alias_preserves_the_existing_injectable_boundary():
+    store_type, dependency = get_args(auth_http.AuthSessionStoreDependency)
+    assert store_type is AuthSessionStore
+    assert dependency.dependency is get_auth_session_store
+    signature = inspect.signature(require_authenticated_principal)
+    assert signature.parameters["store"].annotation == auth_http.AuthSessionStoreDependency
+
+
+def test_post_provider_revalidation_passes_the_same_frozen_principal_without_reading_credentials(monkeypatch):
+    store = RevalidationOnlyStore()
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("Post-provider revalidation must not inspect the browser cookie.")
+
+    monkeypatch.setattr(auth_http, "_cookie_credential", forbidden)
+    assert not inspect.iscoroutinefunction(auth_http.revalidate_authenticated_principal)
+    assert tuple(inspect.signature(auth_http.revalidate_authenticated_principal).parameters) == ("principal", "store")
+    assert auth_http.revalidate_authenticated_principal(principal=PRINCIPAL_A, store=store) is None
+    assert store.principals == [PRINCIPAL_A]
+    assert store.principals[0] is PRINCIPAL_A
+    for field, replacement in (
+        ("user_id", uuid4()), ("auth_session_id", uuid4()), ("request_context", "replacement-context"),
+    ):
+        with pytest.raises(FrozenInstanceError):
+            setattr(store.principals[0], field, replacement)
+
+
+@pytest.mark.parametrize("kind", list(HTTP_FAILURES))
+def test_post_provider_revalidation_maps_approved_failures_to_fixed_private_http_responses(kind):
+    store = RevalidationOnlyStore(AuthenticationFailure(kind))
+    assert_private_http_exception(
+        lambda: auth_http.revalidate_authenticated_principal(principal=PRINCIPAL_A, store=store), kind,
+    )
+    application = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
+
+    @application.get("/post-provider")
+    def release_result():
+        auth_http.revalidate_authenticated_principal(principal=PRINCIPAL_A, store=store)
+        raise AssertionError("A failed revalidation must not release a protected result.")
+
+    with TestClient(application, raise_server_exceptions=False) as client:
+        response = client.get("/post-provider")
+    assert_http_failure(response, kind)
+    assert len(store.principals) == 2
+    assert all(principal is PRINCIPAL_A for principal in store.principals)
+
+
+def test_post_provider_revalidation_discards_unexpected_sensitive_errors_without_chains_or_output(caplog, capsys):
+    digest = sha256(TOKEN_A.encode()).hexdigest()
+    store = RevalidationOnlyStore(RuntimeError(PRIVATE_DETAIL + TOKEN_A + CONTEXT_A + digest))
+    assert_private_http_exception(
+        lambda: auth_http.revalidate_authenticated_principal(principal=PRINCIPAL_A, store=store),
+        AuthenticationFailureKind.UNAVAILABLE, digest,
+    )
+    assert len(store.principals) == 1 and store.principals[0] is PRINCIPAL_A
+    captured = capsys.readouterr()
+    assert captured.out == captured.err == ""
+    assert caplog.records == []
+
+
+@pytest.mark.parametrize("metadata", ["missing-kind", "string-kind", "object-kind", "subclass-kind-override"])
+def test_post_provider_revalidation_keeps_malformed_failure_metadata_in_fixed_unavailable_mapping(metadata):
+    class DerivedFailure(AuthenticationFailure):
+        @property
+        def kind(self):
+            raise RuntimeError(PRIVATE_DETAIL)
+
+    error = AuthenticationFailure(AuthenticationFailureKind.UNAUTHENTICATED)
+    if metadata == "missing-kind":
+        del error._kind
+    elif metadata == "string-kind":
+        error._kind = "unauthenticated"
+    elif metadata == "object-kind":
+        error._kind = object()
+    else:
+        error = DerivedFailure(AuthenticationFailureKind.UNAUTHENTICATED)
+    error.args = (PRIVATE_DETAIL + TOKEN_A + CONTEXT_A,)
+    store = RevalidationOnlyStore(error)
+    assert_private_http_exception(
+        lambda: auth_http.revalidate_authenticated_principal(principal=PRINCIPAL_A, store=store),
+        AuthenticationFailureKind.UNAVAILABLE,
+    )
+    assert len(store.principals) == 1 and store.principals[0] is PRINCIPAL_A
+
+
+@pytest.mark.parametrize("error", [
+    pytest.param(BaseException(PRIVATE_DETAIL), id="base-exception"),
+    pytest.param(asyncio.CancelledError(), id="cancelled"),
+    pytest.param(KeyboardInterrupt(), id="interrupt"), pytest.param(SystemExit(), id="exit"),
+])
+def test_post_provider_revalidation_propagates_cancellation_and_shutdown_unchanged(error):
+    store = RevalidationOnlyStore(error)
+    with pytest.raises(type(error)) as caught:
+        auth_http.revalidate_authenticated_principal(principal=PRINCIPAL_A, store=store)
+    assert caught.value is error
+    assert len(store.principals) == 1 and store.principals[0] is PRINCIPAL_A
 
 
 @pytest.mark.parametrize("credential", [None, "", " "])

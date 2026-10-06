@@ -2,14 +2,17 @@
 
 The actual application dependencies share the isolated test factory. No auth
 principal or interview service is injected into the protected HTTP routes.
-Provider routes, history, and browser authentication lifecycle remain untouched.
+History and browser authentication lifecycle remain outside this slice.
 """
 
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from itertools import count
+import inspect
+from pathlib import Path
 from threading import Barrier
+from typing import get_type_hints
 from uuid import UUID, uuid4
 
 import httpx
@@ -18,7 +21,7 @@ from fastapi.testclient import TestClient
 from fastapi.routing import iter_route_contexts
 from sqlalchemy import event, select, update
 
-from app import auth_http, session_routes
+from app import auth_http, session_routes, sessions as session_module
 from app.auth import AuthenticatedPrincipal, IssuedAuthSession, VerifiedExternalIdentity
 from app.auth_http import AUTH_REQUEST_CONTEXT_HEADER, AUTH_SESSION_COOKIE_NAME
 from app.auth_persistence import PostgreSQLAuthSessionStore
@@ -27,10 +30,7 @@ from app.database_models import (
     TranscriptionMeasurement,
 )
 from app.main import app
-from app.sessions import (
-    QUESTIONS, InterviewSessionService, SessionNotFound, TransitionalProviderSessionService,
-)
-from app.speaking_metrics import measure_transcription
+from app.sessions import QUESTIONS, InterviewSessionService
 
 CORE_OPERATIONS = ("get", "submit", "list", "continue", "comparison")
 NOT_FOUND = {"detail": "Session not found."}
@@ -462,42 +462,28 @@ def test_concurrent_core_writes_preserve_owner_isolation_and_existing_revision_s
         assert listed[0]["answer"] in {"Concurrent answer A.", "Concurrent answer B."}
 
 
-def test_real_transitional_provider_dependency_is_narrow_and_keeps_existing_uuid_behavior(harness):
-    owned, legacy = harness.create(1), legacy_session(harness.factory)
-    with harness.factory.begin() as database:
-        for identifier in (owned, legacy):
-            database.add(QuestionAttempt(
-                session_id=identifier, question_index=0, attempt_number=1,
-                answer_text="Existing provider context answer.",
-            ))
-    before = persisted(harness.factory)
-    wrapper = session_routes.get_transitional_provider_session_service()
-    assert type(wrapper) is TransitionalProviderSessionService
-    assert not isinstance(wrapper, InterviewSessionService)
-    for forbidden in ("start", "submit_attempt", "continue_question", "get_attempts", "get_comparison"):
-        assert not hasattr(wrapper, forbidden)
-    metrics = measure_transcription("Hello world.", "eng", [])
-    for identifier in (owned, legacy):
-        response = wrapper.get(identifier)
-        assert response.id == identifier
-        assert response.current_question_latest_attempt_number == 1
-        assert wrapper.validate_current_question(identifier, 0, 1) is None
-        context = wrapper.get_diagnosis_context(identifier, 0, 1)
-        assert context.question == QUESTIONS[0]
-        assert context.answer == "Existing provider context answer."
-        measurement_id = wrapper.create_measurement(identifier, 0, metrics, expected_last_attempt_number=1)
-        with harness.factory() as database:
-            assert database.get(TranscriptionMeasurement, measurement_id).session_id == identifier
-    after = persisted(harness.factory)
-    assert after["interview_sessions"] == before["interview_sessions"]
-    assert after["question_attempts"] == before["question_attempts"]
-    assert after["interview_sessions"][legacy]["user_id"] is None
-    assert after["interview_sessions"][owned]["user_id"] == harness.logins[1].principal.user_id
-    with pytest.raises(SessionNotFound, match="Session not found\\."):
-        wrapper.get(uuid4())
+def test_runtime_has_no_anonymous_provider_service_or_optional_principal_path():
+    obsolete = (
+        "TransitionalProviderSessionService", "_TransitionalProviderPersistence",
+        "get_transitional_provider_session_service", "TransitionalProviderService", "_SessionPersistence",
+    )
+    runtime_root = Path(session_module.__file__).parent
+    for path in runtime_root.rglob("*.py"):
+        source = path.read_text()
+        for name in obsolete:
+            assert name not in source, f"{path.name} retains the obsolete {name} compatibility path."
+    assert InterviewSessionService.__bases__ == (object,)
+    constructor = inspect.signature(InterviewSessionService.__init__)
+    assert tuple(constructor.parameters) == ("self", "session_factory", "principal")
+    assert constructor.parameters["principal"].default is inspect.Parameter.empty
+    assert get_type_hints(InterviewSessionService.__init__)["principal"] is AuthenticatedPrincipal
+    predicate_source = inspect.getsource(InterviewSessionService._session_predicate)
+    assert "StoredInterviewSession.id" in predicate_source
+    assert "StoredInterviewSession.user_id" in predicate_source
+    assert "self._principal.user_id" in predicate_source
 
 
-def test_route_dependencies_keep_six_owned_core_routes_separate_from_three_provider_routes_and_history():
+def test_all_nine_session_routes_use_owned_authenticated_dependencies_while_history_is_unchanged():
     from app.history_routes import get_history_service
 
     def dependency_calls(dependant):
@@ -517,24 +503,32 @@ def test_route_dependencies_keep_six_owned_core_routes_separate_from_three_provi
         if not hasattr(route, "dependant"):
             continue
         dependencies = dependency_calls(route.dependant)
+        if route.endpoint in core | providers:
+            direct = {dependency.call for dependency in route.dependant.dependencies}
+            assert session_routes.get_session_service in direct
+            signature = inspect.signature(route.endpoint)
+            assert signature.parameters["sessions"].annotation == session_routes.SessionService
         if route.endpoint in core:
             seen_core.add(route.endpoint)
             assert session_routes.get_session_service in dependencies
             assert auth_http.require_authenticated_principal in dependencies
             assert auth_http.get_auth_session_store in dependencies
-            assert session_routes.get_transitional_provider_session_service not in dependencies
         elif route.endpoint in providers:
             seen_providers.add(route.endpoint)
-            assert session_routes.get_transitional_provider_session_service in dependencies
-            assert session_routes.get_session_service not in dependencies
-            assert auth_http.require_authenticated_principal not in dependencies
-            assert auth_http.get_auth_session_store not in dependencies
+            assert session_routes.get_session_service in dependencies
+            assert auth_http.require_authenticated_principal in dependencies
+            assert auth_http.get_auth_session_store in dependencies
+            if route.endpoint in (session_routes.transcribe_audio, session_routes.diagnose_attempt):
+                assert auth_http.require_authenticated_principal in direct
+                assert auth_http.get_auth_session_store in direct
+                assert signature.parameters["principal"].annotation == auth_http.AuthenticatedPrincipalDependency
+                assert signature.parameters["auth_store"].annotation == auth_http.AuthSessionStoreDependency
         elif route.path in ("/api/history/summaries", "/api/sessions/{session_id}/history-detail"):
             seen_history.add(route.path)
             assert get_history_service in dependencies
             assert session_routes.get_session_service not in dependencies
-            assert session_routes.get_transitional_provider_session_service not in dependencies
             assert auth_http.require_authenticated_principal not in dependencies
+            assert auth_http.get_auth_session_store not in dependencies
     assert seen_core == core and len(seen_core) == 6
     assert seen_providers == providers and len(seen_providers) == 3
     assert seen_history == {"/api/history/summaries", "/api/sessions/{session_id}/history-detail"}

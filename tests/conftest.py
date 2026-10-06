@@ -118,6 +118,9 @@ def authenticated_session_override(authenticated_principal, monkeypatch):
                 raise AuthenticationFailure(AuthenticationFailureKind.UNAUTHENTICATED)
             return authenticated_principal
 
+        def revalidate(self, *, principal):
+            assert principal is authenticated_principal
+
     monkeypatch.setitem(app.dependency_overrides, get_auth_session_store, lambda: Store())
 
     def bind(service):

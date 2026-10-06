@@ -12,7 +12,7 @@ from app.audio import MAX_AUDIO_BYTES, MAX_BODY_BYTES
 from app.database_models import TranscriptionMeasurement
 from app.main import app
 from app.session_routes import (
-    SessionTranscription, get_session_service, get_transitional_provider_session_service,
+    SessionTranscription, get_session_service,
 )
 from app.sessions import AttemptRequest, ContinueRequest, InterviewSessionService
 from app.transcription import (
@@ -57,7 +57,6 @@ def setup(
     service = InterviewSessionService(postgres_session_factory, authenticated_principal)
     fake = FakeTranscriber()
     app.dependency_overrides[get_session_service] = authenticated_session_override(service)
-    app.dependency_overrides[get_transitional_provider_session_service] = lambda: service
     app.dependency_overrides[get_transcription_service] = lambda: fake
     try:
         with TestClient(app, headers=authenticated_http_headers) as client:

@@ -7,7 +7,9 @@ from pydantic import Field
 from starlette.concurrency import run_in_threadpool
 
 from app.audio import AudioAccepted, bounded_multipart_request, validated_audio
-from app.auth_http import AuthenticatedPrincipalDependency
+from app.auth_http import (
+    AuthenticatedPrincipalDependency, AuthSessionStoreDependency, revalidate_authenticated_principal,
+)
 from app.comparisons import AttemptComparison
 from app.database import get_database_session_factory
 from app.delivery_metrics import DeliveryMetrics, measure_delivery
@@ -31,7 +33,6 @@ from app.sessions import (
     InterviewSessionService,
     SessionConflict,
     SessionNotFound,
-    TransitionalProviderSessionService,
 )
 
 from app.transcription import (
@@ -50,16 +51,6 @@ def get_session_service(principal: AuthenticatedPrincipalDependency) -> Intervie
 
 SessionService = Annotated[InterviewSessionService, Depends(get_session_service)]
 
-
-def get_transitional_provider_session_service() -> TransitionalProviderSessionService:
-    # Slice 6 will secure provider preflight and post-inference revalidation.
-    # Core routes must never use this deliberately isolated UUID compatibility path.
-    return TransitionalProviderSessionService(get_database_session_factory())
-
-
-TransitionalProviderService = Annotated[
-    TransitionalProviderSessionService, Depends(get_transitional_provider_session_service),
-]
 SemanticDiagnosisService = Annotated[
     SemanticDiagnosisAdapter,
     Depends(get_semantic_diagnosis_adapter),
@@ -127,8 +118,10 @@ async def diagnose_attempt(
     session_id: UUID,
     question_index: Annotated[int, Path(ge=0)],
     attempt_number: Annotated[int, Path(ge=1)],
-    sessions: TransitionalProviderService,
+    sessions: SessionService,
     diagnoser: SemanticDiagnosisService,
+    principal: AuthenticatedPrincipalDependency,
+    auth_store: AuthSessionStoreDependency,
 ) -> SemanticDiagnosis:
     try:
         context = await run_in_threadpool(
@@ -147,6 +140,17 @@ async def diagnose_attempt(
         raise HTTPException(status_code=504, detail="Semantic diagnosis timed out.") from None
     except SemanticDiagnosisFailed:
         raise HTTPException(status_code=502, detail="Unable to generate semantic diagnosis.") from None
+    await run_in_threadpool(revalidate_authenticated_principal, principal, auth_store)
+    try:
+        # A new owned read rechecks the exact persisted target after inference.
+        # Historical attempts remain diagnosable even if the question advanced.
+        current_context = await run_in_threadpool(
+            sessions.get_diagnosis_context, session_id, question_index, attempt_number,
+        )
+    except SessionNotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    if current_context != context:
+        raise HTTPException(status_code=409, detail="Attempt context no longer matches the diagnosis request.")
     return diagnosis
 
 
@@ -166,7 +170,7 @@ def get_comparison(
 
 @asynccontextmanager
 async def current_audio(
-    session_id: UUID, request: Request, sessions: TransitionalProviderSessionService,
+    session_id: UUID, request: Request, sessions: InterviewSessionService,
     *, require_attempt_revision: bool = False,
 ):
     try:
@@ -184,7 +188,7 @@ async def current_audio(
 
 
 @router.post("/{session_id}/audio", response_model=AudioAccepted)
-async def accept_audio(session_id: UUID, request: Request, sessions: TransitionalProviderService) -> AudioAccepted:
+async def accept_audio(session_id: UUID, request: Request, sessions: SessionService) -> AudioAccepted:
     async with current_audio(session_id, request, sessions) as (_, metadata, _):
         return metadata
 
@@ -206,8 +210,10 @@ class SessionTranscription(TranscriptionResult):
 
 @router.post("/{session_id}/transcriptions", response_model=SessionTranscription)
 async def transcribe_audio(
-    session_id: UUID, request: Request, sessions: TransitionalProviderService,
+    session_id: UUID, request: Request, sessions: SessionService,
     transcriber: Annotated[TranscriptionService, Depends(get_transcription_service)],
+    principal: AuthenticatedPrincipalDependency,
+    auth_store: AuthSessionStoreDependency,
 ) -> SessionTranscription:
     async with current_audio(
         session_id, request, sessions, require_attempt_revision=True,
@@ -220,6 +226,7 @@ async def transcribe_audio(
             raise HTTPException(504, "Transcription timed out. Please try again.") from None
         except TranscriptionFailed:
             raise HTTPException(502, "Unable to transcribe this recording. Try again or type your answer.") from None
+        await run_in_threadpool(revalidate_authenticated_principal, principal, auth_store)
         metrics = measure_transcription(result.text, result.language, result.words)
         delivery_metrics = measure_delivery(result.text, result.words)
         # Revalidate and persist in a separate operation after inference/calculation.

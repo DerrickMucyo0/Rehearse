@@ -1,7 +1,7 @@
-"""Cookie authentication and exact login-context binding for future routes.
+"""Cookie authentication, exact context binding and post-provider revalidation.
 
 This module registers no routes and performs no interview ownership lookup.
-Existing application routes remain anonymous until a later enforcement slice.
+Interview routes enforce this boundary; History remains a later slice.
 Cookie issuance, OIDC, logout and frontend context bootstrap are not implemented.
 
 The synchronous dependencies run in FastAPI's worker pool. Every invocation
@@ -119,3 +119,29 @@ def require_authenticated_principal(
 AuthenticatedPrincipalDependency = Annotated[
     AuthenticatedPrincipal, Depends(require_authenticated_principal),
 ]
+
+AuthSessionStoreDependency = Annotated[AuthSessionStore, Depends(get_auth_session_store)]
+
+
+def revalidate_authenticated_principal(
+    principal: AuthenticatedPrincipal, store: AuthSessionStore,
+) -> None:
+    """Check the initiating login generation, never resolve another credential.
+
+    The store owns a fresh short transaction. Async routes run this synchronous
+    boundary in the worker pool after provider work and before protected writes
+    or result release. Use the same closed HTTP failure mapping as authentication;
+    cancellation and shutdown exceptions propagate without normalization.
+    """
+    failure = None
+    try:
+        if type(principal) is not AuthenticatedPrincipal:
+            failure = AuthenticationFailureKind.UNAVAILABLE
+        else:
+            store.revalidate(principal=principal)
+    except AuthenticationFailure as error:
+        failure = _failure_kind(error)
+    except Exception:
+        failure = AuthenticationFailureKind.UNAVAILABLE
+    if failure is not None:
+        raise _http_failure(failure) from None

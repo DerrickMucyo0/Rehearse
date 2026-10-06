@@ -23,7 +23,7 @@ from app.database_models import (
 )
 from app.delivery_metrics import measure_delivery
 from app.main import app
-from app.session_routes import get_session_service, get_transitional_provider_session_service
+from app.session_routes import get_session_service
 from app.sessions import (
     AttemptRequest, ContinueRequest, InterviewSessionService, SessionConflict, SessionNotFound,
 )
@@ -74,14 +74,12 @@ def setup(postgres_session_factory, authenticated_principal, authenticated_sessi
     service = InterviewSessionService(postgres_session_factory, authenticated_principal)
     fake = FakeTranscriber()
     app.dependency_overrides[get_session_service] = authenticated_session_override(service)
-    app.dependency_overrides[get_transitional_provider_session_service] = lambda: service
     app.dependency_overrides[get_transcription_service] = lambda: fake
     try:
         with TestClient(app, raise_server_exceptions=False, headers=authenticated_http_headers) as client:
             yield client, service, fake
     finally:
         app.dependency_overrides.pop(get_session_service, None)
-        app.dependency_overrides.pop(get_transitional_provider_session_service, None)
         app.dependency_overrides.pop(get_transcription_service, None)
 
 
