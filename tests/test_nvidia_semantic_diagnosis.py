@@ -6,6 +6,7 @@ import inspect
 import json
 from pathlib import Path
 import traceback
+from types import SimpleNamespace
 from typing import get_type_hints
 from uuid import UUID
 
@@ -39,9 +40,10 @@ Client = provider.NVIDIANemotronSemanticDiagnosisClient
 
 @pytest.fixture(autouse=True)
 def only_fake_credentials_and_mock_transport(monkeypatch):
-    # Delete without reading an inherited value, then install a synthetic key.
+    # No operating-system credential is configured; only the client sees this
+    # synthetic in-memory configuration, and all HTTP is mocked.
     monkeypatch.delenv("NVIDIA_API_KEY", raising=False)
-    monkeypatch.setenv("NVIDIA_API_KEY", FAKE_KEY)
+    monkeypatch.setattr(provider, "os", SimpleNamespace(environ={"NVIDIA_API_KEY": FAKE_KEY}))
 
     async def forbidden_async_network(*args, **kwargs):
         raise AssertionError("Real HTTP transport must never run in these tests.")
@@ -90,13 +92,25 @@ def run_request(transport, context):
     return asyncio.run(Client(transport=transport).request(context))
 
 
-def assert_private_failure(error, expected_type, message, capsys, caplog):
+def assert_private_failure(
+    error, expected_type, message, capsys, caplog,
+    *, category="provider_response_contract_error", upstream_status=None,
+):
     assert type(error) is expected_type
     assert isinstance(error, RuntimeError)
     assert error.args == (message,)
     assert str(error) == message
     assert error.__cause__ is None
     assert error.__context__ is None
+    assert error.__dict__ == {}
+    if expected_type is provider.NVIDIASemanticDiagnosisFailed:
+        assert error.category == category
+        assert type(error.category) is str
+        assert error.upstream_status == upstream_status
+        assert error.upstream_status is None or type(error.upstream_status) is int
+    else:
+        assert not hasattr(error, "category")
+        assert not hasattr(error, "upstream_status")
     public = "\n".join((str(error), repr(error), "".join(traceback.format_exception(error))))
     for marker in (
         FAKE_KEY, PRIVATE_BODY, PRIVATE_HEADER, PRIVATE_METADATA,
@@ -137,9 +151,9 @@ def test_missing_configuration_never_builds_prompt_or_opens_http(
     configured_key, context, monkeypatch, capsys, caplog,
 ):
     if configured_key is None:
-        monkeypatch.delenv("NVIDIA_API_KEY")
+        monkeypatch.delitem(provider.os.environ, "NVIDIA_API_KEY")
     else:
-        monkeypatch.setenv("NVIDIA_API_KEY", configured_key)
+        monkeypatch.setitem(provider.os.environ, "NVIDIA_API_KEY", configured_key)
     calls = []
 
     def forbidden(*args, **kwargs):
@@ -160,7 +174,7 @@ def test_missing_configuration_never_builds_prompt_or_opens_http(
 
 
 def test_key_is_loaded_at_request_time_and_trimmed(context, monkeypatch):
-    monkeypatch.delenv("NVIDIA_API_KEY")
+    monkeypatch.delitem(provider.os.environ, "NVIDIA_API_KEY")
     requests = []
 
     def respond(request):
@@ -168,7 +182,7 @@ def test_key_is_loaded_at_request_time_and_trimmed(context, monkeypatch):
         return httpx.Response(200, json=envelope("synthetic raw result"))
 
     client = Client(transport=httpx.MockTransport(respond))
-    monkeypatch.setenv("NVIDIA_API_KEY", f" \t{FAKE_KEY}\r\n ")
+    monkeypatch.setitem(provider.os.environ, "NVIDIA_API_KEY", f" \t{FAKE_KEY}\r\n ")
     assert asyncio.run(client.request(context)) == "synthetic raw result"
     assert len(requests) == 1
     assert requests[0].headers["Authorization"] == f"Bearer {FAKE_KEY}"
@@ -427,7 +441,7 @@ def test_json_value_error_is_not_retained_as_context(context, monkeypatch, capsy
 
 
 @pytest.mark.parametrize("status", [
-    100, 199, 300, 301, 307, 400, 401, 403, 404, 408, 409, 429,
+    100, 199, 300, 301, 307, 400, 401, 403, 404, 408, 409, 422, 429,
     500, 502, 503, 504, 599,
 ])
 def test_non_success_http_status_never_decodes_body_or_retries(
@@ -451,7 +465,64 @@ def test_non_success_http_status_never_decodes_body_or_retries(
     assert len(requests) == 1
     assert_private_failure(
         caught.value, provider.NVIDIASemanticDiagnosisFailed, FAILURE_MESSAGE, capsys, caplog,
+        category="provider_http_error", upstream_status=status,
     )
+
+
+@pytest.mark.parametrize("status", [401, 403, 404, 422, 429, 500, 503])
+def test_http_failure_classifier_does_not_access_body_headers_or_response_metadata(
+    status, monkeypatch, capsys, caplog,
+):
+    response = httpx.Response(status, content=PRIVATE_BODY)
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("The failure classifier must inspect only HTTP status.")
+
+    for name in ("json", "read", "aread", "iter_bytes", "iter_raw", "aiter_bytes", "aiter_raw"):
+        monkeypatch.setattr(response, name, forbidden)
+    monkeypatch.setattr(httpx.Response, "content", property(forbidden))
+    monkeypatch.setattr(httpx.Response, "text", property(forbidden))
+    response.headers = object()
+
+    with pytest.raises(provider.NVIDIASemanticDiagnosisFailed) as caught:
+        provider._assistant_content(response)
+
+    assert_private_failure(
+        caught.value, provider.NVIDIASemanticDiagnosisFailed, FAILURE_MESSAGE, capsys, caplog,
+        category="provider_http_error", upstream_status=status,
+    )
+
+
+@pytest.mark.parametrize(("category", "status"), [
+    ("provider_http_error", None), ("provider_http_error", 401),
+    ("provider_transport_error", None), ("provider_response_contract_error", None),
+])
+def test_provider_failure_metadata_contains_only_allowlisted_primitives(category, status):
+    error = provider.NVIDIASemanticDiagnosisFailed(category, status)
+    assert error.category == category and type(error.category) is str
+    assert error.upstream_status == status
+    assert error.__dict__ == {}
+    assert error.args == (FAILURE_MESSAGE,)
+    assert str(error) == FAILURE_MESSAGE
+    assert repr(error) == f"NVIDIASemanticDiagnosisFailed({FAILURE_MESSAGE!r})"
+
+
+@pytest.mark.parametrize(("category", "status"), [
+    (PRIVATE_METADATA, None), (None, None), (1, None), ([], None), ({}, None),
+    ("semantic_json_contract_error", None), ("adapter_contract_error", None),
+    ("provider_http_error", True), ("provider_http_error", 401.0),
+    ("provider_http_error", PRIVATE_METADATA), ("provider_http_error", {}),
+    ("provider_transport_error", 401), ("provider_response_contract_error", 200),
+])
+def test_provider_failure_metadata_rejects_unallowlisted_values_without_formatting(category, status):
+    with pytest.raises(ValueError) as caught:
+        provider.NVIDIASemanticDiagnosisFailed(category, status)
+    assert str(caught.value) in {
+        "Invalid semantic diagnosis failure metadata.",
+        "Invalid semantic diagnosis provider failure category.",
+    }
+    assert PRIVATE_METADATA not in str(caught.value) + repr(caught.value)
+    assert caught.value.__cause__ is None and caught.value.__context__ is None
 
 
 @pytest.mark.parametrize("error_type", [
@@ -469,6 +540,7 @@ def test_network_errors_are_private_and_never_retried(error_type, context, capsy
     assert len(requests) == 1
     assert_private_failure(
         caught.value, provider.NVIDIASemanticDiagnosisFailed, FAILURE_MESSAGE, capsys, caplog,
+        category="provider_transport_error",
     )
 
 
@@ -647,6 +719,7 @@ def test_source_stays_transport_only_with_closed_imports_and_no_retry_or_state_p
             imports.append(node.module)
     assert set(imports) <= {
         "os", "httpx", "app.diagnosis", "app.semantic_diagnosis_prompt",
+        "app.semantic_diagnosis_failure",
     }
     assert {"httpx", "app.semantic_diagnosis_prompt"} <= set(imports)
     assert not any(isinstance(node, (ast.For, ast.AsyncFor, ast.While)) for node in ast.walk(tree))

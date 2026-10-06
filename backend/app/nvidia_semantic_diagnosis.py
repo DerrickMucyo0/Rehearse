@@ -9,6 +9,10 @@ import os
 import httpx
 
 from app.diagnosis import DiagnosisContext
+from app.semantic_diagnosis_failure import (
+    SemanticDiagnosisFailureCategory,
+    validate_failure_metadata,
+)
 from app.semantic_diagnosis_prompt import build_semantic_diagnosis_prompt
 
 NVIDIA_SEMANTIC_DIAGNOSIS_ENDPOINT = (
@@ -28,14 +32,32 @@ class NVIDIASemanticDiagnosisTimeout(RuntimeError):
 
 
 class NVIDIASemanticDiagnosisFailed(RuntimeError):
-    pass
+    """Fixed provider error with only a safe category and optional HTTP status."""
+
+    __slots__ = ("category", "upstream_status")
+
+    def __init__(
+        self,
+        category: SemanticDiagnosisFailureCategory,
+        upstream_status: int | None = None,
+    ) -> None:
+        validate_failure_metadata(category, upstream_status)
+        if category not in (
+            "provider_http_error",
+            "provider_transport_error",
+            "provider_response_contract_error",
+        ):
+            raise ValueError("Invalid semantic diagnosis provider failure category.") from None
+        super().__init__("Semantic diagnosis provider request failed.")
+        self.category = category
+        self.upstream_status = upstream_status
 
 
 def _assistant_content(response: httpx.Response) -> str:
     """Require one complete final message without interpreting semantic JSON."""
     if not response.is_success:
         raise NVIDIASemanticDiagnosisFailed(
-            "Semantic diagnosis provider request failed."
+            "provider_http_error", response.status_code,
         ) from None
     envelope = None
     try:
@@ -54,7 +76,7 @@ def _assistant_content(response: httpx.Response) -> str:
                 if isinstance(content, str) and content != "":
                     return content
     raise NVIDIASemanticDiagnosisFailed(
-        "Semantic diagnosis provider request failed."
+        "provider_response_contract_error",
     ) from None
 
 
@@ -113,5 +135,5 @@ class NVIDIANemotronSemanticDiagnosisClient:
                 "Semantic diagnosis provider timed out."
             ) from None
         raise NVIDIASemanticDiagnosisFailed(
-            "Semantic diagnosis provider request failed."
+            "provider_transport_error",
         ) from None

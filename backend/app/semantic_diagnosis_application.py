@@ -18,6 +18,10 @@ from app.semantic_diagnosis_adapter import (
     SemanticDiagnosisAdapter,
     SemanticDiagnosisAdapterContractError,
 )
+from app.semantic_diagnosis_failure import (
+    SemanticDiagnosisFailureCategory,
+    validate_failure_metadata,
+)
 from app.semantic_diagnosis_json import SemanticDiagnosisJSONContractError
 
 
@@ -30,7 +34,17 @@ class SemanticDiagnosisTimeout(RuntimeError):
 
 
 class SemanticDiagnosisFailed(RuntimeError):
-    pass
+    __slots__ = ("category", "upstream_status")
+
+    def __init__(
+        self,
+        category: SemanticDiagnosisFailureCategory,
+        upstream_status: int | None = None,
+    ) -> None:
+        validate_failure_metadata(category, upstream_status)
+        super().__init__("Unable to generate semantic diagnosis.")
+        self.category = category
+        self.upstream_status = upstream_status
 
 
 async def diagnose_application_attempt(
@@ -54,18 +68,21 @@ async def diagnose_application_attempt(
         failure = "unavailable"
     except NVIDIASemanticDiagnosisTimeout:
         failure = "timeout"
-    except (
-        NVIDIASemanticDiagnosisFailed,
-        SemanticDiagnosisJSONContractError,
-        SemanticDiagnosisAdapterContractError,
-    ):
+    except NVIDIASemanticDiagnosisFailed as error:
         failure = "failed"
+        category, upstream_status = error.category, error.upstream_status
+    except SemanticDiagnosisJSONContractError:
+        failure = "failed"
+        category, upstream_status = "semantic_json_contract_error", None
+    except SemanticDiagnosisAdapterContractError:
+        failure = "failed"
+        category, upstream_status = "adapter_contract_error", None
     # Raise after leaving the handlers so private exception context is discarded.
     if failure == "unavailable":
         raise SemanticDiagnosisUnavailable("Semantic diagnosis is not configured.") from None
     if failure == "timeout":
         raise SemanticDiagnosisTimeout("Semantic diagnosis timed out.") from None
-    raise SemanticDiagnosisFailed("Unable to generate semantic diagnosis.") from None
+    raise SemanticDiagnosisFailed(category, upstream_status) from None
 
 
 async def diagnose_application_context(
@@ -79,15 +96,18 @@ async def diagnose_application_context(
         failure = "unavailable"
     except NVIDIASemanticDiagnosisTimeout:
         failure = "timeout"
-    except (
-        NVIDIASemanticDiagnosisFailed,
-        SemanticDiagnosisJSONContractError,
-        SemanticDiagnosisAdapterContractError,
-    ):
+    except NVIDIASemanticDiagnosisFailed as error:
         failure = "failed"
+        category, upstream_status = error.category, error.upstream_status
+    except SemanticDiagnosisJSONContractError:
+        failure = "failed"
+        category, upstream_status = "semantic_json_contract_error", None
+    except SemanticDiagnosisAdapterContractError:
+        failure = "failed"
+        category, upstream_status = "adapter_contract_error", None
     # Raise after leaving the handlers so private exception context is discarded.
     if failure == "unavailable":
         raise SemanticDiagnosisUnavailable("Semantic diagnosis is not configured.") from None
     if failure == "timeout":
         raise SemanticDiagnosisTimeout("Semantic diagnosis timed out.") from None
-    raise SemanticDiagnosisFailed("Unable to generate semantic diagnosis.") from None
+    raise SemanticDiagnosisFailed(category, upstream_status) from None

@@ -193,6 +193,18 @@ def url(session_id=SESSION_ID, question_index=2, attempt_number=3):
     )
 
 
+def private_failure(error_type):
+    if error_type is SemanticDiagnosisFailed:
+        error = error_type("adapter_contract_error")
+    elif error_type is NVIDIASemanticDiagnosisFailed:
+        error = error_type("provider_transport_error")
+    else:
+        error = error_type(PRIVATE)
+    # Simulate private upstream text without bypassing metadata validation.
+    error.args = (PRIVATE,)
+    return error
+
+
 def test_post_matches_shared_versioned_frontend_contract_fixture(setup, capsys, caplog):
     client, reader, adapter, _, events, dependencies = setup
     fixture_path = (
@@ -312,7 +324,7 @@ def test_neutral_errors_use_fixed_http_details_despite_private_exception_text(
     setup, error_type, status, detail, capsys, caplog,
 ):
     client, reader, adapter, _, _, _ = setup
-    adapter.error = error_type(PRIVATE)
+    adapter.error = private_failure(error_type)
     response = client.post(url())
     assert response.status_code == status
     assert response.json() == {"detail": detail}
@@ -335,12 +347,71 @@ def test_existing_application_normalizes_low_level_failures_before_http_mapping(
     setup, error_type, status, detail, capsys, caplog,
 ):
     client, reader, adapter, _, _, _ = setup
-    adapter.error = error_type(PRIVATE)
+    adapter.error = private_failure(error_type)
     response = client.post(url())
     assert response.status_code == status and response.json() == {"detail": detail}
     assert PRIVATE not in response.text + caplog.text
     assert len(reader.calls) == len(adapter.calls) == 1
     assert reader.mutations == []
+    assert capsys.readouterr() == ("", "")
+
+
+@pytest.mark.parametrize("category,upstream_status,error_type", (
+    *(("provider_http_error", status, NVIDIASemanticDiagnosisFailed)
+      for status in (401, 403, 404, 422, 429, 500, 502, 503)),
+    ("provider_transport_error", None, NVIDIASemanticDiagnosisFailed),
+    ("provider_response_contract_error", None, NVIDIASemanticDiagnosisFailed),
+    ("semantic_json_contract_error", None, SemanticDiagnosisJSONContractError),
+    ("adapter_contract_error", None, SemanticDiagnosisAdapterContractError),
+))
+def test_safe_in_process_observer_captures_only_normalized_metadata_without_http_exposure(
+    setup, monkeypatch, category, upstream_status, error_type, capsys, caplog,
+):
+    client, reader, adapter, _, events, dependencies = setup
+    if error_type is NVIDIASemanticDiagnosisFailed:
+        original = error_type(category, upstream_status)
+    else:
+        original = error_type(PRIVATE)
+    original.args = (PRIVATE,)
+    adapter.error = original
+    before_context, before_state = reader.context.model_dump(), reader.state.copy()
+    actual_application = routes.diagnose_application_context
+    captured = []
+
+    async def observed(*args, **kwargs):
+        try:
+            return await actual_application(*args, **kwargs)
+        except SemanticDiagnosisFailed as error:
+            captured.append({
+                "category": error.category,
+                "upstream_status": error.upstream_status,
+            })
+            raise
+
+    monkeypatch.setattr(routes, "diagnose_application_context", observed)
+    response = client.post(url())
+
+    assert captured == [{"category": category, "upstream_status": upstream_status}]
+    assert type(captured[0]["category"]) is str
+    assert captured[0]["upstream_status"] is None or type(captured[0]["upstream_status"]) is int
+    assert response.status_code == 502
+    assert response.json() == {"detail": "Unable to generate semantic diagnosis."}
+    assert "category" not in response.json() and "upstream_status" not in response.json()
+    public_output = response.text + json.dumps(dict(response.headers))
+    for forbidden in (
+        "category", "upstream_status", "provider_http_error", "provider_transport_error",
+        "provider_response_contract_error", "semantic_json_contract_error", "adapter_contract_error",
+        "PRIVATE-PERSISTED", *PRIVATE.split(),
+    ):
+        assert forbidden not in public_output + caplog.text
+    if upstream_status is not None:
+        assert str(upstream_status) not in public_output
+    assert reader.calls == [(SESSION_ID, 2, 3)]
+    assert len(adapter.calls) == 1 and adapter.calls[0] is reader.context
+    assert dependencies == ["sessions", "diagnoser"]
+    assert events == ["reader_begin", "reader_end", "adapter_begin"]
+    assert reader.mutations == [] and reader.state == before_state
+    assert reader.context.model_dump() == before_context
     assert capsys.readouterr() == ("", "")
 
 

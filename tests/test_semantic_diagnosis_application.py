@@ -13,7 +13,7 @@ import socket
 import subprocess
 import time
 import traceback
-from typing import get_type_hints
+from typing import get_args, get_type_hints
 import urllib.request
 import uuid
 
@@ -41,11 +41,24 @@ from app.semantic_diagnosis_adapter import (
     SemanticDiagnosisAdapter,
     SemanticDiagnosisAdapterContractError,
 )
+from app.semantic_diagnosis_failure import SemanticDiagnosisFailureCategory
 from app.semantic_diagnosis_json import SemanticDiagnosisJSONContractError
 from app.sessions import SessionNotFound
 
 
 SESSION_ID = uuid.UUID("00000000-0000-4000-8000-000000000012")
+
+
+def private_provider_failure(category, upstream_status=None):
+    error = NVIDIASemanticDiagnosisFailed(category, upstream_status)
+    # Synthetic hostile internals must not be copied into normalized exceptions.
+    error.args = ("synthetic private provider detail",)
+    error.raw_response = "synthetic private response body"
+    error.authorization = "synthetic private Authorization value"
+    error.original_error = RuntimeError("synthetic private transport detail")
+    return error
+
+
 KNOWN_FAILURES = (
     (
         NVIDIASemanticDiagnosisUnavailable("synthetic private unavailable detail"),
@@ -58,7 +71,17 @@ KNOWN_FAILURES = (
         "Semantic diagnosis timed out.",
     ),
     (
-        NVIDIASemanticDiagnosisFailed("synthetic private provider detail"),
+        private_provider_failure("provider_http_error", 429),
+        application.SemanticDiagnosisFailed,
+        "Unable to generate semantic diagnosis.",
+    ),
+    (
+        private_provider_failure("provider_transport_error"),
+        application.SemanticDiagnosisFailed,
+        "Unable to generate semantic diagnosis.",
+    ),
+    (
+        private_provider_failure("provider_response_contract_error"),
         application.SemanticDiagnosisFailed,
         "Unable to generate semantic diagnosis.",
     ),
@@ -73,7 +96,18 @@ KNOWN_FAILURES = (
         "Unable to generate semantic diagnosis.",
     ),
 )
-FAILURE_IDS = ("unavailable", "timeout", "provider", "json-contract", "adapter-contract")
+FAILURE_IDS = (
+    "unavailable", "timeout", "provider-http", "provider-transport",
+    "provider-response-contract", "json-contract", "adapter-contract",
+)
+KNOWN_METADATA = (
+    None, None,
+    ("provider_http_error", 429),
+    ("provider_transport_error", None),
+    ("provider_response_contract_error", None),
+    ("semantic_json_contract_error", None),
+    ("adapter_contract_error", None),
+)
 
 
 @pytest.fixture(autouse=True)
@@ -179,6 +213,86 @@ def complete_without_suspension(coroutine):
         raise AssertionError("The synthetic adapter must finish without an event loop.")
     finally:
         coroutine.close()
+
+
+def assert_normalized_metadata(error, original):
+    index = next(index for index, failure in enumerate(KNOWN_FAILURES) if failure[0] is original)
+    expected = KNOWN_METADATA[index]
+    if expected is None:
+        assert not hasattr(error, "category")
+        assert not hasattr(error, "upstream_status")
+    else:
+        assert (error.category, error.upstream_status) == expected
+        assert type(error.category) is str
+        assert error.upstream_status is None or type(error.upstream_status) is int
+        assert error.__slots__ == ("category", "upstream_status")
+        assert not hasattr(error, "raw_response")
+        assert not hasattr(error, "authorization")
+        assert not hasattr(error, "original_error")
+    cursor = error.__traceback__
+    while cursor is not None:
+        if cursor.tb_frame.f_globals.get("__name__") == application.__name__:
+            # Python deletes the caught provider exception before public raising.
+            assert "error" not in cursor.tb_frame.f_locals
+            assert all(value is not original for value in cursor.tb_frame.f_locals.values())
+        cursor = cursor.tb_next
+
+
+@pytest.mark.parametrize("category", get_args(SemanticDiagnosisFailureCategory))
+@pytest.mark.parametrize("upstream_status", (None, 401, 429, 503))
+def test_neutral_failure_accepts_only_closed_primitive_metadata(category, upstream_status):
+    if category != "provider_http_error" and upstream_status is not None:
+        with pytest.raises(ValueError, match="^Invalid semantic diagnosis failure metadata\\.$"):
+            application.SemanticDiagnosisFailed(category, upstream_status)
+        return
+    error = application.SemanticDiagnosisFailed(category, upstream_status)
+    assert error.category == category
+    assert error.upstream_status == upstream_status
+    assert error.__slots__ == ("category", "upstream_status")
+    assert error.__dict__ == {}
+    assert error.args == ("Unable to generate semantic diagnosis.",)
+    assert str(error) == "Unable to generate semantic diagnosis."
+    assert error.__cause__ is None and error.__context__ is None
+
+
+@pytest.mark.parametrize("category,upstream_status", (
+    ("synthetic private unknown category", None),
+    ("provider_http_error ", 429),
+    ("PROVIDER_HTTP_ERROR", 429),
+    (None, None),
+    (False, None),
+    (0, None),
+    ({"private": "synthetic private metadata"}, None),
+    (["provider_http_error"], None),
+    ("provider_http_error", True),
+    ("provider_http_error", 429.0),
+    ("provider_http_error", "synthetic private status"),
+    ("provider_http_error", {"private": "synthetic private status"}),
+    ("provider_http_error", [429]),
+))
+def test_neutral_failure_rejects_unsafe_metadata_without_echoing_values(category, upstream_status):
+    with pytest.raises(ValueError) as caught:
+        application.SemanticDiagnosisFailed(category, upstream_status)
+    assert caught.value.args == ("Invalid semantic diagnosis failure metadata.",)
+    for rendered in (str(caught.value), repr(caught.value), "".join(traceback.format_exception(caught.value))):
+        assert "synthetic private" not in rendered
+
+
+def test_neutral_failure_rejects_primitive_subclasses_without_coercion():
+    class PrivateString(str):
+        def __str__(self):
+            raise AssertionError("Category must not be coerced.")
+
+    class PrivateInteger(int):
+        def __int__(self):
+            raise AssertionError("Status must not be coerced.")
+
+    for category, status in (
+        (PrivateString("provider_http_error"), None),
+        ("provider_http_error", PrivateInteger(429)),
+    ):
+        with pytest.raises(ValueError, match="^Invalid semantic diagnosis failure metadata\\.$"):
+            application.SemanticDiagnosisFailed(category, status)
 
 
 def test_public_neutral_classes_and_async_signature_match_existing_orchestration():
@@ -345,6 +459,7 @@ def test_context_only_known_failures_are_private_and_normalized_once(
     assert error.__cause__ is None
     assert error.__context__ is None
     assert error.__dict__ == {}
+    assert_normalized_metadata(error, original)
     rendered = "".join(traceback.format_exception(error))
     for public_text in (str(error), repr(error), rendered):
         assert "synthetic private" not in public_text
@@ -394,6 +509,7 @@ def test_known_failures_are_private_and_normalized_once_through_real_orchestrati
     assert error.__cause__ is None
     assert error.__context__ is None
     assert error.__dict__ == {}
+    assert_normalized_metadata(error, original)
     rendered = "".join(traceback.format_exception(error))
     for public_text in (str(error), repr(error), rendered):
         assert "synthetic private" not in public_text
@@ -514,6 +630,7 @@ def test_warmed_application_has_no_external_side_effects_or_output(
         _, neutral, message = KNOWN_FAILURES[failure]
         assert type(caught) is neutral and str(caught) == message
         assert caught.__cause__ is None and caught.__context__ is None
+        assert_normalized_metadata(caught, KNOWN_FAILURES[failure][0])
     assert reader.calls == ([(SESSION_ID, 2, 3)] if entrypoint == "attempt" else [])
     assert len(adapter.calls) == 1 and adapter.calls[0] is supplied
     assert capsys.readouterr() == ("", "")
@@ -537,6 +654,9 @@ def test_runtime_ast_has_only_neutral_exceptions_single_delegation_and_closed_fa
         "app.semantic_diagnosis_adapter": {
             "SemanticDiagnosisAdapter", "SemanticDiagnosisAdapterContractError",
         },
+        "app.semantic_diagnosis_failure": {
+            "SemanticDiagnosisFailureCategory", "validate_failure_metadata",
+        },
         "app.semantic_diagnosis_json": {"SemanticDiagnosisJSONContractError"},
     }
     statements = list(tree.body)
@@ -559,7 +679,40 @@ def test_runtime_ast_has_only_neutral_exceptions_single_delegation_and_closed_fa
     for node in classes:
         assert ast.dump(node.bases[0]) == ast.dump(ast.Name(id="RuntimeError", ctx=ast.Load()))
         assert len(node.bases) == 1 and node.keywords == [] and node.decorator_list == []
-        assert len(node.body) == 1 and isinstance(node.body[0], ast.Pass)
+        if node.name != "SemanticDiagnosisFailed":
+            assert len(node.body) == 1 and isinstance(node.body[0], ast.Pass)
+        else:
+            assert len(node.body) == 2
+            assert ast.dump(node.body[0]) == ast.dump(ast.Assign(
+                targets=[ast.Name(id="__slots__", ctx=ast.Store())],
+                value=ast.Tuple(
+                    elts=[ast.Constant(value="category"), ast.Constant(value="upstream_status")],
+                    ctx=ast.Load(),
+                ),
+            ))
+            initializer = node.body[1]
+            assert isinstance(initializer, ast.FunctionDef) and initializer.name == "__init__"
+            assert [argument.arg for argument in initializer.args.args] == [
+                "self", "category", "upstream_status",
+            ]
+            assert len(initializer.body) == 4
+            assert ast.dump(initializer.body[0]) == ast.dump(ast.Expr(value=ast.Call(
+                func=ast.Name(id="validate_failure_metadata", ctx=ast.Load()),
+                args=[ast.Name(id="category", ctx=ast.Load()), ast.Name(id="upstream_status", ctx=ast.Load())],
+                keywords=[],
+            )))
+            assert ast.dump(initializer.body[1]) == ast.dump(ast.Expr(value=ast.Call(
+                func=ast.Attribute(
+                    value=ast.Call(func=ast.Name(id="super", ctx=ast.Load()), args=[], keywords=[]),
+                    attr="__init__", ctx=ast.Load(),
+                ),
+                args=[ast.Constant(value="Unable to generate semantic diagnosis.")], keywords=[],
+            )))
+            for assignment, field in zip(initializer.body[2:], ("category", "upstream_status")):
+                assert ast.dump(assignment) == ast.dump(ast.Assign(
+                    targets=[ast.Attribute(value=ast.Name(id="self", ctx=ast.Load()), attr=field, ctx=ast.Store())],
+                    value=ast.Name(id=field, ctx=ast.Load()),
+                ))
     functions = declarations[3:]
     assert all(isinstance(function, ast.AsyncFunctionDef) for function in functions)
     assert [function.name for function in functions] == [
@@ -568,9 +721,9 @@ def test_runtime_ast_has_only_neutral_exceptions_single_delegation_and_closed_fa
     assert all(function.decorator_list == [] for function in functions)
     assert sum(isinstance(node, ast.ClassDef) for node in ast.walk(tree)) == 3
     assert sum(isinstance(node, ast.AsyncFunctionDef) for node in ast.walk(tree)) == 2
-    assert not any(isinstance(node, ast.FunctionDef) for node in ast.walk(tree))
+    assert sum(isinstance(node, ast.FunctionDef) for node in ast.walk(tree)) == 1
     forbidden_nodes = (
-        ast.Import, ast.Attribute, ast.For, ast.AsyncFor, ast.While, ast.With, ast.AsyncWith,
+        ast.Import, ast.For, ast.AsyncFor, ast.While, ast.With, ast.AsyncWith,
         ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp,
     )
     assert not any(isinstance(node, forbidden_nodes) for node in ast.walk(tree))
@@ -599,34 +752,53 @@ def test_runtime_ast_has_only_neutral_exceptions_single_delegation_and_closed_fa
         assert len(guarded.body) == 1 and isinstance(guarded.body[0], ast.Return)
         assert guarded.body[0].value is awaits[0]
         expected_handlers = (
-            ({"NVIDIASemanticDiagnosisUnavailable"}, "unavailable"),
-            ({"NVIDIASemanticDiagnosisTimeout"}, "timeout"),
-            ({"NVIDIASemanticDiagnosisFailed", "SemanticDiagnosisJSONContractError",
-              "SemanticDiagnosisAdapterContractError"}, "failed"),
+            ("NVIDIASemanticDiagnosisUnavailable", "unavailable", None),
+            ("NVIDIASemanticDiagnosisTimeout", "timeout", None),
+            ("NVIDIASemanticDiagnosisFailed", "failed", "provider"),
+            ("SemanticDiagnosisJSONContractError", "failed", "semantic_json_contract_error"),
+            ("SemanticDiagnosisAdapterContractError", "failed", "adapter_contract_error"),
         )
         assert len(guarded.handlers) == len(expected_handlers)
-        for handler, (names, category) in zip(guarded.handlers, expected_handlers):
-            assert handler.name is None
-            caught_types = handler.type.elts if isinstance(handler.type, ast.Tuple) else [handler.type]
-            assert all(isinstance(node, ast.Name) for node in caught_types)
-            assert {node.id for node in caught_types} == names
-            assert len(handler.body) == 1
+        for handler, (name, failure, metadata_category) in zip(guarded.handlers, expected_handlers):
+            assert handler.name == ("error" if metadata_category == "provider" else None)
+            assert isinstance(handler.type, ast.Name) and handler.type.id == name
+            assert len(handler.body) == (1 if metadata_category is None else 2)
             assert ast.dump(handler.body[0]) == ast.dump(ast.Assign(
-                targets=[ast.Name(id="failure", ctx=ast.Store())], value=ast.Constant(value=category),
+                targets=[ast.Name(id="failure", ctx=ast.Store())], value=ast.Constant(value=failure),
             ))
+            if metadata_category is not None:
+                values = (
+                    [ast.Attribute(value=ast.Name(id="error", ctx=ast.Load()), attr=field, ctx=ast.Load())
+                     for field in ("category", "upstream_status")]
+                    if metadata_category == "provider"
+                    else [ast.Constant(value=metadata_category), ast.Constant(value=None)]
+                )
+                assert ast.dump(handler.body[1]) == ast.dump(ast.Assign(
+                    targets=[ast.Tuple(
+                        elts=[ast.Name(id=field, ctx=ast.Store()) for field in ("category", "upstream_status")],
+                        ctx=ast.Store(),
+                    )],
+                    value=ast.Tuple(elts=values, ctx=ast.Load()),
+                ))
+        attributes = [node for node in ast.walk(function) if isinstance(node, ast.Attribute)]
+        assert len(attributes) == 2
+        assert all(isinstance(node.value, ast.Name) and node.value.id == "error" for node in attributes)
+        assert {node.attr for node in attributes} == {"category", "upstream_status"}
         # Known types are caught without retaining the original; all public raises
-        # occur after the handler and contain only their fixed public messages.
+        # occur after the handler with fixed messages or closed primitive metadata.
         messages = {
             "SemanticDiagnosisUnavailable": "Semantic diagnosis is not configured.",
             "SemanticDiagnosisTimeout": "Semantic diagnosis timed out.",
-            "SemanticDiagnosisFailed": "Unable to generate semantic diagnosis.",
         }
         raises = [node for node in ast.walk(function) if isinstance(node, ast.Raise)]
         assert len(raises) == 3
         for node in raises:
-            assert node.exc.func.id in messages
+            assert node.exc.func.id in neutral_names
             assert node.exc.keywords == []
-            assert len(node.exc.args) == 1 and node.exc.args[0].value == messages[node.exc.func.id]
+            if node.exc.func.id == "SemanticDiagnosisFailed":
+                assert [argument.id for argument in node.exc.args] == ["category", "upstream_status"]
+            else:
+                assert len(node.exc.args) == 1 and node.exc.args[0].value == messages[node.exc.func.id]
             assert isinstance(node.cause, ast.Constant) and node.cause.value is None
     for forbidden in (
         "FastAPI", "APIRouter", "Depends", "HTTPException", "starlette", "SQLAlchemy",
