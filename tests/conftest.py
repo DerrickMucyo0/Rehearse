@@ -9,10 +9,13 @@ from sqlalchemy import delete, inspect, text
 from sqlalchemy.exc import SQLAlchemyError
 
 from app.database import create_database_engine, create_session_factory, get_test_database_url
-from app.database_models import StoredInterviewSession
+from app.database_models import AuthSession, StoredInterviewSession, User
 
 ROOT = Path(__file__).resolve().parents[1]
-TABLES = {"interview_sessions", "question_attempts", "transcription_measurements"}
+TABLES = {
+    "interview_sessions", "question_attempts", "transcription_measurements",
+    "users", "auth_sessions",
+}
 
 
 def migration_config(connection):
@@ -63,3 +66,6 @@ def postgres_session_factory(postgres_engine):
     finally:
         with postgres_engine.begin() as connection:
             connection.execute(delete(StoredInterviewSession))
+            # User FKs are restrictive: remove their children before test users.
+            connection.execute(delete(AuthSession))
+            connection.execute(delete(User))
