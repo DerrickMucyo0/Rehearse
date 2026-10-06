@@ -7,6 +7,7 @@ import {
   getSemanticDiagnosis, isConflictError, SemanticDiagnosisError, startInterview, submitAttempt,
 } from './interviewApi'
 import type { Attempt, AttemptComparison, InterviewSession, SemanticDiagnosis } from './interviewApi'
+import { personalizedDrillForFocus } from './personalizedDrills'
 
 const SESSION_KEY = 'rehearse.session_id'
 type Mode = 'composing' | 'review'
@@ -122,6 +123,7 @@ export default function Interview({ onSessionAccess, onNavigationBusyChange, onH
   const blocked = operation !== null || transcribing || recovery !== null
   const navigationBlocked = blocked || audioBusy
   const feedback = diagnosis.status !== 'idle' && ownsDiagnosis(view, diagnosis.target) ? diagnosis : null
+  const drill = feedback?.status === 'success' ? personalizedDrillForFocus(feedback.diagnosis.next_focus) : null
 
   useLayoutEffect(() => {
     onNavigationBusyChange?.(navigationBlocked)
@@ -410,6 +412,11 @@ export default function Interview({ onSessionAccess, onNavigationBusyChange, onH
                   <p>{feedback.diagnosis.next_focus_reason}</p>
                   <h4>Retry instruction</h4>
                   <p>{feedback.diagnosis.retry_instruction}</p>
+                  {drill && <section aria-label="Practice drill">
+                    <h4>{drill.title}</h4>
+                    <p>{drill.goal}</p>
+                    <ol>{drill.steps.map((step, index) => <li key={index}>{step}</li>)}</ol>
+                  </section>}
                 </>}
               </section>}
               <div className="attempt-actions">
