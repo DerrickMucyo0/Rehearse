@@ -1,5 +1,4 @@
-"""Known-session history reads, without account ownership or enumeration."""
-from functools import lru_cache
+"""Authenticated, owner-scoped History discovery and compatibility reads."""
 from typing import Annotated
 from uuid import UUID
 
@@ -10,10 +9,12 @@ from fastapi.routing import APIRoute
 from pydantic import ValidationError
 from sqlalchemy.exc import SQLAlchemyError
 
-from app.database import DatabaseConfigurationError, create_database_engine, create_session_factory
+from app.auth_http import AuthenticatedPrincipalDependency
+from app.database import DatabaseConfigurationError, get_database_session_factory
 from app.history import (
-    HistoryBatchRequest, HistoryDetail, HistoryDetailQuery, HistoryIntegrityError,
-    HistoryReadService, HistorySummaries,
+    HISTORY_DISCOVERY_DEFAULT_LIMIT, HISTORY_DISCOVERY_MAX_LIMIT,
+    HistoryBatchRequest, HistoryCursorError, HistoryDetail, HistoryDetailQuery, HistoryIntegrityError,
+    HistoryReadService, HistorySummaries, HistorySummaryPage,
 )
 from app.sessions import SessionNotFound
 
@@ -39,7 +40,7 @@ class HistoryRoute(APIRoute):
         async def guarded(request):
             try:
                 response = await original(request)
-            except RequestValidationError:
+            except (RequestValidationError, HistoryCursorError):
                 # Normal request validation status, without echoing supplied values.
                 response = JSONResponse(status_code=422, content={"detail": "Invalid history request."})
             except SessionNotFound:
@@ -49,8 +50,17 @@ class HistoryRoute(APIRoute):
             except (SQLAlchemyError, DatabaseConfigurationError):
                 response = JSONResponse(status_code=503, content={"detail": "Session history is temporarily unavailable."})
             except HTTPException as error:
-                # Only fixed validation messages are raised by the handlers below.
-                response = JSONResponse(status_code=error.status_code, content={"detail": "Invalid history request."})
+                # Preserve the established closed authentication mapping, while
+                # still suppressing arbitrary HTTPException details from reads.
+                auth_details = {
+                    401: "Authentication required.",
+                    403: "Invalid authentication request context.",
+                    503: "Authentication is temporarily unavailable.",
+                }
+                detail = auth_details.get(error.status_code)
+                if detail is None or error.detail != detail:
+                    detail = "Invalid history request."
+                response = JSONResponse(status_code=error.status_code, content={"detail": detail})
             except Exception:
                 # Unexpected read/serialization failures must not expose stored
                 # facts through exception text or bypass the cache policy.
@@ -64,16 +74,11 @@ class HistoryRoute(APIRoute):
 router = APIRouter(tags=["history"], route_class=HistoryRoute)
 
 
-@lru_cache(maxsize=1)
-def get_history_service() -> HistoryReadService:
+def get_history_service(principal: AuthenticatedPrincipalDependency) -> HistoryReadService:
     # Defer configuration until a validated request performs its first read.
     # Invalid requests therefore retain normal 422 behavior without a database.
-    # Existing mutation dependencies and connection defaults are unchanged.
-    @lru_cache(maxsize=1)
-    def configured_factory():
-        return create_session_factory(create_database_engine())
-
-    return HistoryReadService(lambda: configured_factory()())
+    # Share the existing cached factory only, never a principal or ORM Session.
+    return HistoryReadService(lambda: get_database_session_factory()(), principal)
 
 
 HistoryService = Annotated[HistoryReadService, Depends(get_history_service)]
@@ -84,6 +89,17 @@ def history_summaries(body: HistoryBatchRequest, request: Request, history: Hist
     if request.query_params:
         raise HTTPException(status_code=422, detail="Invalid history request.")
     return history.get_summaries(body.session_ids)
+
+
+@router.get("/api/history/summaries", response_model=HistorySummaryPage)
+def discover_history(
+    request: Request, history: HistoryService,
+    limit: Annotated[int, Query(ge=1, le=HISTORY_DISCOVERY_MAX_LIMIT)] = HISTORY_DISCOVERY_DEFAULT_LIMIT,
+    cursor: Annotated[str | None, Query(min_length=1, max_length=512)] = None,
+) -> HistorySummaryPage:
+    if set(request.query_params) - {"limit", "cursor"}:
+        raise HTTPException(status_code=422, detail="Invalid history request.")
+    return history.get_discovery(limit=limit, cursor=cursor)
 
 
 @router.get("/api/sessions/{session_id}/history-detail", response_model=HistoryDetail)

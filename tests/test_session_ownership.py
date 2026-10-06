@@ -483,7 +483,7 @@ def test_runtime_has_no_anonymous_provider_service_or_optional_principal_path():
     assert "self._principal.user_id" in predicate_source
 
 
-def test_all_nine_session_routes_use_owned_authenticated_dependencies_while_history_is_unchanged():
+def test_all_session_and_history_routes_use_owned_authenticated_dependencies():
     from app.history_routes import get_history_service
 
     def dependency_calls(dependant):
@@ -524,11 +524,14 @@ def test_all_nine_session_routes_use_owned_authenticated_dependencies_while_hist
                 assert signature.parameters["principal"].annotation == auth_http.AuthenticatedPrincipalDependency
                 assert signature.parameters["auth_store"].annotation == auth_http.AuthSessionStoreDependency
         elif route.path in ("/api/history/summaries", "/api/sessions/{session_id}/history-detail"):
-            seen_history.add(route.path)
+            seen_history.add((route.path, tuple(sorted(route.methods))))
             assert get_history_service in dependencies
             assert session_routes.get_session_service not in dependencies
-            assert auth_http.require_authenticated_principal not in dependencies
-            assert auth_http.get_auth_session_store not in dependencies
+            assert auth_http.require_authenticated_principal in dependencies
+            assert auth_http.get_auth_session_store in dependencies
     assert seen_core == core and len(seen_core) == 6
     assert seen_providers == providers and len(seen_providers) == 3
-    assert seen_history == {"/api/history/summaries", "/api/sessions/{session_id}/history-detail"}
+    assert seen_history == {
+        ("/api/history/summaries", ("GET",)), ("/api/history/summaries", ("POST",)),
+        ("/api/sessions/{session_id}/history-detail", ("GET",)),
+    }

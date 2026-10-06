@@ -1,4 +1,4 @@
-"""Capability-scoped history reads against isolated, real PostgreSQL.
+"""Owner-scoped history reads against isolated, real PostgreSQL.
 
 All measurements are synthetic and enter through the normal session service.
 The transport guard prohibits transcription providers and other HTTP requests.
@@ -70,14 +70,14 @@ def sessions(postgres_session_factory, authenticated_principal):
 
 
 @pytest.fixture
-def history(postgres_session_factory):
-    return HistoryReadService(postgres_session_factory)
+def history(postgres_session_factory, authenticated_principal):
+    return HistoryReadService(postgres_session_factory, authenticated_principal)
 
 
 @pytest.fixture
 def client(sessions, history, authenticated_session_override, authenticated_http_headers):
     app.dependency_overrides[get_session_service] = authenticated_session_override(sessions)
-    app.dependency_overrides[get_history_service] = lambda: history
+    app.dependency_overrides[get_history_service] = authenticated_session_override(history)
     try:
         with TestClient(app, raise_server_exceptions=False, headers=authenticated_http_headers) as result:
             yield result
@@ -150,7 +150,7 @@ def data_statement(statement):
     return statement.lstrip().upper().startswith(("SELECT", "WITH"))
 
 
-def test_batch_reads_only_explicit_capabilities_and_missing_ids_keep_first_order(client, sessions):
+def test_batch_reads_only_requested_owned_sessions_and_missing_ids_keep_first_order(client, sessions):
     first, second, hidden = (sessions.start() for _ in range(3))
     submit(sessions, hidden.id, answer="PRIVATE-UNREQUESTED-ANSWER")
     unknown, other_unknown = uuid4(), uuid4()
@@ -166,7 +166,13 @@ def test_batch_reads_only_explicit_capabilities_and_missing_ids_keep_first_order
     assert response.headers["Cache-Control"] == "no-store"
     assert str(hidden.id) not in response.text
     assert "PRIVATE-UNREQUESTED-ANSWER" not in response.text
-    assert client.get("/api/history/summaries").status_code in {404, 405}
+    discovery = client.get("/api/history/summaries")
+    assert discovery.status_code == 200
+    assert {item["session_id"] for item in discovery.json()["items"]} == {
+        str(first.id), str(second.id), str(hidden.id),
+    }
+    assert discovery.json()["next_cursor"] is None
+    assert "PRIVATE-UNREQUESTED-ANSWER" not in discovery.text
     assert client.get("/api/sessions").status_code in {404, 405}
 
 
@@ -591,12 +597,22 @@ def test_query_count_is_constant_at_batch_and_page_limits_and_summaries_never_se
 
     small = capture(lambda: history.get_summaries(identifiers[:1]))
     full = capture(lambda: history.get_summaries(identifiers))
-    assert 1 <= len(small) == len(full) <= 3
+    assert len(small) == len(full) == 2
     assert all("answer_text" not in statement.lower() for statement in small + full)
-    assert all("delivery_measurement_version" in statement.lower() for statement in small + full)
+    for statements in (small, full):
+        assert "interview_sessions.user_id" in statements[0].lower()
+        assert "question_attempts" not in statements[0].lower()
+        assert "transcription_measurements" not in statements[0].lower()
+        assert "delivery_measurement_version" in statements[1].lower()
     one = capture(lambda: history.get_detail(identifiers[0], question_index=0, limit=1))
     twenty = capture(lambda: history.get_detail(identifiers[0], question_index=0, limit=20))
-    assert 1 <= len(one) == len(twenty) <= 4
+    assert len(one) == len(twenty) == 3
+    for statements in (one, twenty):
+        assert "interview_sessions.user_id" in statements[0].lower()
+        assert "question_attempts" not in statements[0].lower()
+        assert "transcription_measurements" not in statements[0].lower()
+        assert "answer_text" not in statements[1].lower()
+        assert "answer_text" in statements[2].lower()
     assert not any("FOR UPDATE" in statement.upper() for statements in captures for statement in statements)
 
 
@@ -691,7 +707,8 @@ def test_history_reads_leave_existing_comparison_endpoint_unchanged(
     assert client.get(url).json() == before.json()
 
 
-def test_history_survives_service_and_engine_reconstruction(history, sessions, postgres_engine):
+def test_history_survives_service_and_engine_reconstruction(
+        history, sessions, postgres_engine, authenticated_principal):
     created = sessions.start()
     measured_attempt(sessions, created.id, delivery=delivery())
     advance(sessions, created.id)
@@ -700,7 +717,7 @@ def test_history_survives_service_and_engine_reconstruction(history, sessions, p
     postgres_engine.dispose()
     rebuilt_engine = create_database_engine(postgres_engine.url)
     try:
-        rebuilt = HistoryReadService(create_session_factory(rebuilt_engine))
+        rebuilt = HistoryReadService(create_session_factory(rebuilt_engine), authenticated_principal)
         assert rebuilt.get_summaries([created.id]) == expected_summary
         assert rebuilt.get_detail(created.id, question_index=0) == expected_detail
     finally:
@@ -718,12 +735,20 @@ def test_history_snapshot_stays_coherent_without_blocking_retry_and_continue(
     ))
     reader_executed, release_reader, writer_finished = Event(), Event(), Event()
     results, errors = {}, {}
+    reader_statements = []
 
     def pause_reader(connection, cursor, statement, parameters, context, executemany):
-        if (current_thread().name != "history-snapshot-reader" or
-                not data_statement(statement) or reader_executed.is_set()):
+        if current_thread().name != "history-snapshot-reader" or not data_statement(statement):
             return
+        reader_statements.append(statement)
         assert "FOR UPDATE" not in statement.upper()
+        if reader_executed.is_set():
+            return
+        # Establish the repeatable-read snapshot at the owner-filtered root
+        # lookup, before the concurrent writer changes attempts and finalization.
+        assert "interview_sessions.user_id" in statement.lower()
+        assert "question_attempts" not in statement.lower()
+        assert "transcription_measurements" not in statement.lower()
         reader_executed.set()
         if not release_reader.wait(10):
             raise AssertionError("History snapshot reader was not released")
@@ -765,6 +790,7 @@ def test_history_snapshot_stays_coherent_without_blocking_retry_and_continue(
         event.remove(postgres_engine, "after_cursor_execute", pause_reader)
     assert all(not worker.is_alive() for worker in started)
     assert errors == {}
+    assert len(reader_statements) == (2 if operation == "summaries" else 3)
     summary = results["read"]["summaries"][0] if operation == "summaries" else results["read"]["summary"]
     assert summary["total_attempt_count"] == 2
     assert summary["finalized_question_count"] == 1

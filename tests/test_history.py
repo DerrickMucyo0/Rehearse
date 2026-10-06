@@ -9,11 +9,16 @@ from fastapi.testclient import TestClient
 from pydantic import ValidationError
 from sqlalchemy.exc import SQLAlchemyError
 
-from app import history, history_routes
+from app import auth_http, history, history_routes
+from app.auth import AuthenticatedPrincipal, AuthenticationFailure, AuthenticationFailureKind
+from app.auth_http import (
+    AUTH_REQUEST_CONTEXT_HEADER, AUTH_SESSION_COOKIE_NAME,
+    AuthenticatedPrincipalDependency, get_auth_session_store,
+)
 from app.database import DatabaseConfigurationError
 from app.history import (
     FinalizedPoint, HistoryAttempt, HistoryBatchRequest, HistoryDetail,
-    HistoryDetailQuery, HistoryIntegrityError, HistoryMeasurement, HistorySummaries,
+    HistoryDetailQuery, HistoryIntegrityError, HistoryMeasurement, HistorySummaries, HistorySummaryPage,
     QuestionOverview, SelectedQuestion, SessionSummary,
 )
 from app.main import app
@@ -128,6 +133,10 @@ def history_summaries():
     return HistorySummaries(summaries=[session_summary()], missing_session_ids=[SECOND_ID])
 
 
+def history_summary_page():
+    return HistorySummaryPage(items=[session_summary()], next_cursor=None)
+
+
 class OfflineHistoryService:
     """Concrete typed read results; no engine, ORM session, or provider exists."""
 
@@ -152,21 +161,49 @@ class OfflineHistoryService:
             raise self.error
         return history_detail(selected=question_index is not None)
 
+    def get_discovery(self, limit=10, cursor=None):
+        self.calls.append(("discovery", limit, cursor))
+        if self.error is not None:
+            raise self.error
+        return history_summary_page()
+
 
 @pytest.fixture
 def offline_client(monkeypatch) -> Iterator[tuple[TestClient, OfflineHistoryService]]:
     service = OfflineHistoryService()
+    expected_principal = AuthenticatedPrincipal(
+        user_id=UUID("00000000-0000-4000-8000-000000000021"),
+        auth_session_id=UUID("00000000-0000-4000-8000-000000000022"),
+        request_context="synthetic-offline-history-context",
+    )
+
+    class Store:
+        def resolve(self, *, credential):
+            if credential != "synthetic-offline-history-credential":
+                raise AuthenticationFailure(AuthenticationFailureKind.UNAUTHENTICATED)
+            return expected_principal
+
+        def revalidate(self, *, principal):
+            raise AssertionError("Read-only History has no post-provider revalidation phase.")
+
+    def history_override(principal: AuthenticatedPrincipalDependency):
+        assert principal is expected_principal
+        return service
 
     def forbidden_factory(*args, **kwargs):
         raise AssertionError("History reads must not resolve a database or transcription factory.")
 
-    monkeypatch.setattr(history_routes, "create_database_engine", forbidden_factory)
-    monkeypatch.setattr(history_routes, "create_session_factory", forbidden_factory)
+    monkeypatch.setattr(history_routes, "get_database_session_factory", forbidden_factory)
+    monkeypatch.setattr(auth_http, "get_database_session_factory", forbidden_factory)
     previous_overrides = app.dependency_overrides.copy()
-    app.dependency_overrides[history_routes.get_history_service] = lambda: service
+    app.dependency_overrides[history_routes.get_history_service] = history_override
+    app.dependency_overrides[get_auth_session_store] = lambda: Store()
     app.dependency_overrides[get_transcription_service] = forbidden_factory
     try:
-        with TestClient(app) as client:
+        with TestClient(app, headers={
+            "Cookie": f"{AUTH_SESSION_COOKIE_NAME}=synthetic-offline-history-credential",
+            AUTH_REQUEST_CONTEXT_HEADER: expected_principal.request_context,
+        }) as client:
             yield client, service
     finally:
         app.dependency_overrides.clear()
@@ -320,7 +357,7 @@ def test_measurement_rejects_incoherent_availability_and_unsupported_source(chan
 
 
 @pytest.mark.parametrize("build", [
-    finalized_point, session_summary, history_summaries, question_overview,
+    finalized_point, session_summary, history_summaries, history_summary_page, question_overview,
     history_attempt, selected_question, history_detail,
 ])
 def test_all_history_response_models_reject_extra_sensitive_fields(build):
@@ -335,6 +372,7 @@ def test_all_history_response_models_reject_extra_sensitive_fields(build):
     (finalized_point, "attempt_number", 3),
     (session_summary, "total_attempt_count", 99),
     (history_summaries, "missing_session_ids", []),
+    (history_summary_page, "next_cursor", "replacement-cursor"),
     (question_overview, "attempt_count", 99),
     (history_attempt, "answer_text", PRIVATE_MARKER),
     (selected_question, "has_more", True),
@@ -529,7 +567,7 @@ def invalid_stored_measurement():
     (lambda: RuntimeError(PRIVATE_MARKER), 500, "Session history is temporarily unavailable."),
     (lambda: TypeError(PRIVATE_MARKER), 500, "Session history is temporarily unavailable."),
 ])
-@pytest.mark.parametrize("endpoint", ["summaries", "detail"])
+@pytest.mark.parametrize("endpoint", ["summaries", "discovery", "detail"])
 def test_read_errors_have_fixed_status_detail_and_no_store(
     offline_client, error_factory, status, detail, endpoint,
 ):
@@ -537,6 +575,8 @@ def test_read_errors_have_fixed_status_detail_and_no_store(
     service.error = error_factory()
     if endpoint == "summaries":
         response = client.post("/api/history/summaries", json={"session_ids": [str(FIRST_ID)]})
+    elif endpoint == "discovery":
+        response = client.get("/api/history/summaries")
     else:
         response = client.get(f"/api/sessions/{FIRST_ID}/history-detail")
     assert response.status_code == status
@@ -553,55 +593,55 @@ def test_configured_factory_failure_is_offline_sanitized_and_not_cached(
     client, service = offline_client
     factory_calls = []
 
-    def unavailable_engine():
-        factory_calls.append("engine")
+    def unavailable_factory():
+        factory_calls.append("factory")
         raise error_type(PRIVATE_MARKER)
 
     app.dependency_overrides.pop(history_routes.get_history_service)
-    history_routes.get_history_service.cache_clear()
-    monkeypatch.setattr(history_routes, "create_database_engine", unavailable_engine)
-    try:
-        for _ in range(2):
-            response = client.post("/api/history/summaries", json={"session_ids": [str(FIRST_ID)]})
-            assert response.status_code == 503
-            assert response.headers["Cache-Control"] == "no-store"
-            assert response.json() == {"detail": "Session history is temporarily unavailable."}
-            assert PRIVATE_MARKER not in response.text
-    finally:
-        history_routes.get_history_service.cache_clear()
-    assert factory_calls == ["engine", "engine"]
+    monkeypatch.setattr(history_routes, "get_database_session_factory", unavailable_factory)
+    for _ in range(2):
+        response = client.post("/api/history/summaries", json={"session_ids": [str(FIRST_ID)]})
+        assert response.status_code == 503
+        assert response.headers["Cache-Control"] == "no-store"
+        assert response.json() == {"detail": "Session history is temporarily unavailable."}
+        assert PRIVATE_MARKER not in response.text
+    assert factory_calls == ["factory", "factory"]
     assert service.calls == []
 
 
-@pytest.mark.parametrize("endpoint", ["summaries", "detail"])
+@pytest.mark.parametrize("endpoint", ["summaries", "discovery", "detail"])
 def test_invalid_request_needs_no_database_configuration_or_factory(offline_client, endpoint):
     client, service = offline_client
     app.dependency_overrides.pop(history_routes.get_history_service)
-    history_routes.get_history_service.cache_clear()
-    try:
-        if endpoint == "summaries":
-            response = client.post("/api/history/summaries", json={"session_ids": []})
-        else:
-            response = client.get(f"/api/sessions/{FIRST_ID}/history-detail", params={
-                "after_attempt_number": 1,
-            })
-        assert response.status_code == 422
-        assert response.headers["Cache-Control"] == "no-store"
-        assert response.json() == {"detail": "Invalid history request."}
-        assert service.calls == []
-    finally:
-        history_routes.get_history_service.cache_clear()
-
-
-def test_no_global_history_or_session_enumeration_route_exists(offline_client):
-    client, service = offline_client
-    assert client.get("/api/history/summaries").status_code == 405
-    assert client.get("/api/sessions").status_code == 405
+    if endpoint == "summaries":
+        response = client.post("/api/history/summaries", json={"session_ids": []})
+    elif endpoint == "discovery":
+        response = client.get("/api/history/summaries", params={"limit": 0})
+    else:
+        response = client.get(f"/api/sessions/{FIRST_ID}/history-detail", params={
+            "after_attempt_number": 1,
+        })
+    assert response.status_code == 422
+    assert response.headers["Cache-Control"] == "no-store"
+    assert response.json() == {"detail": "Invalid history request."}
     assert service.calls == []
 
 
+@pytest.mark.parametrize("limit", [None, 1, 20])
+def test_discovery_uses_bounded_page_contract_without_changing_session_routes(offline_client, limit):
+    client, service = offline_client
+    response = client.get("/api/history/summaries", params={} if limit is None else {"limit": limit})
+    assert response.status_code == 200
+    assert response.json() == history_summary_page().model_dump(mode="json")
+    assert set(response.json()) == {"items", "next_cursor"}
+    assert response.headers["Cache-Control"] == "no-store"
+    assert PRIVATE_MARKER not in response.text and SELECTED_ANSWER not in response.text
+    assert service.calls == [("discovery", 10 if limit is None else limit, None)]
+    assert client.get("/api/sessions").status_code == 405
+
+
 @pytest.mark.parametrize(("method", "path", "allowed"), [
-    ("GET", "/api/history/summaries", "POST"),
+    ("PUT", "/api/history/summaries", "POST"),
     ("DELETE", "/api/history/summaries", "POST"),
     ("POST", f"/api/sessions/{FIRST_ID}/history-detail", "GET"),
     ("HEAD", f"/api/sessions/{FIRST_ID}/history-detail", "GET"),

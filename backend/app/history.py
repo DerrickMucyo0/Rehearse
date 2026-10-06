@@ -1,30 +1,43 @@
-"""Capability-scoped, read-only projections of persisted practice facts.
+"""Owner-scoped, read-only projections of persisted practice facts.
 
 These reads select exact attempt-linked measurements, never infer or recalculate
 them. No answer text is loaded for summaries or question overviews.
 """
+import base64
+import binascii
+import json
 from dataclasses import dataclass
 from collections.abc import Callable
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Annotated, Literal
 from uuid import UUID
 
 from pydantic import (
     AwareDatetime, BaseModel, ConfigDict, Field, field_validator, model_validator,
 )
-from sqlalchemy import and_, func, select, text
+from sqlalchemy import and_, func, or_, select, text
 from sqlalchemy.orm import Session
 
+from app.auth import AuthenticatedPrincipal
 from app.comparisons import MeasurementSnapshot, delivery_snapshot
 from app.database_models import QuestionAttempt, StoredInterviewSession, TranscriptionMeasurement
 from app.sessions import SessionNotFound
 
 Nonnegative = Annotated[int, Field(strict=True, ge=0)]
 Positive = Annotated[int, Field(strict=True, gt=0)]
+HISTORY_DISCOVERY_DEFAULT_LIMIT = 10
+HISTORY_DISCOVERY_MAX_LIMIT = 20
 
 
 class HistoryIntegrityError(Exception):
     """Stored facts violate the supported lifecycle; never expose their values."""
+
+
+class HistoryCursorError(ValueError):
+    """Invalid continuation facts; never include supplied cursor content."""
+
+    def __init__(self) -> None:
+        super().__init__("Invalid history request.")
 
 
 class HistoryBatchRequest(BaseModel):
@@ -51,6 +64,13 @@ class HistoryDetailQuery(BaseModel):
         if self.after_attempt_number is not None and self.question_index is None:
             raise ValueError("An attempt cursor requires a question index.")
         return self
+
+
+class HistoryDiscoveryQuery(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    limit: Annotated[int, Field(strict=True, ge=1, le=HISTORY_DISCOVERY_MAX_LIMIT)] = HISTORY_DISCOVERY_DEFAULT_LIMIT
+    cursor: Annotated[str, Field(strict=True, min_length=1, max_length=512)] | None = None
 
 
 class HistoryMeasurement(MeasurementSnapshot):
@@ -103,6 +123,11 @@ class SessionSummary(ReadModel):
 class HistorySummaries(ReadModel):
     summaries: list[SessionSummary]
     missing_session_ids: list[UUID]
+
+
+class HistorySummaryPage(ReadModel):
+    items: list[SessionSummary]
+    next_cursor: str | None
 
 
 class QuestionOverview(ReadModel):
@@ -193,11 +218,41 @@ def _measurement(row) -> HistoryMeasurement | None:
     )
 
 
-class HistoryReadService:
-    """One bounded batch projection; fixed queries for a selected detail page."""
+def _encode_cursor(created_at: datetime, identifier: UUID) -> str:
+    # Ordering facts only, never identity or authorization. Canonical encoding
+    # makes malformed/noncanonical cursors fail without leaking their contents.
+    payload = json.dumps(
+        [created_at.astimezone(timezone.utc).isoformat(), str(identifier)],
+        separators=(",", ":"),
+    ).encode("ascii")
+    return base64.urlsafe_b64encode(payload).decode("ascii").rstrip("=")
 
-    def __init__(self, session_factory: Callable[[], Session]) -> None:
+
+def _decode_cursor(cursor: str) -> tuple[datetime, UUID]:
+    try:
+        raw = base64.b64decode(cursor + "=" * (-len(cursor) % 4), altchars=b"-_", validate=True)
+        facts = json.loads(raw)
+        if (type(facts) is not list or len(facts) != 2 or
+                any(type(value) is not str for value in facts)):
+            raise ValueError()
+        created_at, identifier = datetime.fromisoformat(facts[0]), UUID(facts[1])
+        if created_at.tzinfo is None or _encode_cursor(created_at, identifier) != cursor:
+            raise ValueError()
+        return created_at, identifier
+    except (ValueError, TypeError, UnicodeError, binascii.Error, OverflowError):
+        raise HistoryCursorError() from None
+
+
+class HistoryReadService:
+    """Request-owned reads; authorize roots before querying their child facts."""
+
+    def __init__(
+        self, session_factory: Callable[[], Session], principal: AuthenticatedPrincipal,
+    ) -> None:
+        if type(principal) is not AuthenticatedPrincipal:
+            raise TypeError("History reads require an authenticated principal.")
         self._session_factory = session_factory
+        self._principal = principal
 
     @staticmethod
     def _read_only(database: Session) -> None:
@@ -209,13 +264,47 @@ class HistoryReadService:
         identifiers = HistoryBatchRequest(session_ids=session_ids).session_ids
         with self._session_factory() as database:
             self._read_only(database)
-            reads = self._read_sessions(database, identifiers)
+            owned = self._owned_identifiers(database, identifiers)
+            reads = self._read_sessions(database, owned) if owned else {}
         summaries = sorted(reads.values(), key=lambda item: item.summary.session_id.int)
         summaries.sort(key=lambda item: item.summary.last_saved_activity_at, reverse=True)
         return HistorySummaries(
             summaries=[item.summary for item in summaries],
             missing_session_ids=[identifier for identifier in identifiers if identifier not in reads],
         )
+
+    def get_discovery(self, limit: int = HISTORY_DISCOVERY_DEFAULT_LIMIT, cursor: str | None = None) -> HistorySummaryPage:
+        query = HistoryDiscoveryQuery(limit=limit, cursor=cursor)
+        continuation = _decode_cursor(query.cursor) if query.cursor is not None else None
+        with self._session_factory() as database:
+            self._read_only(database)
+            statement = select(StoredInterviewSession.id, StoredInterviewSession.created_at).where(
+                StoredInterviewSession.user_id == self._principal.user_id,
+            )
+            if continuation is not None:
+                created_at, identifier = continuation
+                statement = statement.where(or_(
+                    StoredInterviewSession.created_at < created_at,
+                    and_(StoredInterviewSession.created_at == created_at, StoredInterviewSession.id < identifier),
+                ))
+            # Stable keyset pagination, independent of mutable practice activity.
+            roots = database.execute(statement.order_by(
+                StoredInterviewSession.created_at.desc(), StoredInterviewSession.id.desc(),
+            ).limit(query.limit + 1)).all()
+            included = roots[:query.limit]
+            reads = self._read_sessions(database, [row.id for row in included]) if included else {}
+            return HistorySummaryPage(
+                items=[reads[row.id].summary for row in included],
+                next_cursor=_encode_cursor(included[-1].created_at, included[-1].id)
+                if len(roots) > query.limit else None,
+            )
+
+    def _owned_identifiers(self, database: Session, identifiers: list[UUID]) -> list[UUID]:
+        # Root-only authorization precedes any attempts or measurements query.
+        return list(database.scalars(select(StoredInterviewSession.id).where(
+            StoredInterviewSession.id.in_(identifiers),
+            StoredInterviewSession.user_id == self._principal.user_id,
+        )))
 
     def get_detail(
         self, session_id: UUID, question_index: int | None = None,
@@ -226,6 +315,8 @@ class HistoryReadService:
         )
         with self._session_factory() as database:
             self._read_only(database)
+            if not self._owned_identifiers(database, [session_id]):
+                raise SessionNotFound()
             read = self._read_sessions(database, [session_id]).get(session_id)
             if read is None:
                 raise SessionNotFound()
@@ -265,8 +356,7 @@ class HistoryReadService:
                 )
             return HistoryDetail(summary=read.summary, questions=read.questions, selected_question=page)
 
-    @staticmethod
-    def _read_sessions(database: Session, identifiers: list[UUID]) -> dict[UUID, _SessionRead]:
+    def _read_sessions(self, database: Session, identifiers: list[UUID]) -> dict[UUID, _SessionRead]:
         # Aggregate only named sessions. Neither retry rows nor answer text are
         # materialized for a summary; one latest row per practiced question joins.
         counts = (
@@ -299,7 +389,10 @@ class HistoryReadService:
                 QuestionAttempt.attempt_number == counts.c.latest_attempt_number,
             ))
             .outerjoin(TranscriptionMeasurement, _measurement_join())
-            .where(StoredInterviewSession.id.in_(identifiers))
+            .where(
+                StoredInterviewSession.id.in_(identifiers),
+                StoredInterviewSession.user_id == self._principal.user_id,
+            )
             .order_by(StoredInterviewSession.id, counts.c.question_index)
         ).mappings().all()
         grouped = {}
