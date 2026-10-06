@@ -2,10 +2,17 @@
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { afterEach, beforeEach, expect, test, vi } from 'vitest'
 import Interview from './Interview'
-import type { Attempt, AttemptComparison, DeliveryMetricChange, InterviewSession, MetricChange } from './interviewApi'
+import type { Attempt, AttemptComparison, DeliveryMetricChange, InterviewSession, MetricChange, SemanticDiagnosis } from './interviewApi'
 
 const storageKey = 'rehearse.session_id'
 const questions = ['Question one', 'Question two', 'Question three', 'Question four', 'Question five']
+const diagnosis: SemanticDiagnosis = {
+  diagnosis_version: 'semantic-diagnosis-v1',
+  addressed_question: 'partially', addressed_question_reason: 'The example addresses part of the question.',
+  strengths: ['The personal contribution is concrete.'], missing_information: ['Explain the result of the work.'],
+  structure: 'mixed', structure_feedback: 'Connect the action to its result.', next_focus: 'supporting_detail',
+  next_focus_reason: 'Support the account with a concrete outcome.', retry_instruction: 'Add the result to your next attempt.',
+}
 type SavedAttempt = Attempt
 type Metric = MetricChange
 type Comparison = AttemptComparison
@@ -71,6 +78,13 @@ function mockSessionApi(initial = freshSession()) {
       session = freshSession(`session-${creations}`)
       return response(session, 201)
     }
+    const diagnosisMatch = url.match(/^\/api\/sessions\/([^/]+)\/questions\/(\d+)\/attempts\/(\d+)\/diagnosis$/)
+    if (diagnosisMatch && options?.method === 'POST') {
+      expect(diagnosisMatch[1]).toBe(session.id)
+      expect(saved(Number(diagnosisMatch[2])).some((attempt) => attempt.attempt_number === Number(diagnosisMatch[3]))).toBe(true)
+      expect(options.body).toBeUndefined()
+      return response(diagnosis)
+    }
     const match = url.match(/\/questions\/(\d+)\/(attempts|continue|comparison)$/)
     if (match) {
       const questionIndex = Number(match[1])
@@ -133,6 +147,30 @@ function postedBody(api: ReturnType<typeof mockSessionApi>, suffix: string, inde
 function comparisonRow(label: string) {
   const row = screen.getByRole('row', { name: new RegExp(label) })
   return within(row).getAllByRole('cell').map((cell) => cell.textContent)
+}
+function deferredResponse() {
+  let resolve!: (value: Response) => void
+  let reject!: (reason: unknown) => void
+  const promise = new Promise<Response>((accept, fail) => { resolve = accept; reject = fail })
+  return { promise, resolve, reject }
+}
+function pendingDiagnoses(api: ReturnType<typeof mockSessionApi>) {
+  const pending: Array<ReturnType<typeof deferredResponse> & { signal: AbortSignal }> = []
+  api.intercept((url, options) => {
+    if (url.endsWith('/diagnosis') && options?.method === 'POST') {
+      const request = { ...deferredResponse(), signal: options.signal as AbortSignal }
+      pending.push(request)
+      // Deliberately ignore abort here so tests also prove generation/target guards.
+      return request.promise
+    }
+    return undefined
+  })
+  return pending
+}
+function feedback() { return screen.getByRole('region', { name: 'Answer feedback' }) }
+function expectReviewActionsEnabled() {
+  expect((screen.getByRole('button', { name: /^Retry(?: Again)?$/ }) as HTMLButtonElement).disabled).toBe(false)
+  expect((screen.getByRole('button', { name: 'Continue' }) as HTMLButtonElement).disabled).toBe(false)
 }
 
 test('a fresh question composes and stores only the session ID for reload', async () => {
@@ -659,4 +697,435 @@ test('persistent read disagreement is bounded and requires Recheck without perfo
   await screen.findByRole('button', { name: 'Continue' })
   expect(screen.getByRole('heading', { name: 'Attempt 3' })).toBeTruthy()
   expect(api.fetchMock.mock.calls.filter(([, options]) => options?.method === 'POST')).toHaveLength(0)
+})
+
+test('diagnosis waits for coherent saved review, then renders semantic feedback separately for the acknowledged attempt', async () => {
+  const api = mockSessionApi()
+  const localStorageBefore = JSON.stringify(localStorage)
+  const refresh = deferredResponse()
+  let acknowledged = false
+  let waitingRead = false
+  api.intercept((url, options) => {
+    if (url.endsWith('/attempts') && options?.method === 'POST') {
+      const body = JSON.parse(options.body as string) as { answer: string }
+      const attempt = api.append(body.answer)
+      acknowledged = true
+      return response({ attempt, session: api.session() }, 201)
+    }
+    if (acknowledged && !waitingRead && url === '/api/sessions/session-1' && options?.method !== 'POST') {
+      waitingRead = true
+      return refresh.promise
+    }
+    return undefined
+  })
+  const factsChanged = vi.fn()
+  render(<Interview onHistoryFactsChange={factsChanged} />); await start()
+  fireEvent.change(screen.getByRole('textbox'), { target: { value: 'Persisted answer' } })
+  fireEvent.click(screen.getByRole('button', { name: 'Submit Attempt' }))
+  await screen.findByText('Persisted answer', { exact: true })
+  await waitFor(() => expect(waitingRead).toBe(true))
+  expect(api.posts('/diagnosis')).toHaveLength(0)
+  expect(screen.queryByRole('region', { name: 'Answer feedback' })).toBeNull()
+  await act(async () => refresh.resolve(response(api.session())))
+  await screen.findByRole('region', { name: 'Answer feedback' })
+  await within(feedback()).findByText(diagnosis.addressed_question_reason)
+  expect(api.posts('/diagnosis')).toHaveLength(1)
+  const [url, options] = api.posts('/diagnosis')[0]
+  expect(url).toBe('/api/sessions/session-1/questions/0/attempts/1/diagnosis')
+  expect(options?.method).toBe('POST')
+  expect(options?.body).toBeUndefined()
+  for (const label of ['Question addressed', 'Strengths', 'Missing information', 'Structure', 'Next focus', 'Retry instruction']) {
+    expect(within(feedback()).getByText(label, { exact: true })).toBeTruthy()
+  }
+  for (const text of ['Partially', 'Mixed', 'Supporting detail', diagnosis.strengths[0], diagnosis.missing_information[0],
+    diagnosis.structure_feedback, diagnosis.next_focus_reason, diagnosis.retry_instruction]) {
+    expect(within(feedback()).getByText(text, { exact: true })).toBeTruthy()
+  }
+  expect(screen.queryByText(/diagnosis_version|semantic-diagnosis-v1/)).toBeNull()
+  expect(within(feedback()).queryByText('Persisted answer', { exact: true })).toBeNull()
+  expect(within(feedback()).queryByText(/Words per minute|Recognized words|Timed pauses/)).toBeNull()
+  expect(api.posts('/attempts')).toHaveLength(1)
+  expect(api.posts('/continue')).toHaveLength(0)
+  expect(api.saved()).toHaveLength(1)
+  expect(factsChanged).toHaveBeenCalledTimes(2)
+  expectReviewActionsEnabled()
+  expect(JSON.stringify(sessionStorage)).not.toContain(diagnosis.retry_instruction)
+  expect(JSON.stringify(localStorage)).toBe(localStorageBefore)
+})
+
+test('diagnosis targets the acknowledged sparse attempt number, question, session and persisted identity', async () => {
+  const api = mockSessionApi({ ...freshSession('existing-session'), current_question_index: 2, current_question: questions[2] })
+  api.append('Earlier authoritative answer', null, 7)
+  await restore(api)
+  await screen.findByRole('button', { name: 'Continue' })
+  expect(api.posts('/diagnosis')).toHaveLength(0)
+  api.intercept((url, options) => {
+    if (url.endsWith('/attempts') && options?.method === 'POST') {
+      const body = JSON.parse(options.body as string) as { answer: string }
+      const attempt = api.append(body.answer)
+      attempt.id = 'server-persisted-exact-identity'
+      return response({ attempt, session: api.session() }, 201)
+    }
+    return undefined
+  })
+  await retry(); await submit('Acknowledged eighth attempt')
+  await within(feedback()).findByText(diagnosis.retry_instruction)
+  expect(api.posts('/diagnosis').map(([url]) => url)).toEqual([
+    '/api/sessions/existing-session/questions/2/attempts/8/diagnosis',
+  ])
+  expect(api.saved().at(-1)?.id).toBe('server-persisted-exact-identity')
+  expect(api.saved()).toHaveLength(2)
+  expect(screen.getByRole('heading', { name: 'Attempt 8' })).toBeTruthy()
+})
+
+test.each(['newer attempt', 'different identity', 'advanced question'] as const)(
+  'no diagnosis is requested when coherent refresh displays a %s instead of the acknowledged target', async (replacement) => {
+    const api = mockSessionApi()
+    let acknowledged = false
+    let replaced = false
+    api.intercept((url, options) => {
+      if (url.endsWith('/attempts') && options?.method === 'POST') {
+        const attempt = api.append('Acknowledged answer')
+        acknowledged = true
+        return response({ attempt, session: api.session() }, 201)
+      }
+      if (acknowledged && !replaced && url === '/api/sessions/session-1' && options?.method !== 'POST') {
+        replaced = true
+        if (replacement === 'newer attempt') api.append('Newer answer from another tab')
+        else if (replacement === 'different identity') api.saved().at(-1)!.id = 'different-persisted-identity'
+        else api.advance()
+      }
+      return undefined
+    })
+    render(<Interview />); await start()
+    fireEvent.change(screen.getByRole('textbox'), { target: { value: 'Acknowledged answer' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Submit Attempt' }))
+    await waitFor(() => expect(replaced).toBe(true))
+    if (replacement === 'advanced question') {
+      await screen.findByText('Question 2 of 5')
+      await waitFor(() => expect((screen.getByRole('button', { name: 'Record Answer' }) as HTMLButtonElement).disabled).toBe(false))
+    } else await waitFor(expectReviewActionsEnabled)
+    expect(api.posts('/diagnosis')).toHaveLength(0)
+    expect(screen.queryByRole('region', { name: 'Answer feedback' })).toBeNull()
+  },
+)
+
+test('pending semantic feedback leaves Retry, Continue and interview navigation independently enabled', async () => {
+  const api = mockSessionApi()
+  const pending = pendingDiagnoses(api)
+  const navigationBusy = vi.fn()
+  render(<Interview onNavigationBusyChange={navigationBusy} />); await start(); await submit('Saved answer')
+  expect(pending).toHaveLength(1)
+  const region = feedback()
+  expect(region.getAttribute('aria-busy')).toBe('true')
+  expect(within(region).getByRole('status').textContent).toBe('Generating answer feedback…')
+  expect(screen.getByRole('region', { name: 'Interview practice' }).getAttribute('aria-busy')).toBe('false')
+  expect(navigationBusy.mock.calls.at(-1)).toEqual([false])
+  expectReviewActionsEnabled()
+  expect(api.posts('/attempts')).toHaveLength(1)
+  expect(api.posts('/continue')).toHaveLength(0)
+})
+
+test.each([
+  [404, 'Feedback is no longer available for this attempt.'],
+  [502, 'Unable to generate feedback right now. You can still retry or continue.'],
+  [503, 'Feedback is unavailable right now. You can still retry or continue.'],
+  [504, 'Feedback took too long. You can still retry or continue.'],
+] as const)('diagnosis HTTP %s stays local to feedback and does not enter mutation recovery', async (status, message) => {
+  const api = mockSessionApi()
+  const pending = pendingDiagnoses(api)
+  const factsChanged = vi.fn()
+  render(<Interview onHistoryFactsChange={factsChanged} />); await start(); await submit('Saved answer')
+  const calls = api.fetchMock.mock.calls.length
+  await act(async () => pending[0].resolve(response({ detail: 'PRIVATE_BACKEND_DIAGNOSTIC_TEXT' }, status)))
+  await within(feedback()).findByText(message)
+  expectReviewActionsEnabled()
+  expect(screen.getByText('Saved answer', { exact: true })).toBeTruthy()
+  expect(screen.getByRole('heading', { name: 'Attempt 1' })).toBeTruthy()
+  expect(screen.queryByRole('button', { name: 'Recheck saved state' })).toBeNull()
+  expect(screen.queryByText(/result is unknown|review could not be loaded|PRIVATE_BACKEND/)).toBeNull()
+  expect(api.fetchMock.mock.calls).toHaveLength(calls)
+  expect(api.posts('/diagnosis')).toHaveLength(1)
+  expect(api.posts('/attempts')).toHaveLength(1)
+  expect(api.session().current_question_latest_attempt_number).toBe(1)
+  expect(factsChanged).toHaveBeenCalledTimes(2)
+})
+
+test.each(['network', 'malformed'] as const)('a %s diagnosis failure preserves successful attempt review and controls', async (failure) => {
+  const api = mockSessionApi()
+  const pending = pendingDiagnoses(api)
+  render(<Interview />); await start(); await submit('Saved answer')
+  const calls = api.fetchMock.mock.calls.length
+  await act(async () => {
+    if (failure === 'network') pending[0].reject(new TypeError('PRIVATE_EXCEPTION_TEXT'))
+    else pending[0].resolve(response({ ...diagnosis, next_focus: 'PRIVATE_INVALID_ENUM' }))
+  })
+  const expected = failure === 'network'
+    ? 'Unable to load feedback right now. You can still retry or continue.'
+    : 'Unable to generate feedback right now. You can still retry or continue.'
+  await within(feedback()).findByText(expected)
+  expectReviewActionsEnabled()
+  expect(screen.getByText('Saved answer', { exact: true })).toBeTruthy()
+  expect(screen.queryByRole('button', { name: 'Recheck saved state' })).toBeNull()
+  expect(document.body.textContent).not.toContain('PRIVATE_')
+  expect(api.fetchMock.mock.calls).toHaveLength(calls)
+})
+
+test('semantic completion does not change the authoritative speaking/delivery comparison or history facts', async () => {
+  const api = mockSessionApi()
+  api.append('Before')
+  const speaking = { recognized_word_count: metric(12, 20), um_count: metric(0, 0), uh_count: metric(1, 0),
+    timed_utterance_span_seconds: { ...metric(2.2, 3.1), delta: 0.9000000000000001 },
+    estimated_words_per_minute: { ...metric(150.02, 148.99), delta: -1.0300000000000011 } }
+  const zeroPause: DeliveryMetricChange = { ...metric(0, 0), before_unavailable_reason: null, after_unavailable_reason: null }
+  const delivery = { before_version: 'delivery-metrics-v1', after_version: 'delivery-metrics-v1',
+    before_source: 'original_transcription', after_source: 'original_transcription',
+    pause_count: zeroPause, total_pause_duration_seconds: zeroPause, longest_pause_seconds: zeroPause }
+  const pending = pendingDiagnoses(api)
+  const factsChanged = vi.fn()
+  sessionStorage.setItem(storageKey, api.session().id)
+  render(<Interview onHistoryFactsChange={factsChanged} />)
+  await screen.findByRole('button', { name: 'Continue' })
+  api.setComparison({ session_id: api.session().id, question_index: 0,
+    before_attempt: { id: api.saved()[0].id, attempt_number: 1, measurement_id: null, measurement_version: null, measurement_source: null },
+    after_attempt: { id: 'attempt-0-2', attempt_number: 2, measurement_id: null, measurement_version: null, measurement_source: null },
+    comparison: speaking, delivery_comparison: delivery })
+  await retry(); await submit('After')
+  await screen.findByRole('table', { name: 'Speaking duration is shown in seconds.' })
+  const tableBefore = screen.getAllByRole('table').map((table) => table.textContent)
+  const storedBefore = JSON.stringify(api.comparison(0))
+  const calls = api.fetchMock.mock.calls.length
+  const historyChanges = factsChanged.mock.calls.length
+  await act(async () => pending[0].resolve(response(diagnosis)))
+  await within(feedback()).findByText(diagnosis.retry_instruction)
+  expect(screen.getAllByRole('table').map((table) => table.textContent)).toEqual(tableBefore)
+  expect(JSON.stringify(api.comparison(0))).toBe(storedBefore)
+  expect(comparisonRow('Recognized words')).toEqual(['12', '20', '+8'])
+  expect(comparisonRow('Words per minute')).toEqual(['150.0', '149.0', '-1.0'])
+  expect(api.fetchMock.mock.calls).toHaveLength(calls)
+  expect(factsChanged).toHaveBeenCalledTimes(historyChanges)
+})
+
+test('empty semantic lists are not fabricated and returned text is rendered as text', async () => {
+  const api = mockSessionApi()
+  const text = '<img src=x onerror=alert(1)>'
+  api.intercept((url) => url.endsWith('/diagnosis') ? response({ ...diagnosis, addressed_question: 'no',
+    strengths: [], missing_information: [], structure: 'insufficient_content', next_focus: 'answer_the_question',
+    retry_instruction: text }) : undefined)
+  render(<Interview />); await start(); await submit('Saved answer')
+  await within(feedback()).findByText(text, { exact: true })
+  expect(within(feedback()).queryByText('Strengths', { exact: true })).toBeNull()
+  expect(within(feedback()).queryByText('Missing information', { exact: true })).toBeNull()
+  expect(within(feedback()).getByText('No', { exact: true })).toBeTruthy()
+  expect(within(feedback()).getByText('Not enough content', { exact: true })).toBeTruthy()
+  expect(within(feedback()).getByText('Answer the question', { exact: true })).toBeTruthy()
+  expect(within(feedback()).queryByRole('img')).toBeNull()
+})
+
+test.each(['rejected', 'conflict', 'network', 'malformed acknowledgement', 'review failure'] as const)(
+  '%s submission and its recovery reads do not request diagnosis', async (failure) => {
+    const api = mockSessionApi()
+    let failWrite = true
+    let failRead = failure === 'review failure'
+    api.intercept((url, options) => {
+      if (failWrite && url.endsWith('/attempts') && options?.method === 'POST') {
+        failWrite = false
+        if (failure === 'rejected') return response({ detail: 'PRIVATE_VALIDATION_MESSAGE' }, 422)
+        if (failure === 'conflict') {
+          api.append('Saved in another tab')
+          return response({ detail: 'PRIVATE_CONFLICT_MESSAGE' }, 409)
+        }
+        if (failure === 'network') { api.append('Saved answer'); return Promise.reject(new TypeError('Private transport text')) }
+        if (failure === 'malformed acknowledgement') { api.append('Saved answer'); return response({ unexpected: true }, 201) }
+        const attempt = api.append('Saved answer')
+        return response({ attempt, session: api.session() }, 201)
+      }
+      if (failRead && url === '/api/sessions/session-1' && options?.method !== 'POST') {
+        failRead = false
+        return Promise.reject(new TypeError('Private review failure'))
+      }
+      return undefined
+    })
+    render(<Interview />); await start()
+    fireEvent.change(screen.getByRole('textbox'), { target: { value: 'Saved answer' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Submit Attempt' }))
+    await screen.findByRole('alert')
+    expect(api.posts('/diagnosis')).toHaveLength(0)
+    const recheck = screen.queryByRole('button', { name: 'Recheck saved state' })
+    if (recheck) {
+      fireEvent.click(recheck)
+      await waitFor(expectReviewActionsEnabled)
+      expect(api.posts('/diagnosis')).toHaveLength(0)
+    }
+    expect(api.posts('/attempts')).toHaveLength(1)
+    expect(screen.queryByRole('region', { name: 'Answer feedback' })).toBeNull()
+  },
+)
+
+test('restored review, ordinary rerender and Cancel Retry never trigger diagnosis', async () => {
+  const api = mockSessionApi()
+  api.append('Restored persisted answer')
+  sessionStorage.setItem(storageKey, api.session().id)
+  const component = render(<Interview />)
+  await screen.findByRole('button', { name: 'Continue' })
+  await waitFor(expectReviewActionsEnabled)
+  component.rerender(<Interview onHistoryFactsChange={vi.fn()} />)
+  await retry()
+  fireEvent.click(screen.getByRole('button', { name: 'Cancel Retry' }))
+  await waitFor(expectReviewActionsEnabled)
+  expect(api.posts('/diagnosis')).toHaveLength(0)
+  expect(api.posts('/attempts')).toHaveLength(0)
+  expect(api.posts('/continue')).toHaveLength(0)
+  expect(screen.queryByRole('region', { name: 'Answer feedback' })).toBeNull()
+})
+
+test.each(['success', 'error'] as const)('late diagnosis %s stays invalidated through Retry and Cancel Retry', async (settlement) => {
+  const api = mockSessionApi()
+  const pending = pendingDiagnoses(api)
+  render(<Interview />); await start(); await submit('Saved answer')
+  const calls = api.fetchMock.mock.calls.length
+  await retry()
+  expect(pending[0].signal.aborted).toBe(true)
+  expect(screen.queryByRole('region', { name: 'Answer feedback' })).toBeNull()
+  fireEvent.click(screen.getByRole('button', { name: 'Cancel Retry' }))
+  await waitFor(expectReviewActionsEnabled)
+  await act(async () => {
+    if (settlement === 'success') pending[0].resolve(response({ ...diagnosis, retry_instruction: 'STALE_RETRY_FEEDBACK' }))
+    else pending[0].reject(new TypeError('STALE_RETRY_FAILURE'))
+  })
+  expect(screen.queryByRole('region', { name: 'Answer feedback' })).toBeNull()
+  expect(screen.queryByRole('alert')).toBeNull()
+  expect(api.fetchMock.mock.calls).toHaveLength(calls)
+  expect(api.posts('/diagnosis')).toHaveLength(1)
+  expect(api.posts('/attempts')).toHaveLength(1)
+  expect(api.posts('/continue')).toHaveLength(0)
+})
+
+test.each([
+  ['success', 'pending Continue'], ['error', 'pending Continue'],
+  ['success', 'changed question'], ['error', 'changed question'],
+] as const)('late diagnosis %s is ignored with %s', async (settlement, stage) => {
+  const api = mockSessionApi()
+  const diagnosisResponse = deferredResponse()
+  const continueResponse = deferredResponse()
+  let diagnosisSignal!: AbortSignal
+  api.intercept((url, options) => {
+    if (url.endsWith('/diagnosis')) { diagnosisSignal = options?.signal as AbortSignal; return diagnosisResponse.promise }
+    if (url.endsWith('/continue') && options?.method === 'POST') return continueResponse.promise
+    return undefined
+  })
+  render(<Interview />); await start(); await submit('Saved answer')
+  fireEvent.click(screen.getByRole('button', { name: 'Continue' }))
+  expect(diagnosisSignal.aborted).toBe(true)
+  expect(api.posts('/continue')).toHaveLength(1)
+  expect(screen.getByText('Question 1 of 5')).toBeTruthy()
+  expect(screen.queryByRole('region', { name: 'Answer feedback' })).toBeNull()
+  if (stage === 'changed question') {
+    await act(async () => continueResponse.resolve(response(api.advance())))
+    await screen.findByText('Question 2 of 5')
+  }
+  await act(async () => {
+    if (settlement === 'success') diagnosisResponse.resolve(response({ ...diagnosis, retry_instruction: 'STALE_CONTINUE_FEEDBACK' }))
+    else diagnosisResponse.reject(new TypeError('STALE_CONTINUE_FAILURE'))
+  })
+  expect(screen.queryByRole('region', { name: 'Answer feedback' })).toBeNull()
+  expect(screen.queryByRole('alert')).toBeNull()
+  if (stage === 'pending Continue') {
+    await act(async () => continueResponse.resolve(response(api.advance())))
+    await screen.findByText('Question 2 of 5')
+  }
+  expect(screen.queryByRole('region', { name: 'Answer feedback' })).toBeNull()
+  expect(api.posts('/diagnosis')).toHaveLength(1)
+})
+
+test.each(['success', 'error'] as const)('old diagnosis %s/final completion cannot replace a newer request or clear its loading state', async (settlement) => {
+  const api = mockSessionApi()
+  const pending = pendingDiagnoses(api)
+  render(<Interview />); await start(); await submit('First saved answer')
+  await retry(); await submit('Second saved answer')
+  expect(pending).toHaveLength(2)
+  expect(pending[0].signal.aborted).toBe(true)
+  expect(pending[1].signal.aborted).toBe(false)
+  await act(async () => {
+    if (settlement === 'success') pending[0].resolve(response({ ...diagnosis, retry_instruction: 'STALE_OLDER_FEEDBACK' }))
+    else pending[0].reject(new TypeError('STALE_OLDER_FAILURE'))
+  })
+  expect(within(feedback()).getByRole('status').textContent).toBe('Generating answer feedback…')
+  expect(feedback().getAttribute('aria-busy')).toBe('true')
+  expect(screen.queryByRole('alert')).toBeNull()
+  expect(document.body.textContent).not.toContain('STALE_OLDER')
+  await act(async () => pending[1].resolve(response({ ...diagnosis, retry_instruction: 'CURRENT_SECOND_FEEDBACK' })))
+  await within(feedback()).findByText('CURRENT_SECOND_FEEDBACK')
+  expect(screen.queryByText('Generating answer feedback…')).toBeNull()
+  expect(api.posts('/diagnosis').map(([url]) => url)).toEqual([
+    '/api/sessions/session-1/questions/0/attempts/1/diagnosis',
+    '/api/sessions/session-1/questions/0/attempts/2/diagnosis',
+  ])
+  expect(api.posts('/attempts')).toHaveLength(2)
+  expectReviewActionsEnabled()
+})
+
+test.each(['success', 'error'] as const)('an old diagnosis %s cannot replace completed newer feedback', async (settlement) => {
+  const api = mockSessionApi()
+  const pending = pendingDiagnoses(api)
+  render(<Interview />); await start(); await submit('First saved answer')
+  await retry(); await submit('Second saved answer')
+  await act(async () => pending[1].resolve(response({ ...diagnosis, retry_instruction: 'CURRENT_COMPLETED_FEEDBACK' })))
+  await within(feedback()).findByText('CURRENT_COMPLETED_FEEDBACK')
+  await act(async () => {
+    if (settlement === 'success') pending[0].resolve(response({ ...diagnosis, retry_instruction: 'STALE_COMPLETED_FEEDBACK' }))
+    else pending[0].reject(new TypeError('STALE_COMPLETED_FAILURE'))
+  })
+  expect(within(feedback()).getByText('CURRENT_COMPLETED_FEEDBACK')).toBeTruthy()
+  expect(screen.queryByRole('alert')).toBeNull()
+  expect(document.body.textContent).not.toContain('STALE_COMPLETED')
+})
+
+test.each(['success', 'error'] as const)('late diagnosis %s from a previous session is ignored after the reachable restart flow', async (settlement) => {
+  const api = mockSessionApi()
+  const diagnosisResponse = deferredResponse()
+  let diagnosisSignal!: AbortSignal
+  api.intercept((url, options) => {
+    if (url.endsWith('/diagnosis')) { diagnosisSignal = options?.signal as AbortSignal; return diagnosisResponse.promise }
+    if (url.endsWith('/continue') && options?.method === 'POST') return response({ detail: 'Private unavailable text' }, 503)
+    return undefined
+  })
+  render(<Interview />); await start(); await submit('Previous session answer')
+  // Start New Interview is offered by the existing recovery UI after a failed Continue.
+  fireEvent.click(screen.getByRole('button', { name: 'Continue' }))
+  await screen.findByRole('button', { name: 'Start New Interview' })
+  fireEvent.click(screen.getByRole('button', { name: 'Start New Interview' }))
+  await screen.findByRole('textbox', { name: 'Your answer' })
+  await waitFor(() => expect((screen.getByRole('button', { name: 'Submit Attempt' }) as HTMLButtonElement).disabled).toBe(true))
+  expect(api.session().id).toBe('session-2')
+  expect(diagnosisSignal.aborted).toBe(true)
+  await act(async () => {
+    if (settlement === 'success') diagnosisResponse.resolve(response({ ...diagnosis, retry_instruction: 'STALE_SESSION_FEEDBACK' }))
+    else diagnosisResponse.reject(new TypeError('STALE_SESSION_FAILURE'))
+  })
+  expect(screen.queryByRole('region', { name: 'Answer feedback' })).toBeNull()
+  expect(screen.queryByRole('alert')).toBeNull()
+  expect(screen.queryByText('Previous session answer', { exact: true })).toBeNull()
+  expect(api.posts('/diagnosis')).toHaveLength(1)
+  expect(api.creations()).toBe(2)
+  expect(api.posts('/attempts')).toHaveLength(1)
+})
+
+test.each(['success', 'error'] as const)('late diagnosis %s is ignored after unmount and a fresh mounted session', async (settlement) => {
+  const api = mockSessionApi()
+  const pending = pendingDiagnoses(api)
+  const original = render(<Interview />); await start(); await submit('Saved before unmount')
+  original.unmount()
+  expect(pending[0].signal.aborted).toBe(true)
+  sessionStorage.clear()
+  render(<Interview />); await start()
+  await act(async () => {
+    if (settlement === 'success') pending[0].resolve(response({ ...diagnosis, retry_instruction: 'STALE_UNMOUNT_FEEDBACK' }))
+    else pending[0].reject(new TypeError('STALE_UNMOUNT_FAILURE'))
+  })
+  expect(screen.queryByRole('region', { name: 'Answer feedback' })).toBeNull()
+  expect(screen.queryByRole('alert')).toBeNull()
+  expect(document.body.textContent).not.toContain('STALE_UNMOUNT')
+  expect(api.posts('/diagnosis')).toHaveLength(1)
+  expect(api.creations()).toBe(2)
 })

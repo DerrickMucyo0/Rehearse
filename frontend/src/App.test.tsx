@@ -2,7 +2,7 @@
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { afterEach, beforeEach, expect, test, vi } from 'vitest'
 import App from './App'
-import type { Attempt, InterviewSession, SpeakingMetrics } from './interviewApi'
+import type { Attempt, InterviewSession, SemanticDiagnosis, SpeakingMetrics } from './interviewApi'
 
 const SESSION_ID = '11111111-1111-4111-8111-111111111111'
 const OTHER_ID = '22222222-2222-4222-8222-222222222222'
@@ -15,6 +15,13 @@ const metrics: SpeakingMetrics = { source: 'original_transcription', recognized_
   filler_unavailable_reason: null, timed_utterance_span_seconds: 1.5, estimated_words_per_minute: 120, timing_unavailable_reason: null }
 const deliveryMetrics = { version: 'pause-metrics-v1', source: 'original_transcription', pause_count: 2,
   total_pause_duration_seconds: 1.5, longest_pause_seconds: 0.8, unavailable_reason: null }
+const semanticDiagnosis: SemanticDiagnosis = {
+  diagnosis_version: 'semantic-diagnosis-v1',
+  addressed_question: 'yes', addressed_question_reason: 'The answer addresses the immediate question.',
+  strengths: ['The example is concrete.'], missing_information: [], structure: 'clear',
+  structure_feedback: 'The actions and result are easy to follow.', next_focus: 'maintain_strengths',
+  next_focus_reason: 'Keep the concrete example.', retry_instruction: 'Keep the clear account in your next attempt.',
+}
 function response(value: unknown, status = 200) { return new Response(JSON.stringify(value), { status }) }
 function initialSession(id = SESSION_ID): InterviewSession {
   return { id, status: 'active', current_question_index: 0, current_question: questions[0],
@@ -142,6 +149,14 @@ function mockAppApi(initial = initialSession()) {
       const query = new URL(url, 'http://localhost').searchParams
       return response(detail(query.has('question_index') ? Number(query.get('question_index')) : null))
     }
+    const diagnosisMatch = url.match(/^\/api\/sessions\/([^/]+)\/questions\/(\d+)\/attempts\/(\d+)\/diagnosis$/)
+    if (diagnosisMatch) {
+      expect(diagnosisMatch[1]).toBe(session.id)
+      expect(options?.method).toBe('POST')
+      expect(options?.body).toBeUndefined()
+      expect(saved(Number(diagnosisMatch[2])).some((attempt) => attempt.attempt_number === Number(diagnosisMatch[3]))).toBe(true)
+      return response(semanticDiagnosis)
+    }
     const match = url.match(/\/questions\/(\d+)\/(attempts|continue|comparison)$/)
     if (match) {
       const index = Number(match[1])
@@ -247,6 +262,50 @@ test('History navigation preserves review and retry draft without creating or re
   expect((retryEditor as HTMLTextAreaElement).value).toBe('Safe retry draft')
   expect(screen.getByText('Saved first attempt')).toBeTruthy()
   expect(api.posts('/attempts')).toHaveLength(1)
+  expect(api.creations()).toBe(1)
+})
+
+test.each(['success', 'error'] as const)('pending and %s semantic feedback preserve navigation, mounted review, and existing mutations', async (result) => {
+  const api = mockAppApi()
+  const pending = deferred<Response>()
+  api.intercept((url) => url === `/api/sessions/${SESSION_ID}/questions/0/attempts/1/diagnosis` ? pending.promise : undefined)
+  render(<App />); await start(); await submit('Persisted feedback navigation answer')
+  await screen.findByText('Generating answer feedback…')
+  const attemptHeading = screen.getByRole('heading', { name: 'Attempt 1' })
+  const signal = api.posts('/diagnosis')[0][1]?.signal
+  expect((nav('History') as HTMLButtonElement).disabled).toBe(false)
+  expect((nav('Progress') as HTMLButtonElement).disabled).toBe(false)
+  go('History'); await screen.findByRole('heading', { name: 'History' })
+  go('Progress'); await screen.findByText('Objective practice history from sessions remembered on this browser.')
+  expect(signal?.aborted).toBe(false)
+  expect(api.posts('/attempts')).toHaveLength(1)
+  expect(api.posts('/continue')).toHaveLength(0)
+  expect(api.posts('/diagnosis')).toHaveLength(1)
+  await act(async () => pending.resolve(result === 'success'
+    ? response(semanticDiagnosis) : response({ detail: 'PRIVATE_FEEDBACK_SERVER_DETAIL' }, 503)))
+  go('Practice')
+  expect(screen.getByRole('heading', { name: 'Attempt 1' })).toBe(attemptHeading)
+  expect(screen.getByText('Persisted feedback navigation answer')).toBeTruthy()
+  const feedback = screen.getByRole('region', { name: 'Answer feedback' })
+  if (result === 'success') await within(feedback).findByText(semanticDiagnosis.addressed_question_reason)
+  else await within(feedback).findByRole('alert')
+  expect(document.body.textContent).not.toContain('PRIVATE_FEEDBACK_SERVER_DETAIL')
+  expect(screen.queryByRole('button', { name: 'Recheck saved state' })).toBeNull()
+  expect((screen.getByRole('button', { name: 'Retry' }) as HTMLButtonElement).disabled).toBe(false)
+  expect((screen.getByRole('button', { name: 'Continue' }) as HTMLButtonElement).disabled).toBe(false)
+  expect((nav('History') as HTMLButtonElement).disabled).toBe(false)
+  expect((nav('Progress') as HTMLButtonElement).disabled).toBe(false)
+  go('History'); await screen.findByRole('heading', { name: 'History' })
+  go('Progress'); await screen.findByText('Objective practice history from sessions remembered on this browser.')
+  go('Practice')
+  expect(screen.getByRole('heading', { name: 'Attempt 1' })).toBe(attemptHeading)
+  fireEvent.click(screen.getByRole('button', { name: 'Continue' }))
+  await screen.findByText('Question 2 of 5')
+  await waitFor(() => expect((nav('History') as HTMLButtonElement).disabled).toBe(false))
+  go('History'); await screen.findByRole('heading', { name: 'History' }); go('Practice')
+  expect(api.posts('/attempts')).toHaveLength(1)
+  expect(api.posts('/continue')).toHaveLength(1)
+  expect(api.posts('/diagnosis')).toHaveLength(1)
   expect(api.creations()).toBe(1)
 })
 

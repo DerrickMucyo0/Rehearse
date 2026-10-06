@@ -15,6 +15,7 @@ from app.database_models import (
     TranscriptionMeasurement, validate_submitted_answer_text,
 )
 from app.delivery_metrics import DeliveryMetrics
+from app.diagnosis import DiagnosisContext, build_diagnosis_context
 from app.speaking_metrics import SpeakingMetrics
 
 QUESTIONS = (
@@ -129,32 +130,7 @@ class InterviewSessionService:
         before: int | None = None, after: int | None = None,
     ) -> AttemptComparison:
         with self._session_factory.begin() as database:
-            # One statement selects the immutable question snapshot, scoped attempts
-            # and their exact linked measurements. No read lock or latest-measurement
-            # inference is needed, even if another retry commits during this read.
-            rows = database.execute(
-                select(StoredInterviewSession, QuestionAttempt, TranscriptionMeasurement)
-                .select_from(StoredInterviewSession)
-                .outerjoin(QuestionAttempt, and_(
-                    QuestionAttempt.session_id == StoredInterviewSession.id,
-                    QuestionAttempt.question_index == question_index,
-                ))
-                .outerjoin(TranscriptionMeasurement, and_(
-                    TranscriptionMeasurement.id == QuestionAttempt.measurement_id,
-                    TranscriptionMeasurement.session_id == QuestionAttempt.session_id,
-                    TranscriptionMeasurement.question_index == QuestionAttempt.question_index,
-                ))
-                .where(StoredInterviewSession.id == session_id)
-                .order_by(QuestionAttempt.attempt_number)
-            ).all()
-            if not rows:
-                raise SessionNotFound("Session not found.")
-            if not 0 <= question_index < len(rows[0][0].questions):
-                raise SessionNotFound("Question not found.")
-            attempts = {
-                attempt.attempt_number: (attempt, measurement)
-                for _, attempt, measurement in rows if attempt is not None
-            }
+            _, attempts = self._read_question_attempts(database, session_id, question_index)
             if before is None and after is None and len(attempts) < 2:
                 baseline = attempts.get(1)
                 return AttemptComparison(
@@ -178,6 +154,34 @@ class InterviewSessionService:
                 after_attempt=self._compared_attempt(after_attempt, after_measurement),
                 comparison=compare_measurements(before_snapshot, after_snapshot),
                 delivery_comparison=compare_delivery_measurements(before_snapshot, after_snapshot),
+            )
+
+    def get_diagnosis_context(
+        self, session_id: UUID, question_index: int, attempt_number: int,
+    ) -> DiagnosisContext:
+        """Project an exact persisted attempt and only its immediate predecessor."""
+        with self._session_factory.begin() as database:
+            stored, attempts = self._read_question_attempts(database, session_id, question_index)
+            if attempt_number not in attempts:
+                raise SessionNotFound("Attempt not found.")
+            target, target_measurement = attempts[attempt_number]
+            target_snapshot = self._measurement_snapshot(target_measurement)
+            predecessor = attempts.get(target.attempt_number - 1)
+            comparison = None
+            if predecessor is not None:
+                before_attempt, before_measurement = predecessor
+                before_snapshot = self._measurement_snapshot(before_measurement)
+                comparison = AttemptComparison(
+                    session_id=session_id, question_index=target.question_index,
+                    before_attempt=self._compared_attempt(before_attempt, before_measurement),
+                    after_attempt=self._compared_attempt(target, target_measurement),
+                    comparison=compare_measurements(before_snapshot, target_snapshot),
+                    delivery_comparison=compare_delivery_measurements(before_snapshot, target_snapshot),
+                )
+            return build_diagnosis_context(
+                question=stored.questions[target.question_index], answer=target.answer_text,
+                question_index=target.question_index, attempt_number=target.attempt_number,
+                measurement=target_snapshot, comparison=comparison,
             )
 
     def submit_attempt(
@@ -304,6 +308,38 @@ class InterviewSessionService:
     def _check_revision(latest: int, expected: int) -> None:
         if expected != latest:
             raise SessionConflict("Attempt revision does not match the current question.")
+
+    @staticmethod
+    def _read_question_attempts(
+        database: Session, session_id: UUID, question_index: int,
+    ) -> tuple[StoredInterviewSession, dict[int, tuple[QuestionAttempt, TranscriptionMeasurement | None]]]:
+        # One statement selects the immutable question snapshot, scoped attempts
+        # and their exact linked measurements. No read lock or latest-measurement
+        # inference is needed, even if another retry commits during this read.
+        rows = database.execute(
+            select(StoredInterviewSession, QuestionAttempt, TranscriptionMeasurement)
+            .select_from(StoredInterviewSession)
+            .outerjoin(QuestionAttempt, and_(
+                QuestionAttempt.session_id == StoredInterviewSession.id,
+                QuestionAttempt.question_index == question_index,
+            ))
+            .outerjoin(TranscriptionMeasurement, and_(
+                TranscriptionMeasurement.id == QuestionAttempt.measurement_id,
+                TranscriptionMeasurement.session_id == QuestionAttempt.session_id,
+                TranscriptionMeasurement.question_index == QuestionAttempt.question_index,
+            ))
+            .where(StoredInterviewSession.id == session_id)
+            .order_by(QuestionAttempt.attempt_number)
+        ).all()
+        if not rows:
+            raise SessionNotFound("Session not found.")
+        stored = rows[0][0]
+        if not 0 <= question_index < len(stored.questions):
+            raise SessionNotFound("Question not found.")
+        return stored, {
+            attempt.attempt_number: (attempt, measurement)
+            for _, attempt, measurement in rows if attempt is not None
+        }
 
     def _read_response(self, database: Session, session_id: UUID) -> InterviewSession:
         # State, finalized answers and the current revision share one SQL snapshot.

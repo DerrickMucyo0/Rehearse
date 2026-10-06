@@ -2,7 +2,7 @@
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { afterEach, beforeEach, expect, test, vi } from 'vitest'
 import App from './App'
-import type { Attempt, InterviewSession, SpeakingMetrics } from './interviewApi'
+import type { Attempt, InterviewSession, SemanticDiagnosis, SpeakingMetrics } from './interviewApi'
 
 const SESSION_ID = '11111111-1111-4111-8111-111111111111'
 const OTHER_ID = '22222222-2222-4222-8222-222222222222'
@@ -15,6 +15,13 @@ const metrics: SpeakingMetrics = { source: 'original_transcription', recognized_
   filler_unavailable_reason: null, timed_utterance_span_seconds: 1.5, estimated_words_per_minute: 120, timing_unavailable_reason: null }
 const deliveryMetrics = { version: 'pause-metrics-v1', source: 'original_transcription', pause_count: 2,
   total_pause_duration_seconds: 1.5, longest_pause_seconds: 0.8, unavailable_reason: null }
+const semanticDiagnosis: SemanticDiagnosis = {
+  diagnosis_version: 'semantic-diagnosis-v1',
+  addressed_question: 'yes', addressed_question_reason: 'Semantic-only question feedback.',
+  strengths: ['Semantic-only strength.'], missing_information: [], structure: 'clear',
+  structure_feedback: 'Semantic-only structure feedback.', next_focus: 'maintain_strengths',
+  next_focus_reason: 'Semantic-only focus reason.', retry_instruction: 'Semantic-only retry instruction.',
+}
 function response(value: unknown, status = 200) { return new Response(JSON.stringify(value), { status }) }
 function initialSession(id = SESSION_ID): InterviewSession {
   return { id, status: 'active', current_question_index: 0, current_question: questions[0],
@@ -148,6 +155,14 @@ function mockAppApi(initial = initialSession()) {
     if (url.startsWith(`/api/sessions/${session.id}/history-detail`)) {
       const query = new URL(url, 'http://localhost').searchParams
       return response(detail(query.has('question_index') ? Number(query.get('question_index')) : null))
+    }
+    const diagnosisMatch = url.match(/^\/api\/sessions\/([^/]+)\/questions\/(\d+)\/attempts\/(\d+)\/diagnosis$/)
+    if (diagnosisMatch) {
+      expect(diagnosisMatch[1]).toBe(session.id)
+      expect(options?.method).toBe('POST')
+      expect(options?.body).toBeUndefined()
+      expect(saved(Number(diagnosisMatch[2])).some((attempt) => attempt.attempt_number === Number(diagnosisMatch[3]))).toBe(true)
+      return response(semanticDiagnosis)
     }
     const match = url.match(/\/questions\/(\d+)\/(attempts|continue|comparison)$/)
     if (match) {
@@ -309,6 +324,56 @@ test('successful Attempt submission invalidates counts without promoting the ope
   expect(screen.getByRole('heading', { name: 'Attempt 1' })).toBeTruthy()
   expect(screen.getByText('The current question is not yet finalized')).toBeTruthy()
   expect(api.posts('/attempts')).toHaveLength(1)
+})
+
+test('semantic diagnosis completion preserves finalized measurements, attempt facts, and shared objective history', async () => {
+  const api = mockAppApi(); render(<App />); await start(); await record(); await finishRecording()
+  fireEvent.click(screen.getByRole('button', { name: 'Transcribe Recording' }))
+  await screen.findByRole('region', { name: 'Speaking measurements' })
+  await submit('Recorded first final answer')
+  fireEvent.click(screen.getByRole('button', { name: 'Continue' }))
+  await screen.findByText('Question 2 of 5')
+  await waitFor(() => expect((nav('Progress') as HTMLButtonElement).disabled).toBe(false))
+  const pending = deferred<Response>()
+  api.intercept((url) => url === `/api/sessions/${SESSION_ID}/questions/1/attempts/1/diagnosis` ? pending.promise : undefined)
+  await submit('Second typed review answer')
+  await screen.findByText('Generating answer feedback…')
+  const beforeFacts = JSON.stringify(api.detail(1))
+  const beforeAttempts = JSON.stringify(api.saved(1))
+  await openLoadedProgress()
+  expect(overviewValue('Finalized questions').querySelector('dd')?.textContent).toBe('1')
+  expect(overviewValue('Saved attempts').querySelector('dd')?.textContent).toBe('2')
+  expect(overviewValue('Measured final answers').querySelector('dd')?.textContent).toBe('1')
+  const pauseCount = within(progress()).getByRole('region', { name: 'Pause count' })
+  expect(pauseCount.textContent).toContain('available for 1 of 1')
+  expect(within(pauseCount).getByRole('cell', { name: '2' })).toBeTruthy()
+  const beforeProgress = progress().innerHTML
+  const reads = summariesReadCount(api)
+  await act(async () => pending.resolve(response(semanticDiagnosis)))
+  expect(progress().innerHTML).toBe(beforeProgress)
+  expect(JSON.stringify(api.detail(1))).toBe(beforeFacts)
+  expect(JSON.stringify(api.saved(1))).toBe(beforeAttempts)
+  expect(summariesReadCount(api)).toBe(reads)
+  expect(within(progress()).queryByText(semanticDiagnosis.addressed_question_reason)).toBeNull()
+  expect(within(progress()).queryByRole('region', { name: 'Answer feedback' })).toBeNull()
+  await openLoadedHistory()
+  expect(summariesReadCount(api)).toBe(reads)
+  const history = screen.getByRole('region', { name: 'Remembered session history' })
+  expect(within(history).getByText('Attempts', { exact: true }).nextElementSibling?.textContent).toBe('2')
+  expect(within(history).queryByText(semanticDiagnosis.addressed_question_reason)).toBeNull()
+  fireEvent.click(screen.getByRole('button', { name: 'Open session' }))
+  await screen.findByRole('heading', { name: 'Session detail' })
+  fireEvent.click(screen.getByRole('button', { name: 'Question 2' }))
+  await screen.findByText('Second typed review answer')
+  expect(within(screen.getByRole('region', { name: 'Session detail' })).queryByText(semanticDiagnosis.retry_instruction)).toBeNull()
+  go('Practice')
+  await within(screen.getByRole('region', { name: 'Answer feedback' })).findByText(semanticDiagnosis.addressed_question_reason)
+  expect(api.posts('/attempts')).toHaveLength(2)
+  expect(api.posts('/continue')).toHaveLength(1)
+  expect(api.posts('/transcriptions')).toHaveLength(1)
+  expect(api.posts('/diagnosis')).toHaveLength(2)
+  expect(JSON.stringify(Object.entries(localStorage))).not.toContain('Semantic-only')
+  expect(JSON.stringify(Object.entries(sessionStorage))).not.toContain('Semantic-only')
 })
 
 test('successful Continue invalidates final points while the next-question editor remains mounted', async () => {

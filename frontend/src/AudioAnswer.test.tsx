@@ -3,11 +3,17 @@ import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testi
 import { afterEach, beforeEach, expect, test, vi } from 'vitest'
 import AudioAnswer from './AudioAnswer'
 import Interview from './Interview'
-import type { Attempt, InterviewSession, SpeakingMetrics } from './interviewApi'
+import type { Attempt, InterviewSession, SemanticDiagnosis, SpeakingMetrics } from './interviewApi'
 import type { DeliveryMetrics } from './deliveryMetrics'
 import { deliveryUnavailableText, TIMED_PAUSES_EXPLANATION, TIMED_PAUSES_LIMITATION } from './deliveryMetrics'
 
 const session: InterviewSession = { id: 'session-1', status: 'active', current_question_index: 0, current_question: 'Question', current_question_latest_attempt_number: 0, questions: ['Question'], answers: [] }
+const semanticDiagnosis: SemanticDiagnosis = {
+  diagnosis_version: 'semantic-diagnosis-v1',
+  addressed_question: 'yes', addressed_question_reason: 'The answer addresses the immediate question.',
+  strengths: [], missing_information: [], structure: 'clear', structure_feedback: 'The account is easy to follow.',
+  next_focus: 'maintain_strengths', next_focus_reason: 'Keep the clear account.', retry_instruction: 'Keep the clear account.',
+}
 let stopTrack: ReturnType<typeof vi.fn>
 let getUserMedia: ReturnType<typeof vi.fn>
 let media: MediaStream
@@ -87,6 +93,14 @@ function interviewFetch({ active = session, transcriptions = [], submissionError
       if (typeof result?.measurement_id === 'string' && result.metrics) persistedMetrics.set(result.measurement_id, result.metrics)
       if (typeof result?.measurement_id === 'string' && result.delivery_metrics) persistedDelivery.set(result.measurement_id, result.delivery_metrics)
       return response
+    }
+    const diagnosisMatch = url.match(/^\/api\/sessions\/([^/]+)\/questions\/(\d+)\/attempts\/(\d+)\/diagnosis$/)
+    if (diagnosisMatch) {
+      expect(diagnosisMatch[1]).toBe(active.id)
+      expect(options?.method).toBe('POST')
+      expect(options?.body).toBeUndefined()
+      expect(histories.get(Number(diagnosisMatch[2]))?.some((attempt) => attempt.attempt_number === Number(diagnosisMatch[3]))).toBe(true)
+      return json(semanticDiagnosis)
     }
     const path = `/api/sessions/${active.id}/questions/${current.current_question_index}`
     if (url === `${path}/attempts`) {

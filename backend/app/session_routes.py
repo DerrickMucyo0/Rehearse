@@ -11,6 +11,15 @@ from app.audio import AudioAccepted, bounded_multipart_request, validated_audio
 from app.comparisons import AttemptComparison
 from app.database import create_database_engine, create_session_factory
 from app.delivery_metrics import DeliveryMetrics, measure_delivery
+from app.semantic_diagnosis import SemanticDiagnosis
+from app.semantic_diagnosis_adapter import SemanticDiagnosisAdapter
+from app.semantic_diagnosis_application import (
+    SemanticDiagnosisFailed,
+    SemanticDiagnosisTimeout,
+    SemanticDiagnosisUnavailable,
+    diagnose_application_context,
+)
+from app.semantic_diagnosis_composition import get_semantic_diagnosis_adapter
 from app.speaking_metrics import SpeakingMetrics, measure_transcription
 from app.sessions import (
     Attempt,
@@ -40,6 +49,10 @@ def get_session_service() -> InterviewSessionService:
 
 
 SessionService = Annotated[InterviewSessionService, Depends(get_session_service)]
+SemanticDiagnosisService = Annotated[
+    SemanticDiagnosisAdapter,
+    Depends(get_semantic_diagnosis_adapter),
+]
 
 
 @router.post("", response_model=InterviewSession, status_code=201)
@@ -93,6 +106,37 @@ def get_attempts(
         return sessions.get_attempts(session_id, question_index)
     except SessionNotFound as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.post(
+    "/{session_id}/questions/{question_index}/attempts/{attempt_number}/diagnosis",
+    response_model=SemanticDiagnosis,
+)
+async def diagnose_attempt(
+    session_id: UUID,
+    question_index: Annotated[int, Path(ge=0)],
+    attempt_number: Annotated[int, Path(ge=1)],
+    sessions: SessionService,
+    diagnoser: SemanticDiagnosisService,
+) -> SemanticDiagnosis:
+    try:
+        context = await run_in_threadpool(
+            sessions.get_diagnosis_context,
+            session_id,
+            question_index,
+            attempt_number,
+        )
+    except SessionNotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    try:
+        _, diagnosis = await diagnose_application_context(diagnoser, context)
+    except SemanticDiagnosisUnavailable:
+        raise HTTPException(status_code=503, detail="Semantic diagnosis is not configured.") from None
+    except SemanticDiagnosisTimeout:
+        raise HTTPException(status_code=504, detail="Semantic diagnosis timed out.") from None
+    except SemanticDiagnosisFailed:
+        raise HTTPException(status_code=502, detail="Unable to generate semantic diagnosis.") from None
+    return diagnosis
 
 
 @router.get("/{session_id}/questions/{question_index}/comparison", response_model=AttemptComparison)
