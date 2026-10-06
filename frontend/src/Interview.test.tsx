@@ -2,6 +2,7 @@
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { afterEach, beforeEach, expect, test, vi } from 'vitest'
 import Interview from './Interview'
+import { personalizedDrillForFocus } from './personalizedDrills'
 import type { Attempt, AttemptComparison, DeliveryMetricChange, InterviewSession, MetricChange, SemanticDiagnosis } from './interviewApi'
 
 const storageKey = 'rehearse.session_id'
@@ -168,6 +169,22 @@ function pendingDiagnoses(api: ReturnType<typeof mockSessionApi>) {
   return pending
 }
 function feedback() { return screen.getByRole('region', { name: 'Answer feedback' }) }
+function expectNoDrill() { expect(screen.queryByRole('region', { name: 'Practice drill' })).toBeNull() }
+function expectDrillForFocus(focus: SemanticDiagnosis['next_focus']) {
+  const drill = personalizedDrillForFocus(focus)
+  const regions = screen.getAllByRole('region', { name: 'Practice drill' })
+  expect(regions).toHaveLength(1)
+  const region = regions[0]
+  expect(within(feedback()).getByRole('region', { name: 'Practice drill' })).toBe(region)
+  expect(within(region).getByRole('heading', { name: drill.title, level: 4 })).toBeTruthy()
+  expect(within(region).getByText(drill.goal, { exact: true })).toBeTruthy()
+  expect(within(region).getByRole('list').tagName).toBe('OL')
+  expect(within(region).getAllByRole('listitem').map((item) => item.textContent)).toEqual(drill.steps)
+  expect(region.textContent).toBe(drill.title + drill.goal + drill.steps.join(''))
+  expect(within(region).queryByText(drill.drill_version, { exact: true })).toBeNull()
+  expect(within(region).queryByText(focus, { exact: true })).toBeNull()
+  return region
+}
 function expectReviewActionsEnabled() {
   expect((screen.getByRole('button', { name: /^Retry(?: Again)?$/ }) as HTMLButtonElement).disabled).toBe(false)
   expect((screen.getByRole('button', { name: 'Continue' }) as HTMLButtonElement).disabled).toBe(false)
@@ -201,15 +218,22 @@ test('Attempt 1 uses the new endpoint and revision zero, remains on the question
 test('Retry and Cancel Retry are local transitions preserving saved attempts and clearing unsaved text', async () => {
   const api = mockSessionApi()
   render(<Interview />); await start(); await submit('Saved baseline')
+  await screen.findByRole('region', { name: 'Practice drill' })
+  expectDrillForFocus(diagnosis.next_focus)
   const calls = api.fetchMock.mock.calls.length
   await retry()
+  expectNoDrill()
   expect((screen.getByRole('textbox') as HTMLTextAreaElement).value).toBe('')
   expect(screen.getByText('Saved baseline')).toBeTruthy()
   fireEvent.change(screen.getByRole('textbox'), { target: { value: 'Unsaved draft' } })
   expect(screen.queryByRole('heading', { name: 'Attempt 2' })).toBeNull()
   fireEvent.click(screen.getByRole('button', { name: 'Cancel Retry' }))
   expect(screen.queryByRole('textbox')).toBeNull()
+  expectNoDrill()
   expect(api.fetchMock.mock.calls).toHaveLength(calls)
+  expect(api.posts('/diagnosis')).toHaveLength(1)
+  expect(api.posts('/attempts')).toHaveLength(1)
+  expect(api.posts('/continue')).toHaveLength(0)
   await retry()
   expect((screen.getByRole('textbox') as HTMLTextAreaElement).value).toBe('')
 })
@@ -234,17 +258,22 @@ test('Attempt 2 and Attempt 3 use authoritative revisions, preserve history, and
 test('Continue sends authoritative revision and advances only after its response', async () => {
   const api = mockSessionApi()
   render(<Interview />); await start(); await submit('Saved')
+  await screen.findByRole('region', { name: 'Practice drill' })
+  expectDrillForFocus(diagnosis.next_focus)
   let resolve!: (value: Response) => void
   api.intercept((url, options) => url.endsWith('/continue') && options?.method === 'POST'
     ? new Promise<Response>((done) => { resolve = done }) : undefined)
   const button = screen.getByRole('button', { name: 'Continue' })
   fireEvent.click(button); fireEvent.click(button)
+  expectNoDrill()
   expect(api.posts('/continue')).toHaveLength(1)
   expect(postedBody(api, '/continue')).toEqual({ expected_last_attempt_number: 1 })
   expect(screen.getByText('Question 1 of 5')).toBeTruthy()
   expect((screen.getByRole('button', { name: /^Retry$/ }) as HTMLButtonElement).disabled).toBe(true)
   await act(async () => resolve(response(api.advance())))
   await screen.findByText('Question 2 of 5')
+  expectNoDrill()
+  expect(api.posts('/diagnosis')).toHaveLength(1)
   expect((screen.getByRole('textbox') as HTMLTextAreaElement).value).toBe('')
   expect(screen.queryByText('Saved', { exact: true })).toBeNull()
   expect(screen.queryByRole('table')).toBeNull()
@@ -285,11 +314,13 @@ test('the final saved attempt is reviewed before explicit Continue completes the
   for (let index = 0; index < 5; index += 1) {
     await screen.findByText(`Question ${index + 1} of 5`)
     await submit(`Answer ${index + 1}`)
+    await screen.findByRole('region', { name: 'Practice drill' })
     expect(screen.queryByRole('heading', { name: 'Interview Complete' })).toBeNull()
     expect(screen.queryByRole('textbox')).toBeNull()
     fireEvent.click(screen.getByRole('button', { name: 'Continue' }))
   }
   await screen.findByRole('heading', { name: 'Interview Complete' })
+  expectNoDrill()
   expect(screen.getByText('You completed all 5 questions.')).toBeTruthy()
   expect(screen.queryByRole('button', { name: /^Retry/ })).toBeNull()
   expect(screen.queryByRole('button', { name: 'Record Answer' })).toBeNull()
@@ -297,6 +328,7 @@ test('the final saved attempt is reviewed before explicit Continue completes the
   fireEvent.click(screen.getByRole('button', { name: 'Start New Interview' }))
   await screen.findByText('Question 1 of 5')
   expect(api.creations()).toBe(2)
+  expectNoDrill()
 })
 
 test.each([0, 1, 3])('page reload reconstructs %i saved attempts without persisting draft text', async (count) => {
@@ -316,6 +348,7 @@ test.each([0, 1, 3])('page reload reconstructs %i saved attempts without persist
   expect(api.gets(`/api/sessions/${api.session().id}`)).toHaveLength(2)
   expect(api.gets('/questions/0/attempts')).toHaveLength(1)
   expect(JSON.stringify(sessionStorage)).not.toContain('Saved')
+  expectNoDrill()
 })
 
 test('reload of a completed session shows completion without fetching active attempts', async () => {
@@ -699,6 +732,45 @@ test('persistent read disagreement is bounded and requires Recheck without perfo
   expect(api.fetchMock.mock.calls.filter(([, options]) => options?.method === 'POST')).toHaveLength(0)
 })
 
+test.each([
+  'answer_the_question', 'specificity', 'supporting_detail', 'structure', 'completeness', 'conciseness', 'maintain_strengths',
+] as const)('owned diagnosis focus %s renders exactly its drill without extra requests, writes or rerender side effects', async (focus) => {
+  const api = mockSessionApi()
+  const pending = pendingDiagnoses(api)
+  const factsChanged = vi.fn()
+  const component = render(<Interview onHistoryFactsChange={factsChanged} />)
+  await start(); await submit('Saved drill answer')
+  expect(pending).toHaveLength(1)
+  expectNoDrill()
+  const calls = api.fetchMock.mock.calls.length
+  const savedBefore = JSON.stringify(api.saved())
+  const sessionBefore = JSON.stringify(api.session())
+  const localStorageBefore = JSON.stringify(localStorage)
+  const sessionStorageBefore = JSON.stringify(sessionStorage)
+  const factsBefore = factsChanged.mock.calls.length
+  const storageWrites = (['setItem', 'removeItem', 'clear'] as const).map((method) => vi.spyOn(Storage.prototype, method))
+  await act(async () => pending[0].resolve(response({ ...diagnosis, next_focus: focus })))
+  await screen.findByRole('region', { name: 'Practice drill' })
+  const region = expectDrillForFocus(focus)
+  const retryInstruction = within(feedback()).getByText(diagnosis.retry_instruction, { exact: true })
+  expect(retryInstruction.compareDocumentPosition(region) & Node.DOCUMENT_POSITION_FOLLOWING).not.toBe(0)
+  expect(region.compareDocumentPosition(screen.getByRole('button', { name: 'Retry' })) & Node.DOCUMENT_POSITION_FOLLOWING).not.toBe(0)
+  expect(region.compareDocumentPosition(screen.getByRole('button', { name: 'Continue' })) & Node.DOCUMENT_POSITION_FOLLOWING).not.toBe(0)
+  component.rerender(<Interview onHistoryFactsChange={factsChanged} />)
+  expect(expectDrillForFocus(focus)).toBe(region)
+  expectReviewActionsEnabled()
+  expect(api.fetchMock.mock.calls).toHaveLength(calls)
+  expect(api.posts('/diagnosis')).toHaveLength(1)
+  expect(api.posts('/attempts')).toHaveLength(1)
+  expect(api.posts('/continue')).toHaveLength(0)
+  expect(JSON.stringify(api.saved())).toBe(savedBefore)
+  expect(JSON.stringify(api.session())).toBe(sessionBefore)
+  expect(JSON.stringify(localStorage)).toBe(localStorageBefore)
+  expect(JSON.stringify(sessionStorage)).toBe(sessionStorageBefore)
+  expect(factsChanged).toHaveBeenCalledTimes(factsBefore)
+  for (const write of storageWrites) expect(write).not.toHaveBeenCalled()
+})
+
 test('diagnosis waits for coherent saved review, then renders semantic feedback separately for the acknowledged attempt', async () => {
   const api = mockSessionApi()
   const localStorageBefore = JSON.stringify(localStorage)
@@ -726,9 +798,11 @@ test('diagnosis waits for coherent saved review, then renders semantic feedback 
   await waitFor(() => expect(waitingRead).toBe(true))
   expect(api.posts('/diagnosis')).toHaveLength(0)
   expect(screen.queryByRole('region', { name: 'Answer feedback' })).toBeNull()
+  expectNoDrill()
   await act(async () => refresh.resolve(response(api.session())))
   await screen.findByRole('region', { name: 'Answer feedback' })
   await within(feedback()).findByText(diagnosis.addressed_question_reason)
+  expectDrillForFocus(diagnosis.next_focus)
   expect(api.posts('/diagnosis')).toHaveLength(1)
   const [url, options] = api.posts('/diagnosis')[0]
   expect(url).toBe('/api/sessions/session-1/questions/0/attempts/1/diagnosis')
@@ -770,6 +844,7 @@ test('diagnosis targets the acknowledged sparse attempt number, question, sessio
   })
   await retry(); await submit('Acknowledged eighth attempt')
   await within(feedback()).findByText(diagnosis.retry_instruction)
+  expectDrillForFocus(diagnosis.next_focus)
   expect(api.posts('/diagnosis').map(([url]) => url)).toEqual([
     '/api/sessions/existing-session/questions/2/attempts/8/diagnosis',
   ])
@@ -807,6 +882,7 @@ test.each(['newer attempt', 'different identity', 'advanced question'] as const)
     } else await waitFor(expectReviewActionsEnabled)
     expect(api.posts('/diagnosis')).toHaveLength(0)
     expect(screen.queryByRole('region', { name: 'Answer feedback' })).toBeNull()
+    expectNoDrill()
   },
 )
 
@@ -818,6 +894,7 @@ test('pending semantic feedback leaves Retry, Continue and interview navigation 
   expect(pending).toHaveLength(1)
   const region = feedback()
   expect(region.getAttribute('aria-busy')).toBe('true')
+  expectNoDrill()
   expect(within(region).getByRole('status').textContent).toBe('Generating answer feedback…')
   expect(screen.getByRole('region', { name: 'Interview practice' }).getAttribute('aria-busy')).toBe('false')
   expect(navigationBusy.mock.calls.at(-1)).toEqual([false])
@@ -839,6 +916,7 @@ test.each([
   const calls = api.fetchMock.mock.calls.length
   await act(async () => pending[0].resolve(response({ detail: 'PRIVATE_BACKEND_DIAGNOSTIC_TEXT' }, status)))
   await within(feedback()).findByText(message)
+  expectNoDrill()
   expectReviewActionsEnabled()
   expect(screen.getByText('Saved answer', { exact: true })).toBeTruthy()
   expect(screen.getByRole('heading', { name: 'Attempt 1' })).toBeTruthy()
@@ -864,6 +942,7 @@ test.each(['network', 'malformed'] as const)('a %s diagnosis failure preserves s
     ? 'Unable to load feedback right now. You can still retry or continue.'
     : 'Unable to generate feedback right now. You can still retry or continue.'
   await within(feedback()).findByText(expected)
+  expectNoDrill()
   expectReviewActionsEnabled()
   expect(screen.getByText('Saved answer', { exact: true })).toBeTruthy()
   expect(screen.queryByRole('button', { name: 'Recheck saved state' })).toBeNull()
@@ -898,6 +977,7 @@ test('semantic completion does not change the authoritative speaking/delivery co
   const historyChanges = factsChanged.mock.calls.length
   await act(async () => pending[0].resolve(response(diagnosis)))
   await within(feedback()).findByText(diagnosis.retry_instruction)
+  expectDrillForFocus(diagnosis.next_focus)
   expect(screen.getAllByRole('table').map((table) => table.textContent)).toEqual(tableBefore)
   expect(JSON.stringify(api.comparison(0))).toBe(storedBefore)
   expect(comparisonRow('Recognized words')).toEqual(['12', '20', '+8'])
@@ -959,6 +1039,7 @@ test.each(['rejected', 'conflict', 'network', 'malformed acknowledgement', 'revi
     }
     expect(api.posts('/attempts')).toHaveLength(1)
     expect(screen.queryByRole('region', { name: 'Answer feedback' })).toBeNull()
+    expectNoDrill()
   },
 )
 
@@ -969,7 +1050,9 @@ test('restored review, ordinary rerender and Cancel Retry never trigger diagnosi
   const component = render(<Interview />)
   await screen.findByRole('button', { name: 'Continue' })
   await waitFor(expectReviewActionsEnabled)
+  expectNoDrill()
   component.rerender(<Interview onHistoryFactsChange={vi.fn()} />)
+  expectNoDrill()
   await retry()
   fireEvent.click(screen.getByRole('button', { name: 'Cancel Retry' }))
   await waitFor(expectReviewActionsEnabled)
@@ -977,6 +1060,7 @@ test('restored review, ordinary rerender and Cancel Retry never trigger diagnosi
   expect(api.posts('/attempts')).toHaveLength(0)
   expect(api.posts('/continue')).toHaveLength(0)
   expect(screen.queryByRole('region', { name: 'Answer feedback' })).toBeNull()
+  expectNoDrill()
 })
 
 test.each(['success', 'error'] as const)('late diagnosis %s stays invalidated through Retry and Cancel Retry', async (settlement) => {
@@ -987,6 +1071,7 @@ test.each(['success', 'error'] as const)('late diagnosis %s stays invalidated th
   await retry()
   expect(pending[0].signal.aborted).toBe(true)
   expect(screen.queryByRole('region', { name: 'Answer feedback' })).toBeNull()
+  expectNoDrill()
   fireEvent.click(screen.getByRole('button', { name: 'Cancel Retry' }))
   await waitFor(expectReviewActionsEnabled)
   await act(async () => {
@@ -995,6 +1080,7 @@ test.each(['success', 'error'] as const)('late diagnosis %s stays invalidated th
   })
   expect(screen.queryByRole('region', { name: 'Answer feedback' })).toBeNull()
   expect(screen.queryByRole('alert')).toBeNull()
+  expectNoDrill()
   expect(api.fetchMock.mock.calls).toHaveLength(calls)
   expect(api.posts('/diagnosis')).toHaveLength(1)
   expect(api.posts('/attempts')).toHaveLength(1)
@@ -1020,6 +1106,7 @@ test.each([
   expect(api.posts('/continue')).toHaveLength(1)
   expect(screen.getByText('Question 1 of 5')).toBeTruthy()
   expect(screen.queryByRole('region', { name: 'Answer feedback' })).toBeNull()
+  expectNoDrill()
   if (stage === 'changed question') {
     await act(async () => continueResponse.resolve(response(api.advance())))
     await screen.findByText('Question 2 of 5')
@@ -1030,12 +1117,14 @@ test.each([
   })
   expect(screen.queryByRole('region', { name: 'Answer feedback' })).toBeNull()
   expect(screen.queryByRole('alert')).toBeNull()
+  expectNoDrill()
   if (stage === 'pending Continue') {
     await act(async () => continueResponse.resolve(response(api.advance())))
     await screen.findByText('Question 2 of 5')
   }
   expect(screen.queryByRole('region', { name: 'Answer feedback' })).toBeNull()
   expect(api.posts('/diagnosis')).toHaveLength(1)
+  expectNoDrill()
 })
 
 test.each(['success', 'error'] as const)('old diagnosis %s/final completion cannot replace a newer request or clear its loading state', async (settlement) => {
@@ -1047,15 +1136,18 @@ test.each(['success', 'error'] as const)('old diagnosis %s/final completion cann
   expect(pending[0].signal.aborted).toBe(true)
   expect(pending[1].signal.aborted).toBe(false)
   await act(async () => {
-    if (settlement === 'success') pending[0].resolve(response({ ...diagnosis, retry_instruction: 'STALE_OLDER_FEEDBACK' }))
+    if (settlement === 'success') pending[0].resolve(response({ ...diagnosis, next_focus: 'specificity', retry_instruction: 'STALE_OLDER_FEEDBACK' }))
     else pending[0].reject(new TypeError('STALE_OLDER_FAILURE'))
   })
   expect(within(feedback()).getByRole('status').textContent).toBe('Generating answer feedback…')
   expect(feedback().getAttribute('aria-busy')).toBe('true')
+  expectNoDrill()
   expect(screen.queryByRole('alert')).toBeNull()
   expect(document.body.textContent).not.toContain('STALE_OLDER')
-  await act(async () => pending[1].resolve(response({ ...diagnosis, retry_instruction: 'CURRENT_SECOND_FEEDBACK' })))
+  await act(async () => pending[1].resolve(response({ ...diagnosis, next_focus: 'conciseness', retry_instruction: 'CURRENT_SECOND_FEEDBACK' })))
   await within(feedback()).findByText('CURRENT_SECOND_FEEDBACK')
+  expectDrillForFocus('conciseness')
+  expect(screen.queryByRole('heading', { name: personalizedDrillForFocus('specificity').title })).toBeNull()
   expect(screen.queryByText('Generating answer feedback…')).toBeNull()
   expect(api.posts('/diagnosis').map(([url]) => url)).toEqual([
     '/api/sessions/session-1/questions/0/attempts/1/diagnosis',
@@ -1070,13 +1162,16 @@ test.each(['success', 'error'] as const)('an old diagnosis %s cannot replace com
   const pending = pendingDiagnoses(api)
   render(<Interview />); await start(); await submit('First saved answer')
   await retry(); await submit('Second saved answer')
-  await act(async () => pending[1].resolve(response({ ...diagnosis, retry_instruction: 'CURRENT_COMPLETED_FEEDBACK' })))
+  await act(async () => pending[1].resolve(response({ ...diagnosis, next_focus: 'conciseness', retry_instruction: 'CURRENT_COMPLETED_FEEDBACK' })))
   await within(feedback()).findByText('CURRENT_COMPLETED_FEEDBACK')
+  const currentDrill = expectDrillForFocus('conciseness')
   await act(async () => {
-    if (settlement === 'success') pending[0].resolve(response({ ...diagnosis, retry_instruction: 'STALE_COMPLETED_FEEDBACK' }))
+    if (settlement === 'success') pending[0].resolve(response({ ...diagnosis, next_focus: 'specificity', retry_instruction: 'STALE_COMPLETED_FEEDBACK' }))
     else pending[0].reject(new TypeError('STALE_COMPLETED_FAILURE'))
   })
   expect(within(feedback()).getByText('CURRENT_COMPLETED_FEEDBACK')).toBeTruthy()
+  expect(expectDrillForFocus('conciseness')).toBe(currentDrill)
+  expect(screen.queryByRole('heading', { name: personalizedDrillForFocus('specificity').title })).toBeNull()
   expect(screen.queryByRole('alert')).toBeNull()
   expect(document.body.textContent).not.toContain('STALE_COMPLETED')
 })
@@ -1106,6 +1201,7 @@ test.each(['success', 'error'] as const)('late diagnosis %s from a previous sess
   expect(screen.queryByRole('region', { name: 'Answer feedback' })).toBeNull()
   expect(screen.queryByRole('alert')).toBeNull()
   expect(screen.queryByText('Previous session answer', { exact: true })).toBeNull()
+  expectNoDrill()
   expect(api.posts('/diagnosis')).toHaveLength(1)
   expect(api.creations()).toBe(2)
   expect(api.posts('/attempts')).toHaveLength(1)
@@ -1126,6 +1222,7 @@ test.each(['success', 'error'] as const)('late diagnosis %s is ignored after unm
   expect(screen.queryByRole('region', { name: 'Answer feedback' })).toBeNull()
   expect(screen.queryByRole('alert')).toBeNull()
   expect(document.body.textContent).not.toContain('STALE_UNMOUNT')
+  expectNoDrill()
   expect(api.posts('/diagnosis')).toHaveLength(1)
   expect(api.creations()).toBe(2)
 })

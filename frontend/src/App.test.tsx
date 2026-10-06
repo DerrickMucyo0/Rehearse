@@ -3,6 +3,7 @@ import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testi
 import { afterEach, beforeEach, expect, test, vi } from 'vitest'
 import App from './App'
 import type { Attempt, InterviewSession, SemanticDiagnosis, SpeakingMetrics } from './interviewApi'
+import { personalizedDrillForFocus } from './personalizedDrills'
 
 const SESSION_ID = '11111111-1111-4111-8111-111111111111'
 const OTHER_ID = '22222222-2222-4222-8222-222222222222'
@@ -265,30 +266,72 @@ test('History navigation preserves review and retry draft without creating or re
   expect(api.creations()).toBe(1)
 })
 
-test.each(['success', 'error'] as const)('pending and %s semantic feedback preserve navigation, mounted review, and existing mutations', async (result) => {
+test.each([
+  ['success', 'History'], ['error', 'History'],
+  ['success', 'Progress'], ['error', 'Progress'],
+] as const)('pending and %s semantic feedback preserve navigation, mounted review, and existing mutations while hidden in %s', async (result, hiddenView) => {
   const api = mockAppApi()
   const pending = deferred<Response>()
+  const expectedDrill = personalizedDrillForFocus(semanticDiagnosis.next_focus)
   api.intercept((url) => url === `/api/sessions/${SESSION_ID}/questions/0/attempts/1/diagnosis` ? pending.promise : undefined)
-  render(<App />); await start(); await submit('Persisted feedback navigation answer')
+  const view = render(<App />); await start(); await submit('Persisted feedback navigation answer')
   await screen.findByText('Generating answer feedback…')
+  expect(screen.queryByRole('region', { name: 'Practice drill' })).toBeNull()
   const attemptHeading = screen.getByRole('heading', { name: 'Attempt 1' })
   const signal = api.posts('/diagnosis')[0][1]?.signal
+  const setItem = vi.spyOn(Storage.prototype, 'setItem')
+  const removeItem = vi.spyOn(Storage.prototype, 'removeItem')
+  const clear = vi.spyOn(Storage.prototype, 'clear')
   expect((nav('History') as HTMLButtonElement).disabled).toBe(false)
   expect((nav('Progress') as HTMLButtonElement).disabled).toBe(false)
   go('History'); await screen.findByRole('heading', { name: 'History' })
   go('Progress'); await screen.findByText('Objective practice history from sessions remembered on this browser.')
+  await within(screen.getByRole('region', { name: 'Progress' })).findByText('Saved attempts', { exact: true })
+  if (hiddenView === 'History') { go('History'); await screen.findByRole('heading', { name: 'History' }) }
+  const hiddenPanel = screen.getByRole('region', { name: hiddenView === 'History' ? 'Remembered session history' : 'Progress' })
+  const beforePanel = hiddenPanel.innerHTML
+  const beforeRequests = api.fetchMock.mock.calls.length
+  const beforeFacts = JSON.stringify(api.detail(0))
+  const beforeLocalStorage = JSON.stringify(Object.entries(localStorage))
+  const beforeSessionStorage = JSON.stringify(Object.entries(sessionStorage))
+  expect(screen.queryByRole('region', { name: 'Practice drill' })).toBeNull()
   expect(signal?.aborted).toBe(false)
   expect(api.posts('/attempts')).toHaveLength(1)
   expect(api.posts('/continue')).toHaveLength(0)
   expect(api.posts('/diagnosis')).toHaveLength(1)
   await act(async () => pending.resolve(result === 'success'
     ? response(semanticDiagnosis) : response({ detail: 'PRIVATE_FEEDBACK_SERVER_DETAIL' }, 503)))
+  expect(hiddenPanel.innerHTML).toBe(beforePanel)
+  expect(screen.queryByRole('region', { name: 'Practice drill' })).toBeNull()
+  expect(api.fetchMock.mock.calls).toHaveLength(beforeRequests)
+  expect(JSON.stringify(api.detail(0))).toBe(beforeFacts)
   go('Practice')
   expect(screen.getByRole('heading', { name: 'Attempt 1' })).toBe(attemptHeading)
   expect(screen.getByText('Persisted feedback navigation answer')).toBeTruthy()
   const feedback = screen.getByRole('region', { name: 'Answer feedback' })
-  if (result === 'success') await within(feedback).findByText(semanticDiagnosis.addressed_question_reason)
-  else await within(feedback).findByRole('alert')
+  if (result === 'success') {
+    await within(feedback).findByText(semanticDiagnosis.addressed_question_reason)
+    expect(screen.getAllByRole('region', { name: 'Practice drill' })).toHaveLength(1)
+    const drill = within(feedback).getByRole('region', { name: 'Practice drill' })
+    expect(within(drill).getByRole('heading', { name: expectedDrill.title, level: 4 })).toBeTruthy()
+    expect(within(drill).getByText(expectedDrill.goal, { exact: true })).toBeTruthy()
+    const steps = within(drill).getByRole('list')
+    expect(steps.tagName).toBe('OL')
+    expect(within(steps).getAllByRole('listitem').map((step) => step.textContent)).toEqual(expectedDrill.steps)
+    expect(drill.textContent).not.toContain(expectedDrill.drill_version)
+    expect(drill.textContent).not.toContain(expectedDrill.focus)
+  } else {
+    expect((await within(feedback).findByRole('alert')).textContent).toBe('Feedback is unavailable right now. You can still retry or continue.')
+    expect(screen.queryByRole('region', { name: 'Practice drill' })).toBeNull()
+  }
+  view.rerender(<App />)
+  expect(api.fetchMock.mock.calls).toHaveLength(beforeRequests)
+  expect(JSON.stringify(api.detail(0))).toBe(beforeFacts)
+  expect(JSON.stringify(Object.entries(localStorage))).toBe(beforeLocalStorage)
+  expect(JSON.stringify(Object.entries(sessionStorage))).toBe(beforeSessionStorage)
+  expect(setItem).not.toHaveBeenCalled()
+  expect(removeItem).not.toHaveBeenCalled()
+  expect(clear).not.toHaveBeenCalled()
   expect(document.body.textContent).not.toContain('PRIVATE_FEEDBACK_SERVER_DETAIL')
   expect(screen.queryByRole('button', { name: 'Recheck saved state' })).toBeNull()
   expect((screen.getByRole('button', { name: 'Retry' }) as HTMLButtonElement).disabled).toBe(false)
@@ -299,8 +342,14 @@ test.each(['success', 'error'] as const)('pending and %s semantic feedback prese
   go('Progress'); await screen.findByText('Objective practice history from sessions remembered on this browser.')
   go('Practice')
   expect(screen.getByRole('heading', { name: 'Attempt 1' })).toBe(attemptHeading)
+  expect(api.fetchMock.mock.calls).toHaveLength(beforeRequests)
+  expect(screen.queryAllByRole('region', { name: 'Practice drill' })).toHaveLength(result === 'success' ? 1 : 0)
+  expect(setItem).not.toHaveBeenCalled()
+  expect(removeItem).not.toHaveBeenCalled()
+  expect(clear).not.toHaveBeenCalled()
   fireEvent.click(screen.getByRole('button', { name: 'Continue' }))
   await screen.findByText('Question 2 of 5')
+  expect(screen.queryByRole('region', { name: 'Practice drill' })).toBeNull()
   await waitFor(() => expect((nav('History') as HTMLButtonElement).disabled).toBe(false))
   go('History'); await screen.findByRole('heading', { name: 'History' }); go('Practice')
   expect(api.posts('/attempts')).toHaveLength(1)

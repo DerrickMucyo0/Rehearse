@@ -3,6 +3,7 @@ import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testi
 import { afterEach, beforeEach, expect, test, vi } from 'vitest'
 import App from './App'
 import type { Attempt, InterviewSession, SemanticDiagnosis, SpeakingMetrics } from './interviewApi'
+import { personalizedDrillForFocus } from './personalizedDrills'
 
 const SESSION_ID = '11111111-1111-4111-8111-111111111111'
 const OTHER_ID = '22222222-2222-4222-8222-222222222222'
@@ -327,7 +328,8 @@ test('successful Attempt submission invalidates counts without promoting the ope
 })
 
 test('semantic diagnosis completion preserves finalized measurements, attempt facts, and shared objective history', async () => {
-  const api = mockAppApi(); render(<App />); await start(); await record(); await finishRecording()
+  const api = mockAppApi(); const view = render(<App />); await start(); await record(); await finishRecording()
+  const expectedDrill = personalizedDrillForFocus(semanticDiagnosis.next_focus)
   fireEvent.click(screen.getByRole('button', { name: 'Transcribe Recording' }))
   await screen.findByRole('region', { name: 'Speaking measurements' })
   await submit('Recorded first final answer')
@@ -338,6 +340,7 @@ test('semantic diagnosis completion preserves finalized measurements, attempt fa
   api.intercept((url) => url === `/api/sessions/${SESSION_ID}/questions/1/attempts/1/diagnosis` ? pending.promise : undefined)
   await submit('Second typed review answer')
   await screen.findByText('Generating answer feedback…')
+  expect(screen.queryByRole('region', { name: 'Practice drill' })).toBeNull()
   const beforeFacts = JSON.stringify(api.detail(1))
   const beforeAttempts = JSON.stringify(api.saved(1))
   await openLoadedProgress()
@@ -349,31 +352,72 @@ test('semantic diagnosis completion preserves finalized measurements, attempt fa
   expect(within(pauseCount).getByRole('cell', { name: '2' })).toBeTruthy()
   const beforeProgress = progress().innerHTML
   const reads = summariesReadCount(api)
+  const requests = api.fetchMock.mock.calls.length
+  const comparisonReads = api.fetchMock.mock.calls.filter(([url]) => String(url).endsWith('/comparison')).length
+  const beforeLocalStorage = JSON.stringify(Object.entries(localStorage))
+  const beforeSessionStorage = JSON.stringify(Object.entries(sessionStorage))
+  const setItem = vi.spyOn(Storage.prototype, 'setItem')
+  const removeItem = vi.spyOn(Storage.prototype, 'removeItem')
+  const clear = vi.spyOn(Storage.prototype, 'clear')
   await act(async () => pending.resolve(response(semanticDiagnosis)))
+  view.rerender(<App />)
   expect(progress().innerHTML).toBe(beforeProgress)
+  expect(api.fetchMock.mock.calls).toHaveLength(requests)
   expect(JSON.stringify(api.detail(1))).toBe(beforeFacts)
   expect(JSON.stringify(api.saved(1))).toBe(beforeAttempts)
   expect(summariesReadCount(api)).toBe(reads)
   expect(within(progress()).queryByText(semanticDiagnosis.addressed_question_reason)).toBeNull()
   expect(within(progress()).queryByRole('region', { name: 'Answer feedback' })).toBeNull()
+  expect(within(progress()).queryByRole('region', { name: 'Practice drill' })).toBeNull()
+  for (const text of [expectedDrill.title, expectedDrill.goal, ...expectedDrill.steps]) {
+    expect(within(progress()).queryByText(text, { exact: true })).toBeNull()
+  }
   await openLoadedHistory()
   expect(summariesReadCount(api)).toBe(reads)
   const history = screen.getByRole('region', { name: 'Remembered session history' })
   expect(within(history).getByText('Attempts', { exact: true }).nextElementSibling?.textContent).toBe('2')
   expect(within(history).queryByText(semanticDiagnosis.addressed_question_reason)).toBeNull()
+  expect(within(history).queryByRole('region', { name: 'Practice drill' })).toBeNull()
+  for (const text of [expectedDrill.title, expectedDrill.goal, ...expectedDrill.steps]) {
+    expect(within(history).queryByText(text, { exact: true })).toBeNull()
+  }
   fireEvent.click(screen.getByRole('button', { name: 'Open session' }))
   await screen.findByRole('heading', { name: 'Session detail' })
   fireEvent.click(screen.getByRole('button', { name: 'Question 2' }))
   await screen.findByText('Second typed review answer')
   expect(within(screen.getByRole('region', { name: 'Session detail' })).queryByText(semanticDiagnosis.retry_instruction)).toBeNull()
+  expect(within(screen.getByRole('region', { name: 'Session detail' })).queryByRole('region', { name: 'Practice drill' })).toBeNull()
+  const beforeReturnRequests = api.fetchMock.mock.calls.length
   go('Practice')
   await within(screen.getByRole('region', { name: 'Answer feedback' })).findByText(semanticDiagnosis.addressed_question_reason)
+  expect(screen.getAllByRole('region', { name: 'Practice drill' })).toHaveLength(1)
+  const drill = within(screen.getByRole('region', { name: 'Answer feedback' })).getByRole('region', { name: 'Practice drill' })
+  expect(within(drill).getByRole('heading', { name: expectedDrill.title, level: 4 })).toBeTruthy()
+  expect(within(drill).getByText(expectedDrill.goal, { exact: true })).toBeTruthy()
+  const steps = within(drill).getByRole('list')
+  expect(steps.tagName).toBe('OL')
+  expect(within(steps).getAllByRole('listitem').map((step) => step.textContent)).toEqual(expectedDrill.steps)
+  expect(drill.textContent).not.toContain(expectedDrill.drill_version)
+  expect(drill.textContent).not.toContain(expectedDrill.focus)
+  expect(api.fetchMock.mock.calls).toHaveLength(beforeReturnRequests)
+  expect(api.fetchMock.mock.calls.filter(([url]) => String(url).endsWith('/comparison'))).toHaveLength(comparisonReads)
+  expect(JSON.stringify(api.detail(1))).toBe(beforeFacts)
+  expect(JSON.stringify(api.saved(1))).toBe(beforeAttempts)
+  expect(JSON.stringify(Object.entries(localStorage))).toBe(beforeLocalStorage)
+  expect(JSON.stringify(Object.entries(sessionStorage))).toBe(beforeSessionStorage)
+  expect(setItem).not.toHaveBeenCalled()
+  expect(removeItem).not.toHaveBeenCalled()
+  expect(clear).not.toHaveBeenCalled()
   expect(api.posts('/attempts')).toHaveLength(2)
   expect(api.posts('/continue')).toHaveLength(1)
   expect(api.posts('/transcriptions')).toHaveLength(1)
   expect(api.posts('/diagnosis')).toHaveLength(2)
   expect(JSON.stringify(Object.entries(localStorage))).not.toContain('Semantic-only')
   expect(JSON.stringify(Object.entries(sessionStorage))).not.toContain('Semantic-only')
+  for (const text of [expectedDrill.title, expectedDrill.goal, ...expectedDrill.steps]) {
+    expect(JSON.stringify(Object.entries(localStorage))).not.toContain(text)
+    expect(JSON.stringify(Object.entries(sessionStorage))).not.toContain(text)
+  }
 })
 
 test('successful Continue invalidates final points while the next-question editor remains mounted', async () => {
