@@ -5,10 +5,10 @@ import { deliveryUnavailableText, formatDeliveryDuration, TIMED_PAUSES_EXPLANATI
 
 export interface ProgressDashboardProps {
   history: HistoryHydrationState
-  storageError?: string | null
   onRetry: () => void
   onReload: () => void
   onPractice?: () => void
+  onLoadMore?: () => void
 }
 
 function MetricTable({ metric }: { metric: ProgressMetric }) {
@@ -66,26 +66,26 @@ function DeliveryMetricTable({ metric }: { metric: DeliveryProgressMetric }) {
   </div>
 }
 
-export default function ProgressDashboard({ history, storageError, onRetry, onReload, onPractice }: ProgressDashboardProps) {
+export default function ProgressDashboard({ history, onRetry, onReload, onPractice, onLoadMore }: ProgressDashboardProps) {
   const progress = projectProgress(history.summaries)
   const loading = history.status === 'loading' || history.status === 'idle'
   const complete = history.status === 'complete'
-  const empty = history.rememberedCount === 0
+  const empty = complete && history.summaries.length === 0
   const unrecordedDelivery = progress.points.filter((point) => point.measurement !== null && point.measurement.delivery_metrics === null).length
   return <section className="progress-dashboard" aria-label="Progress">
     <h2>Progress</h2>
-    <p>Objective practice history from sessions remembered on this browser.</p>
-    {storageError && <p role="status">{storageError}</p>}
+    <p>Objective practice history from your saved sessions.</p>
     {empty ? <>
-      <p>No sessions are remembered on this browser yet.</p>
+      <p>No saved sessions yet.</p>
       {onPractice && <button type="button" onClick={onPractice}>Practice</button>}
     </> : <>
-      {loading && <p role="status">Loading remembered sessions…</p>}
-      {history.status === 'error' && <p role="alert">Remembered sessions could not be loaded.</p>}
-      {history.status === 'partial' && <p role="alert">Some remembered sessions could not be loaded.</p>}
-      {!complete && <p>Progress totals are unavailable until all remembered sessions load.</p>}
+      {loading && <p role="status">Loading saved sessions…</p>}
+      {history.status === 'error' && <p role="alert">Saved sessions could not be loaded.</p>}
+      {history.pageError && history.status !== 'error' && <p role="alert">More saved sessions could not be loaded.</p>}
+      {!complete && <p>Progress totals are unavailable until all saved sessions load.</p>}
       {!loading && <div className="progress-actions">
-        {history.failedChunks.length > 0 && <button type="button" onClick={onRetry}>Retry failed history requests</button>}
+        {history.pageError && <button type="button" onClick={onRetry}>Retry history request</button>}
+        {history.nextCursor !== null && !history.pageError && onLoadMore && <button type="button" onClick={onLoadMore}>Load more sessions</button>}
         <button type="button" onClick={onReload}>Reload history</button>
       </div>}
       {complete && <section aria-label="Progress overview">
@@ -98,7 +98,6 @@ export default function ProgressDashboard({ history, storageError, onRetry, onRe
           <div><dt>Saved retries</dt><dd>{progress.overview.savedRetries}</dd></div>
           <div><dt>Measured final answers</dt><dd>{progress.overview.measuredFinalAnswers}</dd></div>
         </dl>
-        {history.missingIds.length > 0 && <p>{history.missingIds.length} remembered {history.missingIds.length === 1 ? 'session is' : 'sessions are'} unavailable. These totals describe the available persisted sessions.</p>}
       </section>}
       {progress.points.length === 0 && !loading && history.status !== 'error' && <p>No finalized question answers are available in the loaded sessions.</p>}
       {progress.points.length > 0 && <section aria-label="Finalized answer measurements">

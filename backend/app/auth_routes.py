@@ -8,7 +8,7 @@ exclude sensitive callback query strings.
 
 A committed local session whose response is never delivered can remain until its
 fixed expiry. There is no network-spanning transaction or compensating replay.
-HTTPS is required; this slice adds no insecure development-cookie exception.
+Cookies are Secure outside trusted matching loopback HTTP development settings.
 """
 
 import re
@@ -113,20 +113,20 @@ def _cookie_value(value: object) -> bool:
     return type(value) is str and re.fullmatch(r"[A-Za-z0-9_-]+", value) is not None
 
 
-def _failure(status: int = 400, *, clear_state: bool = False) -> JSONResponse:
+def _failure(status: int = 400, *, clear_state: bool = False, secure_cookies: bool = True) -> JSONResponse:
     response = JSONResponse(
         {"detail": _UNAVAILABLE if status == 503 else _LOGIN_FAILURE},
         status_code=status, headers=_NO_STORE,
     )
     if clear_state:
-        _clear_state_cookie(response)
+        _clear_state_cookie(response, secure_cookies=secure_cookies)
     return response
 
 
-def _clear_state_cookie(response: Response) -> None:
+def _clear_state_cookie(response: Response, *, secure_cookies: bool) -> None:
     response.delete_cookie(
         OIDC_STATE_COOKIE_NAME, path=OIDC_STATE_COOKIE_PATH,
-        secure=True, httponly=True, samesite="lax",
+        secure=secure_cookies, httponly=True, samesite="lax",
     )
 
 
@@ -158,7 +158,7 @@ async def login(
         response = RedirectResponse(location, status_code=302, headers=_NO_STORE)
         response.set_cookie(
             OIDC_STATE_COOKIE_NAME, issued.state, max_age=OIDC_STATE_COOKIE_MAX_AGE,
-            path=OIDC_STATE_COOKIE_PATH, secure=True, httponly=True, samesite="lax",
+            path=OIDC_STATE_COOKIE_PATH, secure=settings.secure_cookies, httponly=True, samesite="lax",
         )
         return response
     except Exception:
@@ -186,11 +186,11 @@ async def callback(
         proof = await run_in_threadpool(transactions.consume_login_transaction, state)
         consumed = True
         if type(proof) is not ConsumedLoginTransaction:
-            return _failure(503, clear_state=True)
+            return _failure(503, clear_state=True, secure_cookies=settings.secure_cookies)
         codes = request.query_params.getlist("code")
         # Provider-declared rejection burns the matching state, without exchange.
         if "error" in request.query_params or len(codes) != 1 or not _text(codes[0]):
-            return _failure(clear_state=True)
+            return _failure(clear_state=True, secure_cookies=settings.secure_cookies)
         phase = "verify"
         identity = await oidc.verify_callback(
             code=codes[0], state=state, expected_state=state,
@@ -198,21 +198,21 @@ async def callback(
         )
         if (type(identity) is not VerifiedExternalIdentity or not _text(identity.subject)
                 or identity.issuer != settings.oidc.issuer):
-            return _failure(clear_state=True)
+            return _failure(clear_state=True, secure_cookies=settings.secure_cookies)
         phase = "persist"
         user_id = await run_in_threadpool(store.provision_user, identity=identity)
         if type(user_id) is not UUID:
-            return _failure(503, clear_state=True)
+            return _failure(503, clear_state=True, secure_cookies=settings.secure_cookies)
         issued = await run_in_threadpool(store.create, user_id=user_id)
         if (type(issued) is not IssuedAuthSession or issued.principal.user_id != user_id
                 or not _cookie_value(issued.credential)):
-            return _failure(503, clear_state=True)
+            return _failure(503, clear_state=True, secure_cookies=settings.secure_cookies)
         response = RedirectResponse(settings.app_origin, status_code=302, headers=_NO_STORE)
         response.set_cookie(
             AUTH_SESSION_COOKIE_NAME, issued.credential, max_age=settings.session_ttl_seconds,
-            path="/", secure=True, httponly=True, samesite="lax",
+            path="/", secure=settings.secure_cookies, httponly=True, samesite="lax",
         )
-        _clear_state_cookie(response)
+        _clear_state_cookie(response, secure_cookies=settings.secure_cookies)
         return response
     except OIDCFailure as error:
         kind = _oidc_kind(error)
@@ -223,7 +223,7 @@ async def callback(
             status = 400
     except Exception:
         pass
-    return _failure(status, clear_state=consumed)
+    return _failure(status, clear_state=consumed, secure_cookies=settings.secure_cookies)
 
 
 def get_bootstrap_principal(request: Request, store: AuthSessionStoreDependency) -> AuthenticatedPrincipal:
@@ -252,7 +252,10 @@ def me(principal: Annotated[AuthenticatedPrincipal, Depends(get_bootstrap_princi
 
 
 @router.post("/logout", status_code=204)
-def logout(principal: AuthenticatedPrincipalDependency, store: AuthSessionStoreDependency) -> Response:
+def logout(
+    principal: AuthenticatedPrincipalDependency, store: AuthSessionStoreDependency,
+    settings: SettingsDependency,
+) -> Response:
     try:
         store.revoke(auth_session_id=principal.auth_session_id)
     except Exception:
@@ -260,7 +263,7 @@ def logout(principal: AuthenticatedPrincipalDependency, store: AuthSessionStoreD
     else:
         response = Response(status_code=204, headers=_NO_STORE)
         response.delete_cookie(
-            AUTH_SESSION_COOKIE_NAME, path="/", secure=True, httponly=True, samesite="lax",
+            AUTH_SESSION_COOKIE_NAME, path="/", secure=settings.secure_cookies, httponly=True, samesite="lax",
         )
         return response
     raise _http_failure(AuthenticationFailureKind.UNAVAILABLE) from None

@@ -121,6 +121,7 @@ def test_application_origin_is_exact_trusted_https_root(configuration, value):
 ])
 def test_valid_application_origin_is_preserved(configuration, value):
     configuration["AUTH_APP_ORIGIN"] = value
+    configuration["AUTH_OIDC_REDIRECT_URI"] = value.rstrip("/") + "/api/auth/callback"
     assert load_auth_settings(configuration).app_origin == value
 
 
@@ -234,3 +235,64 @@ def test_shutdown_exceptions_propagate(error):
 
     with pytest.raises(type(error)):
         load_auth_settings(InterruptedMapping())
+
+
+@pytest.mark.parametrize("host", ["localhost", "127.0.0.1", "[::1]"])
+def test_explicit_matching_loopback_http_origins_allow_port_differences(configuration, host):
+    configuration["AUTH_APP_ORIGIN"] = f"http://{host}:5173"
+    configuration["AUTH_OIDC_REDIRECT_URI"] = f"http://{host}:8000/api/auth/callback"
+    settings = load_auth_settings(configuration)
+    assert settings.app_origin == configuration["AUTH_APP_ORIGIN"]
+    assert settings.oidc.redirect_uri == configuration["AUTH_OIDC_REDIRECT_URI"]
+    assert settings.secure_cookies is False
+    assert settings.oidc.issuer == configuration["AUTH_OIDC_ISSUER"]
+
+
+def test_https_deployment_retains_secure_cookie_policy(configuration):
+    assert load_auth_settings(configuration).secure_cookies is True
+
+
+@pytest.mark.parametrize("origin,callback", [
+    ("http://localhost:5173", "http://127.0.0.1:8000"),
+    ("http://127.0.0.1:5173", "http://localhost:8000"),
+    ("http://[::1]:5173", "http://localhost:8000"),
+    ("http://localhost:5173", "https://localhost:8000"),
+    ("https://localhost:5173", "http://localhost:8000"),
+])
+def test_browser_origin_and_callback_require_matching_scheme_and_host(configuration, origin, callback):
+    configuration["AUTH_APP_ORIGIN"] = origin
+    configuration["AUTH_OIDC_REDIRECT_URI"] = callback + "/api/auth/callback"
+    assert_unavailable(configuration)
+
+
+def test_existing_https_application_callback_configuration_policy_is_preserved(configuration):
+    configuration["AUTH_APP_ORIGIN"] = "https://app.example"
+    configuration["AUTH_OIDC_REDIRECT_URI"] = "https://callback.example/api/auth/callback"
+    settings = load_auth_settings(configuration)
+    assert settings.app_origin == configuration["AUTH_APP_ORIGIN"]
+    assert settings.oidc.redirect_uri == configuration["AUTH_OIDC_REDIRECT_URI"]
+    assert settings.secure_cookies is True
+
+
+@pytest.mark.parametrize("host", [
+    "example.com", "localhost.example.com", "example.localhost", "0.0.0.0", "192.168.1.1",
+    "10.1.2.3", "172.16.0.1", "8.8.8.8", "*", "[::]", "[::ffff:127.0.0.1]",
+    "127.1", "2130706433", "localhost.",
+    "[::1]suffix", "[::1].example",
+])
+def test_http_requires_exact_approved_loopback_targets(configuration, host):
+    configuration["AUTH_APP_ORIGIN"] = f"http://{host}:5173"
+    configuration["AUTH_OIDC_REDIRECT_URI"] = f"http://{host}:8000/api/auth/callback"
+    assert_unavailable(configuration)
+
+
+@pytest.mark.parametrize("suffix", [":", ":0", ":65536", ":wrong", " ", "\\other", "\n", "\x00"])
+def test_malformed_loopback_origin_is_rejected(configuration, suffix):
+    configuration["AUTH_APP_ORIGIN"] = "http://localhost" + suffix
+    configuration["AUTH_OIDC_REDIRECT_URI"] = "http://localhost:8000/api/auth/callback"
+    assert_unavailable(configuration)
+
+
+def test_insecure_cookie_environment_flags_cannot_override_https_policy(configuration):
+    configuration.update({"AUTH_DISABLE_SECURE_COOKIES": "true", "DEBUG_INSECURE_COOKIES": "true"})
+    assert load_auth_settings(configuration).secure_cookies is True

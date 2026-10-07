@@ -433,6 +433,67 @@ def test_configuration_rejects_untrusted_issuer_urls(issuer):
         OIDCConfiguration(issuer=issuer, client_id=CLIENT_ID, redirect_uri=REDIRECT_URI)
 
 
+@pytest.mark.parametrize("uri", [
+    "https://app.example/callback", "http://localhost:8000/api/auth/callback",
+    "http://127.0.0.1:8000/api/auth/callback", "http://[::1]:8000/api/auth/callback",
+])
+def test_callback_uri_uses_https_or_only_explicit_loopback_http(uri):
+    config = OIDCConfiguration(issuer=ISSUER, client_id=CLIENT_ID, redirect_uri=uri)
+    assert config.redirect_uri == uri
+
+
+@pytest.mark.parametrize("uri", [
+    "http://0.0.0.0/callback", "http://192.168.1.2/callback", "http://10.1.2.3/callback",
+    "http://172.16.0.2/callback", "http://8.8.8.8/callback", "http://example.com/callback",
+    "http://localhost.example.com/callback", "http://example.localhost/callback", "http://*/callback",
+    "http://127.1/callback", "http://localhost./callback", "http://[::]/callback",
+    "http://localhost:wrong/callback", "http://localhost:65536/callback", "http://localhost:0/callback",
+    "http://localhost:/callback", "http://user:password@localhost/callback", "http://localhost/callback?",
+    "http://localhost/callback#", "http://local host/callback", "http://localhost\\other/callback",
+    " http://localhost/callback", "http://localhost/call\nback", "http://localhost/call\x00back",
+    "http://[invalid]/callback",
+    "http://[::1]evil:8000/callback", "http://[::1].example:8000/callback", "http://[::1]suffix/callback",
+])
+def test_http_callback_exception_rejects_non_loopback_or_malformed_uris(uri):
+    with pytest.raises(ValueError):
+        OIDCConfiguration(issuer=ISSUER, client_id=CLIENT_ID, redirect_uri=uri)
+
+
+@pytest.mark.parametrize("host", ["localhost", "127.0.0.1", "[::1]"])
+def test_loopback_callback_does_not_relax_https_issuer_policy(host):
+    with pytest.raises(ValueError):
+        OIDCConfiguration(
+            issuer=f"http://{host}:9000", client_id=CLIENT_ID,
+            redirect_uri=f"http://{host}:8000/api/auth/callback",
+        )
+
+
+def test_loopback_callback_preserves_real_library_exchange_and_https_provider_transport(provider):
+    callback = "http://localhost:8000/api/auth/callback"
+    verifier = AuthlibOIDCVerifier(
+        OIDCConfiguration(issuer=ISSUER, client_id=CLIENT_ID, redirect_uri=callback),
+        transport=provider.transport, clock=lambda: NOW,
+    )
+    assert provider.callback(verifier) == VerifiedExternalIdentity(issuer=ISSUER, subject=SUBJECT)
+    assert [str(request.url) for request in provider.requests] == [DISCOVERY_URI, TOKEN_URI, JWKS_URI]
+    assert all(request.url.scheme == "https" for request in provider.requests)
+    body = parse_qs(provider.exchange_requests()[0].content.decode("ascii"))
+    assert body["redirect_uri"] == [callback]
+    assert body["code_verifier"] == [VERIFIER]
+
+
+@pytest.mark.parametrize("endpoint", ["authorization_endpoint", "token_endpoint", "jwks_uri"])
+def test_loopback_redirect_exception_does_not_allow_http_provider_endpoints(provider, endpoint):
+    provider.discovery[endpoint] = "http://localhost:9000/provider"
+    verifier = AuthlibOIDCVerifier(
+        OIDCConfiguration(
+            issuer=ISSUER, client_id=CLIENT_ID, redirect_uri="http://localhost:8000/api/auth/callback",
+        ), transport=provider.transport, clock=lambda: NOW,
+    )
+    assert_failure(provider, OIDCFailureKind.UNAVAILABLE, verifier=verifier)
+    assert [str(request.url) for request in provider.requests] == [DISCOVERY_URI]
+
+
 def test_discovery_issuer_mismatch_fails_before_sending_code_or_verifier(provider):
     provider.discovery["issuer"] = "https://another-issuer.example.test"
     assert_failure(provider, OIDCFailureKind.UNAVAILABLE)

@@ -4,6 +4,7 @@ import type { InterviewSession, SpeakingMetrics } from './interviewApi'
 import { useAudioRecorder } from './useAudioRecorder'
 import DeliveryFacts from './DeliveryFacts'
 import type { DeliveryMetrics } from './deliveryMetrics'
+import { getAuthState, isAuthWorkspaceCurrent } from './auth'
 
 interface Props {
   session: InterviewSession
@@ -18,6 +19,10 @@ interface Props {
 }
 
 export default function AudioAnswer({ session, disabled, hasAnswer, onTranscript, onInvalidateMeasurement, onTranscribing, onBusyChange, onConflict, onUncertainTranscription }: Props) {
+  const [workspaceGeneration] = useState(() => {
+    const auth = getAuthState()
+    return auth.status === 'authenticated' ? auth.generation : null
+  })
   const recording = useAudioRecorder()
   const [uploadState, setUploadState] = useState<'idle' | 'uploading' | 'accepted' | 'transcribing' | 'transcribed' | 'error'>('idle')
   const [error, setError] = useState('')
@@ -47,13 +52,13 @@ export default function AudioAnswer({ session, disabled, hasAnswer, onTranscript
     setError('')
     try {
       const result = await transcribeAudio(session, audio, pending.signal)
-      if (!pending.signal.aborted) {
+      if (!pending.signal.aborted && workspaceGeneration !== null && isAuthWorkspaceCurrent(workspaceGeneration)) {
         onTranscript(result.text, result.measurement_id)
         setMeasurements({ blob: audio, metrics: result.metrics, delivery: result.delivery_metrics })
         setUploadState('transcribed')
       }
     } catch (cause) {
-      if (!pending.signal.aborted) {
+      if (!pending.signal.aborted && workspaceGeneration !== null && isAuthWorkspaceCurrent(workspaceGeneration)) {
         onInvalidateMeasurement()
         setUploadState('error')
         setError(cause instanceof ApiError ? cause.message : 'Transcription failed. Please try again.')
@@ -66,7 +71,7 @@ export default function AudioAnswer({ session, disabled, hasAnswer, onTranscript
         }
       }
     } finally {
-      if (!pending.signal.aborted) onTranscribing(false)
+      if (!pending.signal.aborted && workspaceGeneration !== null && isAuthWorkspaceCurrent(workspaceGeneration)) onTranscribing(false)
       if (controller.current === pending) controller.current = null
     }
   }
@@ -79,9 +84,9 @@ export default function AudioAnswer({ session, disabled, hasAnswer, onTranscript
     setError('')
     try {
       await uploadAudio(session, recording.blob, pending.signal)
-      if (!pending.signal.aborted) setUploadState('accepted')
+      if (!pending.signal.aborted && workspaceGeneration !== null && isAuthWorkspaceCurrent(workspaceGeneration)) setUploadState('accepted')
     } catch (cause) {
-      if (!pending.signal.aborted) {
+      if (!pending.signal.aborted && workspaceGeneration !== null && isAuthWorkspaceCurrent(workspaceGeneration)) {
         setUploadState('error')
         setError(cause instanceof ApiError ? cause.message : 'Audio upload failed. Please try again.')
         if (isConflictError(cause)) {

@@ -1,8 +1,8 @@
 """Explicit trusted settings for the backend browser authentication lifecycle.
 
 Loading is lazy and uncached. This boundary owns no request identity, database,
-HTTP client or principal. HTTPS deployment is required in this slice; local
-insecure-cookie exceptions are deliberately not part of this contract.
+HTTP client or principal. HTTPS deployment remains required outside explicitly
+configured, matching loopback HTTP browser origins and callback hosts.
 """
 
 from collections.abc import Mapping
@@ -12,20 +12,21 @@ import os
 from urllib.parse import urlsplit
 
 from app.auth import AuthenticationFailure, AuthenticationFailureKind
-from app.oidc_verifier import OIDCConfiguration
+from app.oidc_verifier import OIDCConfiguration, is_loopback_http_browser_url
 
 AUTH_SESSION_MIN_TTL_SECONDS = 60
 AUTH_SESSION_MAX_TTL_SECONDS = 86400
 
 
-def _trusted_https_url(value: object) -> bool:
+def _trusted_browser_url(value: object) -> bool:
     if (type(value) is not str or not value or
             any(character.isspace() or ord(character) < 32 or ord(character) == 127
                 for character in value) or "\\" in value):
         return False
     try:
         parsed = urlsplit(value)
-        return (parsed.scheme == "https" and bool(parsed.hostname) and
+        return ((parsed.scheme == "https" or is_loopback_http_browser_url(value)) and
+                bool(parsed.hostname) and
                 parsed.username is None and parsed.password is None and
                 (parsed.port is None or 1 <= parsed.port <= 65535) and
                 "?" not in value and "#" not in value)
@@ -44,13 +45,19 @@ class AuthSettings:
     def __post_init__(self) -> None:
         if type(self.oidc) is not OIDCConfiguration:
             raise TypeError("Authentication requires trusted OIDC configuration.")
-        if (not _trusted_https_url(self.oidc.issuer) or
-                not _trusted_https_url(self.oidc.redirect_uri) or
+        if (not _trusted_browser_url(self.oidc.issuer) or
+                urlsplit(self.oidc.issuer).scheme != "https"):
+            raise ValueError("Authentication OIDC issuer must use the trusted HTTPS policy.")
+        if (not _trusted_browser_url(self.oidc.redirect_uri) or
                 urlsplit(self.oidc.redirect_uri).path != "/api/auth/callback"):
-            raise ValueError("Authentication OIDC URLs must use the trusted HTTPS callback policy.")
-        if (not _trusted_https_url(self.app_origin) or
+            raise ValueError("Authentication callback URL must use the trusted browser callback policy.")
+        if (not _trusted_browser_url(self.app_origin) or
                 urlsplit(self.app_origin).path not in ("", "/")):
-            raise ValueError("Authentication application origin must be a trusted HTTPS root origin.")
+            raise ValueError("Authentication application origin must use the trusted browser root-origin policy.")
+        origin, callback = urlsplit(self.app_origin), urlsplit(self.oidc.redirect_uri)
+        if ("http" in (origin.scheme, callback.scheme) and
+                (origin.scheme != callback.scheme or origin.hostname != callback.hostname)):
+            raise ValueError("HTTP development application and callback URLs must share a browser scheme and host.")
         if type(self.session_ttl_seconds) is not int:
             raise TypeError("Authentication session lifetime must be an integer.")
         if not AUTH_SESSION_MIN_TTL_SECONDS <= self.session_ttl_seconds <= AUTH_SESSION_MAX_TTL_SECONDS:
@@ -59,6 +66,10 @@ class AuthSettings:
     @property
     def session_lifetime(self) -> timedelta:
         return timedelta(seconds=self.session_ttl_seconds)
+
+    @property
+    def secure_cookies(self) -> bool:
+        return urlsplit(self.app_origin).scheme == "https"
 
 
 def load_auth_settings(environment: Mapping[str, str] | None = None) -> AuthSettings:

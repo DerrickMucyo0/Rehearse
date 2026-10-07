@@ -9,7 +9,8 @@ const SESSION_ID = '11111111-1111-4111-8111-111111111111'
 const OTHER_ID = '22222222-2222-4222-8222-222222222222'
 const MEASUREMENT_ID = '33333333-3333-4333-8333-333333333333'
 const HISTORY_PREFIX = 'rehearse.history.v1:'
-const PRACTICE_KEY = 'rehearse.session_id'
+const USER_ID = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
+const PRACTICE_KEY = `rehearse.session_id:${USER_ID}`
 const questions = ['First interview question', 'Second interview question', 'Third interview question', 'Fourth interview question', 'Fifth interview question']
 const submittedAt = '2026-10-05T12:00:00Z'
 const metrics: SpeakingMetrics = { source: 'original_transcription', recognized_word_count: 3, um_count: 0, uh_count: 0,
@@ -80,7 +81,6 @@ function mockAppApi(initial = initialSession()) {
   let creations = 0
   const attempts = new Map<number, Attempt[]>()
   const known = new Map<string, InterviewSession>()
-  known.set(initial.id, initial)
   let intercept: ((url: string, options?: RequestInit) => Response | Promise<Response> | undefined) | undefined
   const saved = (questionIndex = session.current_question_index) => attempts.get(questionIndex) ?? []
   function append(answer: string, measurementId: string | null = null) {
@@ -139,19 +139,24 @@ function mockAppApi(initial = initialSession()) {
   }
   const fetchMock = vi.fn(async (input: RequestInfo | URL, options?: RequestInit): Promise<Response> => {
     const url = String(input)
+    if (url !== '/api/health' && url !== '/api/auth/me') {
+      expect(new Headers(options?.headers).get('X-Rehearse-Auth-Context')).toBe('context-A')
+    }
     const override = intercept?.(url, options)
     if (override) return await override
     if (url === '/api/health') return response({ status: 'ok', service: 'rehearse-api' })
+    if (url === '/api/auth/me') return response({ user_id: USER_ID, request_context: 'context-A' })
+    if (url === '/api/auth/logout') return new Response(null, { status: 204 })
     if (url === '/api/sessions' && options?.method === 'POST') {
       creations += 1
       session = initialSession()
       known.set(session.id, session)
       return response(session, 201)
     }
-    if (url === '/api/history/summaries' && options?.method === 'POST') {
-      const body = JSON.parse(options.body as string) as { session_ids: string[] }
-      return response({ summaries: body.session_ids.filter((id) => known.has(id)).map((id) => summary(known.get(id)!)),
-        missing_session_ids: body.session_ids.filter((id) => !known.has(id)) })
+    if (url === '/api/history/summaries') {
+      expect(options?.method).toBe('GET')
+      expect(options?.body).toBeUndefined()
+      return response({ items: [...known.values()].map(summary), next_cursor: null })
     }
     if (url.startsWith(`/api/sessions/${session.id}/history-detail`)) {
       const query = new URL(url, 'http://localhost').searchParams
@@ -207,7 +212,7 @@ function mockAppApi(initial = initialSession()) {
   })
   vi.stubGlobal('fetch', fetchMock)
   return { fetchMock, append, advance, saved, detail, session: () => session, creations: () => creations,
-    rememberKnown: (other: InterviewSession) => known.set(other.id, other),
+    addServerSession: (other: InterviewSession) => known.set(other.id, other),
     intercept: (next: typeof intercept) => { intercept = next },
     posts: (suffix: string) => fetchMock.mock.calls.filter(([url, options]) => String(url).endsWith(suffix) && options?.method === 'POST') }
 }
@@ -222,7 +227,7 @@ function assertNavigationBlocked() {
   expect(nav('Practice').getAttribute('aria-current')).toBe('page')
 }
 async function start() {
-  fireEvent.click(screen.getByRole('button', { name: 'Start Interview' }))
+  fireEvent.click(await screen.findByRole('button', { name: 'Start Interview' }))
   await screen.findByRole('textbox', { name: 'Your answer' })
 }
 async function submit(text: string) {
@@ -246,13 +251,17 @@ function overviewValue(label: string) {
   const name = within(progress()).getByText(label, { exact: true })
   return name.parentElement!
 }
-function remember(id: string) { localStorage.setItem(HISTORY_PREFIX + id, '1') }
-function summariesReadCount(api: ReturnType<typeof mockAppApi>) { return api.posts('/api/history/summaries').length }
+function summariesReads(api: ReturnType<typeof mockAppApi>) {
+  return api.fetchMock.mock.calls.filter(([url]) => String(url).startsWith('/api/history/summaries'))
+}
+function summariesReadCount(api: ReturnType<typeof mockAppApi>) { return summariesReads(api).length }
 async function openLoadedHistory() {
+  await screen.findByRole('navigation')
   go('History')
-  await screen.findByRole('button', { name: 'Open session' })
+  await screen.findAllByRole('button', { name: 'Open session' })
 }
 async function openLoadedProgress() {
+  await screen.findByRole('navigation')
   go('Progress')
   await waitFor(() => expect(within(progress()).getByText('Saved attempts', { exact: true })).toBeTruthy())
 }
@@ -290,17 +299,17 @@ test('History → Progress reuses an in-flight hydration without cancelling or d
   api.intercept((url) => url === '/api/history/summaries' ? pending.promise : undefined)
   go('History')
   await waitFor(() => expect(summariesReadCount(api)).toBe(1))
-  const signal = api.posts('/api/history/summaries')[0][1]?.signal
+  const signal = summariesReads(api)[0][1]?.signal
   go('Progress')
   expect(summariesReadCount(api)).toBe(1)
   expect(signal?.aborted).toBe(false)
-  await act(async () => pending.resolve(response({ summaries: [], missing_session_ids: [SESSION_ID] })))
-  await waitFor(() => expect(overviewValue('Active sessions').textContent).toContain('0'))
+  await act(async () => pending.resolve(response({ items: [], next_cursor: null })))
+  await within(progress()).findByText('No saved sessions yet.')
   expect(summariesReadCount(api)).toBe(1)
 })
 
-test('successful session creation invalidates a previously loaded remembered history', async () => {
-  const api = mockAppApi(); api.rememberKnown(initialSession(OTHER_ID)); remember(OTHER_ID)
+test('successful session creation invalidates previously loaded server history', async () => {
+  const api = mockAppApi(); api.addServerSession(initialSession(OTHER_ID))
   render(<App />); await openLoadedHistory()
   expect(summariesReadCount(api)).toBe(1)
   go('Practice'); await start()
@@ -309,7 +318,7 @@ test('successful session creation invalidates a previously loaded remembered his
   await openLoadedProgress()
   expect(summariesReadCount(api)).toBe(2)
   expect(overviewValue('Active sessions').textContent).toContain('2')
-  expect(rememberedKeys()).toEqual([HISTORY_PREFIX + SESSION_ID, HISTORY_PREFIX + OTHER_ID])
+  expect(rememberedKeys()).toEqual([])
 })
 
 test('successful Attempt submission invalidates counts without promoting the open question to a metric point', async () => {
@@ -374,7 +383,7 @@ test('semantic diagnosis completion preserves finalized measurements, attempt fa
   }
   await openLoadedHistory()
   expect(summariesReadCount(api)).toBe(reads)
-  const history = screen.getByRole('region', { name: 'Remembered session history' })
+  const history = screen.getByRole('region', { name: 'Session history' })
   expect(within(history).getByText('Attempts', { exact: true }).nextElementSibling?.textContent).toBe('2')
   expect(within(history).queryByText(semanticDiagnosis.addressed_question_reason)).toBeNull()
   expect(within(history).queryByRole('region', { name: 'Practice drill' })).toBeNull()
@@ -464,7 +473,7 @@ test.each([
   }
   const beforePauseCount = within(progress()).getByRole('region', { name: 'Pause count' }).textContent
   if (hiddenView === 'History') await openLoadedHistory()
-  const visiblePanel = screen.getByRole('region', { name: hiddenView === 'History' ? 'Remembered session history' : 'Progress' })
+  const visiblePanel = screen.getByRole('region', { name: hiddenView === 'History' ? 'Session history' : 'Progress' })
   const beforePanel = visiblePanel.innerHTML
   const beforeFacts = JSON.stringify(api.detail(null))
   const beforeAttempts = JSON.stringify(questions.map((_, index) => api.saved(index)))
@@ -493,7 +502,7 @@ test.each([
   expect(within(progress()).getByRole('region', { name: 'Pause count' }).textContent).toBe(beforePauseCount)
   expect(within(progress()).queryByRole('region', { name: 'Interview summary' })).toBeNull()
   await openLoadedHistory()
-  expect(within(screen.getByRole('region', { name: 'Remembered session history' })).queryByRole('region', { name: 'Interview summary' })).toBeNull()
+  expect(within(screen.getByRole('region', { name: 'Session history' })).queryByRole('region', { name: 'Interview summary' })).toBeNull()
   go('Practice')
   expect(screen.getByRole('region', { name: 'Interview summary' })).toBe(summary)
   expect(summary.getAttribute('aria-busy')).toBe('false')
@@ -580,68 +589,64 @@ test('successful Continue invalidates final points while the next-question edito
   expect(api.posts('/continue')).toHaveLength(1)
 })
 
-test('a same-membership history storage event invalidates facts without losing Practice state', async () => {
+test('legacy membership storage events cannot invalidate server facts or lose Practice state', async () => {
   const api = mockAppApi(); render(<App />); await start(); await openLoadedProgress()
   expect(overviewValue('Saved attempts').textContent).toContain('0')
   api.append('Saved in another browser tab')
   act(() => window.dispatchEvent(new StorageEvent('storage', {
     key: HISTORY_PREFIX + SESSION_ID, oldValue: '1', newValue: '1', storageArea: localStorage,
   })))
-  await waitFor(() => expect(summariesReadCount(api)).toBe(2))
+  expect(summariesReadCount(api)).toBe(1)
+  expect(overviewValue('Saved attempts').textContent).toContain('0')
+  fireEvent.click(within(progress()).getByRole('button', { name: 'Reload history' }))
   await waitFor(() => expect(overviewValue('Saved attempts').textContent).toContain('1'))
-  expect(rememberedKeys()).toEqual([HISTORY_PREFIX + SESSION_ID])
-  go('History')
-  await screen.findByRole('button', { name: 'Open session' })
+  expect(summariesReadCount(api)).toBe(2)
+  expect(rememberedKeys()).toEqual([])
+  await openLoadedHistory()
   expect(summariesReadCount(api)).toBe(2)
   go('Practice')
   expect(screen.getByRole('textbox')).toBeTruthy()
 })
 
-test('a history event while Practice is active invalidates lazily and ignores unrelated storage events', async () => {
+test('legacy and unrelated storage events during Practice cannot trigger hidden server discovery', async () => {
   const api = mockAppApi(); render(<App />); await start(); await openLoadedProgress(); go('Practice')
-  act(() => window.dispatchEvent(new StorageEvent('storage', {
-    key: 'unrelated.preference', newValue: '1', storageArea: localStorage,
-  })))
-  await openLoadedProgress()
-  expect(summariesReadCount(api)).toBe(1)
-  go('Practice')
-  api.append('A saved fact from another tab')
-  act(() => window.dispatchEvent(new StorageEvent('storage', {
-    key: HISTORY_PREFIX + SESSION_ID, oldValue: '1', newValue: '1', storageArea: localStorage,
-  })))
+  for (const key of ['unrelated.preference', HISTORY_PREFIX + SESSION_ID]) {
+    act(() => window.dispatchEvent(new StorageEvent('storage', { key, newValue: '1', storageArea: localStorage })))
+  }
   expect(summariesReadCount(api)).toBe(1)
   await openLoadedProgress()
-  expect(summariesReadCount(api)).toBe(2)
-  expect(overviewValue('Saved attempts').textContent).toContain('1')
+  expect(summariesReadCount(api)).toBe(1)
+  expect(overviewValue('Saved attempts').textContent).toContain('0')
 })
 
-test('removing a remembered ID invalidates both views and preserves the current Practice session', async () => {
-  const api = mockAppApi(); api.rememberKnown(initialSession(OTHER_ID)); remember(OTHER_ID)
+test('server-owned membership ignores removal of a legacy browser ID in both views', async () => {
+  const api = mockAppApi(); api.addServerSession(initialSession(OTHER_ID))
+  localStorage.setItem(HISTORY_PREFIX + OTHER_ID, '1')
   render(<App />); await start(); await openLoadedProgress()
   expect(overviewValue('Active sessions').textContent).toContain('2')
-  go('History')
-  await waitFor(() => expect(screen.getAllByRole('button', { name: 'Open session' })).toHaveLength(2))
-  const first = screen.getAllByRole('button', { name: 'Remove from this browser' })[0]
-  fireEvent.click(first)
-  await waitFor(() => expect(screen.getAllByRole('button', { name: 'Open session' })).toHaveLength(1))
-  expect(summariesReadCount(api)).toBe(2)
+  localStorage.removeItem(HISTORY_PREFIX + OTHER_ID)
+  act(() => window.dispatchEvent(new StorageEvent('storage', { key: HISTORY_PREFIX + OTHER_ID, newValue: null, storageArea: localStorage })))
+  await openLoadedHistory()
+  expect(screen.getAllByRole('button', { name: 'Open session' })).toHaveLength(2)
+  expect(screen.queryByRole('button', { name: 'Remove from this browser' })).toBeNull()
   await openLoadedProgress()
-  expect(overviewValue('Active sessions').textContent).toContain('1')
-  expect(summariesReadCount(api)).toBe(2)
+  expect(overviewValue('Active sessions').textContent).toContain('2')
+  expect(summariesReadCount(api)).toBe(1)
   go('Practice')
   expect(screen.getByRole('textbox')).toBeTruthy()
   expect(sessionStorage.getItem(PRACTICE_KEY)).toBe(SESSION_ID)
 })
 
-test('clearing remembered history clears shared Progress facts and no server delete occurs', async () => {
+test('clearing legacy browser storage cannot clear authenticated History or Progress facts', async () => {
   const api = mockAppApi(); render(<App />); await start(); await openLoadedProgress()
-  vi.spyOn(window, 'confirm').mockReturnValue(true)
-  go('History'); await screen.findByRole('button', { name: 'Open session' })
-  fireEvent.click(screen.getByRole('button', { name: 'Clear remembered history' }))
-  await screen.findByText('No sessions are remembered on this browser yet.')
-  go('Progress')
-  await within(progress()).findByText('No sessions are remembered on this browser yet.')
-  expect(within(progress()).queryByText('Saved attempts', { exact: true })).toBeNull()
+  localStorage.setItem(HISTORY_PREFIX + SESSION_ID, '1')
+  localStorage.clear()
+  act(() => window.dispatchEvent(new StorageEvent('storage', { key: null, storageArea: localStorage })))
+  await openLoadedHistory()
+  expect(screen.getAllByRole('button', { name: 'Open session' })).toHaveLength(1)
+  expect(screen.queryByRole('button', { name: 'Clear remembered history' })).toBeNull()
+  await openLoadedProgress()
+  expect(overviewValue('Active sessions').textContent).toContain('1')
   expect(summariesReadCount(api)).toBe(1)
   expect(api.fetchMock.mock.calls.some(([, options]) => options?.method === 'DELETE')).toBe(false)
   go('Practice')
@@ -649,19 +654,19 @@ test('clearing remembered history clears shared Progress facts and no server del
   expect(sessionStorage.getItem(PRACTICE_KEY)).toBe(SESSION_ID)
 })
 
-test('clearing history cancels a pending shared read and prevents its late result from restoring rows', async () => {
+test('legacy clear cannot cancel or authorize a pending server discovery response', async () => {
   const api = mockAppApi(); render(<App />); await start()
   const pending = deferred<Response>()
   api.intercept((url) => url === '/api/history/summaries' ? pending.promise : undefined)
-  vi.spyOn(window, 'confirm').mockReturnValue(true)
   go('History')
   await waitFor(() => expect(summariesReadCount(api)).toBe(1))
-  fireEvent.click(screen.getByRole('button', { name: 'Clear remembered history' }))
-  await screen.findByText('No sessions are remembered on this browser yet.')
+  const signal = summariesReads(api)[0][1]?.signal
+  localStorage.clear()
+  act(() => window.dispatchEvent(new StorageEvent('storage', { key: null, storageArea: localStorage })))
+  expect(signal?.aborted).toBe(false)
   go('Progress')
-  await within(progress()).findByText('No sessions are remembered on this browser yet.')
-  expect(api.posts('/api/history/summaries')[0][1]?.signal?.aborted).toBe(true)
-  await act(async () => pending.resolve(response({ summaries: [], missing_session_ids: [SESSION_ID] })))
+  await act(async () => pending.resolve(response({ items: [], next_cursor: null })))
+  await within(progress()).findByText('No saved sessions yet.')
   expect(within(progress()).queryByText('Active sessions', { exact: true })).toBeNull()
   go('History')
   expect(screen.queryByRole('button', { name: 'Open session' })).toBeNull()
@@ -669,35 +674,42 @@ test('clearing history cancels a pending shared read and prevents its late resul
   expect(summariesReadCount(api)).toBe(1)
 })
 
-test('partial hydration persists across navigation and manual retry requests only the failed chunk', async () => {
+test('server pagination persists across navigation and manual retry resumes only the failed cursor', async () => {
   const api = mockAppApi()
-  const ids = Array.from({ length: 51 }, (_, index) => `00000000-0000-4000-8000-${(index + 1).toString(16).padStart(12, '0')}`)
-  ids.forEach((id) => { remember(id); api.rememberKnown(initialSession(id)) })
+  const ids = Array.from({ length: 11 }, (_, index) => `00000000-0000-4000-8000-${(index + 1).toString(16).padStart(12, '0')}`)
+  const sample = api.detail(null).summary
+  const firstPage = ids.slice(0, 10).map((session_id) => ({ ...sample, session_id }))
+  const lastPage = { ...sample, session_id: ids[10] }
   let failLast = true
   api.intercept((url, options) => {
-    if (url !== '/api/history/summaries') return undefined
-    const requested = (JSON.parse(options!.body as string) as { session_ids: string[] }).session_ids
-    if (requested.includes(ids[50]) && failLast) return response({}, 503)
-    return undefined
+    if (!url.startsWith('/api/history/summaries')) return undefined
+    expect(options?.method).toBe('GET')
+    expect(options?.body).toBeUndefined()
+    const cursor = new URL(url, 'http://localhost').searchParams.get('cursor')
+    if (cursor === 'next-page') return failLast ? response({}, 500) : response({ items: [lastPage], next_cursor: null })
+    expect(cursor).toBeNull()
+    return response({ items: firstPage, next_cursor: 'next-page' })
   })
-  render(<App />); go('Progress')
-  await within(progress()).findByText('Progress totals are unavailable until all remembered sessions load.')
+  render(<App />); await screen.findByRole('navigation'); go('Progress')
+  await within(progress()).findByRole('button', { name: 'Load more sessions' })
+  expect(within(progress()).getByText('Progress totals are unavailable until all saved sessions load.')).toBeTruthy()
   expect(within(progress()).queryByText('Saved attempts', { exact: true })).toBeNull()
+  expect(summariesReadCount(api)).toBe(1)
+  fireEvent.click(within(progress()).getByRole('button', { name: 'Load more sessions' }))
+  await within(progress()).findByRole('button', { name: 'Retry history request' })
   expect(summariesReadCount(api)).toBe(2)
   go('History')
-  await waitFor(() => expect(screen.getAllByRole('button', { name: 'Open session' })).toHaveLength(50))
+  await waitFor(() => expect(screen.getAllByRole('button', { name: 'Open session' })).toHaveLength(10))
   expect(screen.getByText(/These results are incomplete/)).toBeTruthy()
   go('Progress')
-  expect(within(progress()).getByText('Progress totals are unavailable until all remembered sessions load.')).toBeTruthy()
-  expect(summariesReadCount(api)).toBe(2)
+  expect(within(progress()).getByText('Progress totals are unavailable until all saved sessions load.')).toBeTruthy()
   failLast = false
-  fireEvent.click(within(progress()).getByRole('button', { name: /Retry.*history/i }))
-  await waitFor(() => expect(overviewValue('Active sessions').textContent).toContain('51'))
+  fireEvent.click(within(progress()).getByRole('button', { name: 'Retry history request' }))
+  await waitFor(() => expect(overviewValue('Active sessions').textContent).toContain('11'))
   expect(summariesReadCount(api)).toBe(3)
-  const retryBody = JSON.parse(api.posts('/api/history/summaries')[2][1]!.body as string) as { session_ids: string[] }
-  expect(retryBody.session_ids).toEqual([ids[50]])
+  expect(new URL(String(summariesReads(api)[2][0]), 'http://localhost').searchParams.get('cursor')).toBe('next-page')
   go('History')
-  await waitFor(() => expect(screen.getAllByRole('button', { name: 'Open session' })).toHaveLength(51))
+  await waitFor(() => expect(screen.getAllByRole('button', { name: 'Open session' })).toHaveLength(11))
   expect(summariesReadCount(api)).toBe(3)
 })
 
@@ -717,11 +729,11 @@ test('a stale history response cannot overwrite a newer successful Practice inva
   await openLoadedProgress()
   expect(summariesReadCount(api)).toBe(2)
   expect(overviewValue('Saved attempts').textContent).toContain('1')
-  await act(async () => pending.resolve(response({ summaries: [initialSummary], missing_session_ids: [] })))
+  await act(async () => pending.resolve(response({ items: [initialSummary], next_cursor: null })))
   expect(overviewValue('Saved attempts').textContent).toContain('1')
   await openLoadedHistory()
   expect(summariesReadCount(api)).toBe(2)
-  const facts = within(screen.getByRole('region', { name: 'Remembered session history' }))
+  const facts = within(screen.getByRole('region', { name: 'Session history' }))
   expect(facts.getByText('Attempts', { exact: true }).nextElementSibling?.textContent).toBe('1')
 })
 

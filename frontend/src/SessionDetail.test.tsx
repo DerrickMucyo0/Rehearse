@@ -1,3 +1,4 @@
+import { authenticateTestWorkspace } from './authTestUtils'
 // @vitest-environment jsdom
 import { act, cleanup, fireEvent, render, screen, within } from '@testing-library/react'
 import { afterEach, beforeEach, expect, test, vi } from 'vitest'
@@ -98,7 +99,7 @@ function lastPage(answer?: string): HistoryDetail {
 }
 
 function props(sessionId = FIRST) {
-  return { sessionId, onBack: vi.fn(), onRemove: vi.fn() }
+  return { sessionId, onBack: vi.fn() }
 }
 
 function deferred<T>() {
@@ -123,7 +124,8 @@ function savedHeadings(questionNumber: number): string[] {
     .queryAllByRole('heading', { level: 5 }).map((heading) => heading.textContent!)
 }
 
-beforeEach(() => {
+beforeEach(async () => {
+  await authenticateTestWorkspace()
   readDetail.mockReset().mockResolvedValue(overview())
   forbiddenFetch.mockReset().mockRejectedValue(new Error('Unmocked network is forbidden'))
   microphoneAccess.mockReset().mockRejectedValue(new Error('Microphone access is forbidden in History'))
@@ -183,7 +185,6 @@ test('loads an overview without a question selector and shows five factual, acce
   expect(view.container.textContent).not.toMatch(/\b(improved|better|worse|good|bad|score|performance|readiness|confidence)\b/i)
   fireEvent.click(screen.getByRole('button', { name: 'Back to History' }))
   expect(options.onBack).toHaveBeenCalledOnce()
-  expect(options.onRemove).not.toHaveBeenCalled()
 })
 
 test('completed sessions show the persisted completion timestamp and five finalized questions without a current question', async () => {
@@ -291,10 +292,9 @@ test('an overview failure is safe and retried only through Retry session request
   expect(readDetail.mock.calls[1][0]).toBe(FIRST)
   expect(readDetail.mock.calls[1][1]).not.toHaveProperty('questionIndex')
   expect(screen.queryByRole('alert')).toBeNull()
-  expect(options.onRemove).not.toHaveBeenCalled()
 })
 
-test('a missing overview shows safe unavailability and removes only through the explicit local callback', async () => {
+test('a missing overview shows safe unavailability without a local membership deletion control', async () => {
   readDetail.mockRejectedValueOnce(new HistoryApiError(PRIVATE_ERROR, 404))
   const options = props()
   const view = render(<SessionDetail {...options} />)
@@ -303,10 +303,7 @@ test('a missing overview shows safe unavailability and removes only through the 
   expect(screen.getByRole('button', { name: 'Retry session request' })).toBeTruthy()
   expect(view.container.textContent).not.toContain(PRIVATE_ERROR)
   expect(view.container.textContent).not.toContain(FIRST)
-  expect(options.onRemove).not.toHaveBeenCalled()
-  fireEvent.click(screen.getByRole('button', { name: 'Remove from this browser' }))
-  expect(options.onRemove).toHaveBeenCalledOnce()
-  expect(options.onRemove).toHaveBeenCalledWith(FIRST)
+  expect(screen.queryByRole('button', { name: 'Remove from this browser' })).toBeNull()
   expect(readDetail).toHaveBeenCalledOnce()
 })
 
@@ -342,7 +339,7 @@ test('a failed later page preserves saved attempts and retries the same backend 
   expect(screen.queryByRole('alert')).toBeNull()
 })
 
-test('a selected-page 404 clears stale details and offers explicit removal from this browser', async () => {
+test('a selected-page 404 clears stale details without offering local membership deletion', async () => {
   readDetail.mockResolvedValueOnce(overview()).mockRejectedValueOnce(new HistoryApiError(PRIVATE_ERROR, 404))
   const options = props()
   render(<SessionDetail {...options} />)
@@ -350,9 +347,7 @@ test('a selected-page 404 clears stale details and offers explicit removal from 
   expect((await screen.findByRole('alert')).textContent).toBe('This session is unavailable.')
   expect(screen.queryByRole('region', { name: 'Saved questions' })).toBeNull()
   expect(screen.queryByRole('button', { name: 'Retry saved attempts' })).toBeNull()
-  expect(options.onRemove).not.toHaveBeenCalled()
-  fireEvent.click(screen.getByRole('button', { name: 'Remove from this browser' }))
-  expect(options.onRemove).toHaveBeenCalledWith(FIRST)
+  expect(screen.queryByRole('button', { name: 'Remove from this browser' })).toBeNull()
   expect(readDetail).toHaveBeenCalledTimes(2)
 })
 
@@ -463,7 +458,6 @@ test.each(['overview', 'page'] as const)('unmounting aborts a pending %s read an
   expect(view.container.textContent).toBe('')
   expect(screen.queryByRole('region', { name: 'Session detail' })).toBeNull()
   expect(options.onBack).not.toHaveBeenCalled()
-  expect(options.onRemove).not.toHaveBeenCalled()
 })
 
 function persistedMeasurement(delivery_metrics: DeliveryMetrics | null): HistoryMeasurement {

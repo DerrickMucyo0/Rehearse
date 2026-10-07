@@ -6,6 +6,7 @@ import { buildInterviewSummary } from './interviewSummary'
 import type { InterviewSummary as Summary } from './interviewSummary'
 import { describeUnavailableReason, formatProgressValue, PROGRESS_METRICS } from './progress'
 import type { ProgressMetricId } from './progress'
+import { getAuthState, isAuthWorkspaceCurrent } from './auth'
 
 type Snapshot =
   | { sessionId: string; status: 'error' }
@@ -18,6 +19,10 @@ function unavailableReason(measurement: HistoryMeasurement, metric: ProgressMetr
 }
 
 function OwnedInterviewSummary({ sessionId }: { sessionId: string }) {
+  const [workspaceGeneration] = useState(() => {
+    const auth = getAuthState()
+    return auth.status === 'authenticated' ? auth.generation : null
+  })
   const [snapshot, setSnapshot] = useState<Snapshot | null>(null)
   const generation = useRef(0)
   const owner = useRef<string | null>(null)
@@ -26,7 +31,8 @@ function OwnedInterviewSummary({ sessionId }: { sessionId: string }) {
     const controller = new AbortController()
     const read = ++generation.current
     owner.current = sessionId
-    const current = () => !controller.signal.aborted && generation.current === read && owner.current === sessionId
+    const current = () => workspaceGeneration !== null && isAuthWorkspaceCurrent(workspaceGeneration) &&
+      !controller.signal.aborted && generation.current === read && owner.current === sessionId
     // A discarded mount (including development StrictMode replay) owns no read.
     void Promise.resolve().then(() => {
       if (current()) return getHistoryDetail(sessionId, { signal: controller.signal })
@@ -43,7 +49,7 @@ function OwnedInterviewSummary({ sessionId }: { sessionId: string }) {
       generation.current += 1
       owner.current = null
     }
-  }, [sessionId])
+  }, [sessionId, workspaceGeneration])
 
   const current = snapshot?.sessionId === sessionId ? snapshot : null
   const loading = current === null

@@ -9,7 +9,8 @@ const SESSION_ID = '11111111-1111-4111-8111-111111111111'
 const OTHER_ID = '22222222-2222-4222-8222-222222222222'
 const MEASUREMENT_ID = '33333333-3333-4333-8333-333333333333'
 const HISTORY_PREFIX = 'rehearse.history.v1:'
-const PRACTICE_KEY = 'rehearse.session_id'
+const USER_ID = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
+const PRACTICE_KEY = `rehearse.session_id:${USER_ID}`
 const questions = ['First interview question', 'Second interview question', 'Third interview question', 'Fourth interview question', 'Fifth interview question']
 const submittedAt = '2026-10-05T12:00:00Z'
 const metrics: SpeakingMetrics = { source: 'original_transcription', recognized_word_count: 3, um_count: 0, uh_count: 0,
@@ -80,7 +81,6 @@ function mockAppApi(initial = initialSession()) {
   let creations = 0
   const attempts = new Map<number, Attempt[]>()
   const known = new Map<string, InterviewSession>()
-  known.set(initial.id, initial)
   let intercept: ((url: string, options?: RequestInit) => Response | Promise<Response> | undefined) | undefined
   const saved = (questionIndex = session.current_question_index) => attempts.get(questionIndex) ?? []
   function append(answer: string, measurementId: string | null = null) {
@@ -132,19 +132,24 @@ function mockAppApi(initial = initialSession()) {
   }
   const fetchMock = vi.fn(async (input: RequestInfo | URL, options?: RequestInit): Promise<Response> => {
     const url = String(input)
+    if (url !== '/api/health' && url !== '/api/auth/me') {
+      expect(new Headers(options?.headers).get('X-Rehearse-Auth-Context')).toBe('context-A')
+    }
     const override = intercept?.(url, options)
     if (override) return await override
     if (url === '/api/health') return response({ status: 'ok', service: 'rehearse-api' })
+    if (url === '/api/auth/me') return response({ user_id: USER_ID, request_context: 'context-A' })
+    if (url === '/api/auth/logout') return new Response(null, { status: 204 })
     if (url === '/api/sessions' && options?.method === 'POST') {
       creations += 1
       session = initialSession()
       known.set(session.id, session)
       return response(session, 201)
     }
-    if (url === '/api/history/summaries' && options?.method === 'POST') {
-      const body = JSON.parse(options.body as string) as { session_ids: string[] }
-      return response({ summaries: body.session_ids.filter((id) => known.has(id)).map((id) => summary(known.get(id)!)),
-        missing_session_ids: body.session_ids.filter((id) => !known.has(id)) })
+    if (url === '/api/history/summaries') {
+      expect(options?.method).toBe('GET')
+      expect(options?.body).toBeUndefined()
+      return response({ items: [...known.values()].map(summary), next_cursor: null })
     }
     if (url.startsWith(`/api/sessions/${session.id}/history-detail`)) {
       const query = new URL(url, 'http://localhost').searchParams
@@ -200,7 +205,7 @@ function mockAppApi(initial = initialSession()) {
   })
   vi.stubGlobal('fetch', fetchMock)
   return { fetchMock, append, advance, saved, detail, session: () => session, creations: () => creations,
-    rememberKnown: (other: InterviewSession) => known.set(other.id, other),
+    addServerSession: (other: InterviewSession) => known.set(other.id, other),
     intercept: (next: typeof intercept) => { intercept = next },
     posts: (suffix: string) => fetchMock.mock.calls.filter(([url, options]) => String(url).endsWith(suffix) && options?.method === 'POST') }
 }
@@ -215,7 +220,7 @@ function assertNavigationBlocked() {
   expect(nav('Practice').getAttribute('aria-current')).toBe('page')
 }
 async function start() {
-  fireEvent.click(screen.getByRole('button', { name: 'Start Interview' }))
+  fireEvent.click(await screen.findByRole('button', { name: 'Start Interview' }))
   await screen.findByRole('textbox', { name: 'Your answer' })
 }
 async function submit(text: string) {
@@ -242,7 +247,7 @@ test('navigation preserves the same idle typed editor while displaying objective
   await screen.findByRole('heading', { name: 'History' })
   expect(screen.queryByRole('textbox')).toBeNull()
   go('Progress')
-  expect(await screen.findByText('Objective practice history from sessions remembered on this browser.')).toBeTruthy()
+  expect(await screen.findByText('Objective practice history from your saved sessions.')).toBeTruthy()
   expect(nav('Progress').getAttribute('aria-current')).toBe('page')
   go('Practice')
   expect(screen.getByRole('textbox')).toBe(editor)
@@ -285,10 +290,10 @@ test.each([
   expect((nav('History') as HTMLButtonElement).disabled).toBe(false)
   expect((nav('Progress') as HTMLButtonElement).disabled).toBe(false)
   go('History'); await screen.findByRole('heading', { name: 'History' })
-  go('Progress'); await screen.findByText('Objective practice history from sessions remembered on this browser.')
+  go('Progress'); await screen.findByText('Objective practice history from your saved sessions.')
   await within(screen.getByRole('region', { name: 'Progress' })).findByText('Saved attempts', { exact: true })
   if (hiddenView === 'History') { go('History'); await screen.findByRole('heading', { name: 'History' }) }
-  const hiddenPanel = screen.getByRole('region', { name: hiddenView === 'History' ? 'Remembered session history' : 'Progress' })
+  const hiddenPanel = screen.getByRole('region', { name: hiddenView === 'History' ? 'Session history' : 'Progress' })
   const beforePanel = hiddenPanel.innerHTML
   const beforeRequests = api.fetchMock.mock.calls.length
   const beforeFacts = JSON.stringify(api.detail(0))
@@ -339,7 +344,7 @@ test.each([
   expect((nav('History') as HTMLButtonElement).disabled).toBe(false)
   expect((nav('Progress') as HTMLButtonElement).disabled).toBe(false)
   go('History'); await screen.findByRole('heading', { name: 'History' })
-  go('Progress'); await screen.findByText('Objective practice history from sessions remembered on this browser.')
+  go('Progress'); await screen.findByText('Objective practice history from your saved sessions.')
   go('Practice')
   expect(screen.getByRole('heading', { name: 'Attempt 1' })).toBe(attemptHeading)
   expect(api.fetchMock.mock.calls).toHaveLength(beforeRequests)
@@ -402,7 +407,7 @@ test.each([
   go('Progress')
   await within(screen.getByRole('region', { name: 'Progress' })).findByText('Saved attempts', { exact: true })
   if (hiddenView === 'History') { go('History'); await screen.findByRole('heading', { name: 'History' }) }
-  const visiblePanel = screen.getByRole('region', { name: hiddenView === 'History' ? 'Remembered session history' : 'Progress' })
+  const visiblePanel = screen.getByRole('region', { name: hiddenView === 'History' ? 'Session history' : 'Progress' })
   const beforePanel = visiblePanel.innerHTML
   const beforeFacts = JSON.stringify(api.detail(null))
   const beforeAttempts = JSON.stringify(questions.map((_, index) => api.saved(index)))
@@ -457,7 +462,7 @@ test.each([
   expect(within(summary).queryByRole('region', { name: 'Practice drill' })).toBeNull()
   expect((screen.getByRole('button', { name: 'Start New Interview' }) as HTMLButtonElement).disabled).toBe(false)
   go('History'); await screen.findByRole('heading', { name: 'History' })
-  go('Progress'); await screen.findByText('Objective practice history from sessions remembered on this browser.')
+  go('Progress'); await screen.findByText('Objective practice history from your saved sessions.')
   go('Practice')
   view.rerender(<App />)
   expect(screen.getByRole('region', { name: 'Interview summary' })).toBe(summary)
@@ -490,26 +495,40 @@ test('same-draft transcript edits retain measurement linkage across navigation',
   await screen.findByRole('button', { name: 'Continue' })
   const body = JSON.parse(api.posts('/attempts')[0][1]!.body as string) as { measurement_id: string; answer: string }
   expect(body).toMatchObject({ measurement_id: MEASUREMENT_ID, answer: 'Edited recorded answer' })
-  expect(rememberedKeys()).toEqual([HISTORY_PREFIX + SESSION_ID])
-  expect(localStorage.getItem(HISTORY_PREFIX + SESSION_ID)).toBe('1')
+  expect(rememberedKeys()).toEqual([])
+  expect(localStorage.getItem(HISTORY_PREFIX + SESSION_ID)).toBeNull()
 })
 
-test('successful creation remembers only its canonical ID and no Practice content', async () => {
+test('successful creation scopes only its canonical restore ID to the authenticated user and stores no Practice content', async () => {
   mockAppApi(); render(<App />); await start()
   fireEvent.change(screen.getByRole('textbox'), { target: { value: 'Private unsaved draft' } })
-  expect(rememberedKeys()).toEqual([HISTORY_PREFIX + SESSION_ID])
-  expect(localStorage.getItem(HISTORY_PREFIX + SESSION_ID)).toBe('1')
+  expect(rememberedKeys()).toEqual([])
+  expect(localStorage.getItem(HISTORY_PREFIX + SESSION_ID)).toBeNull()
   expect(sessionStorage.getItem(PRACTICE_KEY)).toBe(SESSION_ID)
   expect(JSON.stringify(localStorage)).not.toMatch(/Private unsaved draft|First interview question|recognized_word_count|measurement_id/)
 })
 
-test('successful verified Practice restore registers an existing session', async () => {
+test('successful verified Practice restore uses the authenticated user key without registering History membership', async () => {
   const api = mockAppApi(); api.append('Previously saved answer')
   sessionStorage.setItem(PRACTICE_KEY, SESSION_ID)
   render(<App />)
   await screen.findByRole('button', { name: 'Continue' })
-  expect(rememberedKeys()).toEqual([HISTORY_PREFIX + SESSION_ID])
+  expect(rememberedKeys()).toEqual([])
   expect(api.creations()).toBe(0)
+})
+
+test('legacy unscoped and another user restore IDs are ignored by the authenticated workspace', async () => {
+  const api = mockAppApi()
+  sessionStorage.setItem('rehearse.session_id', SESSION_ID)
+  sessionStorage.setItem('rehearse.session_id:bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb', OTHER_ID)
+  render(<App />)
+  await screen.findByRole('button', { name: 'Start Interview' })
+  expect(api.fetchMock.mock.calls.some(([url]) => String(url).startsWith('/api/sessions/'))).toBe(false)
+  expect(api.creations()).toBe(0)
+  expect(sessionStorage.getItem(PRACTICE_KEY)).toBeNull()
+  await start()
+  expect(sessionStorage.getItem(PRACTICE_KEY)).toBe(SESSION_ID)
+  expect(sessionStorage.getItem('request_context')).toBeNull()
 })
 
 test.each(['create_failure', 'malformed_creation_id', 'unknown_restore'] as const)('%s is never registered as History', async (scenario) => {
@@ -524,100 +543,98 @@ test.each(['create_failure', 'malformed_creation_id', 'unknown_restore'] as cons
     return undefined
   })
   render(<App />)
-  if (scenario !== 'unknown_restore') fireEvent.click(screen.getByRole('button', { name: 'Start Interview' }))
-  if (scenario !== 'malformed_creation_id') await screen.findByRole('alert')
+  if (scenario !== 'unknown_restore') fireEvent.click(await screen.findByRole('button', { name: 'Start Interview' }))
+  if (scenario !== 'malformed_creation_id') await screen.findAllByRole('alert')
   else await screen.findByRole('textbox')
   expect(rememberedKeys()).toEqual([])
 })
 
-test('history storage write failure leaves Practice usable and warns without leaking details', async () => {
-  mockAppApi()
+test('legacy History storage is never written and a storage write policy cannot block Practice', async () => {
+  const api = mockAppApi()
   const original = Storage.prototype.setItem
-  vi.spyOn(Storage.prototype, 'setItem').mockImplementation(function (this: Storage, key, value) {
+  const writes = vi.spyOn(Storage.prototype, 'setItem').mockImplementation(function (this: Storage, key, value) {
     if (this === localStorage) throw new DOMException('private quota details', 'QuotaExceededError')
     original.call(this, key, value)
   })
   render(<App />); await start()
-  expect(screen.getByText('History could not be saved in this browser.')).toBeTruthy()
+  expect(screen.queryByText('History could not be saved in this browser.')).toBeNull()
   expect(document.body.textContent).not.toContain('private quota details')
-  fireEvent.change(screen.getByRole('textbox'), { target: { value: 'Still usable' } })
-  fireEvent.click(screen.getByRole('button', { name: 'Submit Attempt' }))
-  await screen.findByRole('button', { name: 'Continue' })
+  await submit('Still usable')
   expect(sessionStorage.getItem(PRACTICE_KEY)).toBe(SESSION_ID)
+  expect(writes.mock.instances).not.toContain(localStorage)
+  expect(api.posts('/attempts')).toHaveLength(1)
 })
 
-test('the 501st History registration does not evict remembered IDs or block Practice', async () => {
+test('500 legacy browser IDs do not influence authenticated server History or block Practice', async () => {
   for (let index = 1; index <= 500; index += 1) {
     const id = `00000000-0000-4000-8000-${index.toString(16).padStart(12, '0')}`
     localStorage.setItem(HISTORY_PREFIX + id, '1')
   }
-  mockAppApi(); render(<App />); await start()
+  const api = mockAppApi(); render(<App />); await start()
   expect(rememberedKeys()).toHaveLength(500)
   expect(localStorage.getItem(HISTORY_PREFIX + SESSION_ID)).toBeNull()
-  expect(screen.getByText(/History storage is full/)).toBeTruthy()
+  expect(screen.queryByText(/History storage is full/)).toBeNull()
   fireEvent.change(screen.getByRole('textbox'), { target: { value: 'Practice remains available' } })
   expect((screen.getByRole('button', { name: 'Submit Attempt' }) as HTMLButtonElement).disabled).toBe(false)
+  go('History')
+  await screen.findByRole('button', { name: 'Open session' })
+  expect(screen.getAllByRole('button', { name: 'Open session' })).toHaveLength(1)
+  expect(api.posts('/api/history/summaries')).toHaveLength(0)
 })
 
-test('clear remembered History removes browser discovery only and preserves the live draft and restore ID', async () => {
+test('reloading server History preserves the live draft and restoration ID without deleting anything', async () => {
   const api = mockAppApi(); render(<App />); await start()
   const editor = screen.getByRole('textbox')
   fireEvent.change(editor, { target: { value: 'Keep my current answer' } })
   localStorage.setItem('unrelated.preference', 'keep')
-  vi.spyOn(window, 'confirm').mockReturnValue(true)
-  go('History'); await screen.findByRole('button', { name: 'Clear remembered history' })
-  fireEvent.click(screen.getByRole('button', { name: 'Clear remembered history' }))
-  expect(window.confirm).toHaveBeenCalledWith(expect.stringContaining('It does not delete sessions stored on the server.'))
-  await screen.findByText('No sessions are remembered on this browser yet.')
+  go('History'); await screen.findByRole('button', { name: 'Open session' })
+  expect(screen.queryByRole('button', { name: 'Clear remembered history' })).toBeNull()
+  fireEvent.click(screen.getByRole('button', { name: 'Reload history' }))
+  await screen.findByRole('button', { name: 'Open session' })
   expect(rememberedKeys()).toEqual([])
   expect(localStorage.getItem('unrelated.preference')).toBe('keep')
   expect(sessionStorage.getItem(PRACTICE_KEY)).toBe(SESSION_ID)
   go('Practice')
   expect(screen.getByRole('textbox')).toBe(editor)
   expect((editor as HTMLTextAreaElement).value).toBe('Keep my current answer')
-  expect(rememberedKeys()).toEqual([])
   expect(api.posts('/attempts')).toHaveLength(0)
   expect(api.posts('/continue')).toHaveLength(0)
+  expect(api.fetchMock.mock.calls.some(([, options]) => options?.method === 'DELETE')).toBe(false)
 })
 
-test('other-tab add/remove/clear storage events refresh History without losing Practice', async () => {
-  const api = mockAppApi(); api.rememberKnown(initialSession(OTHER_ID))
+test('other-tab legacy add/remove/clear storage events cannot change server History or Practice', async () => {
+  const api = mockAppApi(); api.addServerSession(initialSession(OTHER_ID))
   render(<App />); await start(); go('History')
-  await screen.findByRole('button', { name: 'Open session' })
+  await waitFor(() => expect(screen.getAllByRole('button', { name: 'Open session' })).toHaveLength(2))
+  const reads = api.fetchMock.mock.calls.length
   localStorage.setItem(HISTORY_PREFIX + OTHER_ID, '1')
   act(() => window.dispatchEvent(new StorageEvent('storage', { key: HISTORY_PREFIX + OTHER_ID, newValue: '1', storageArea: localStorage })))
-  await waitFor(() => expect(screen.getAllByRole('button', { name: 'Open session' })).toHaveLength(2))
   localStorage.removeItem(HISTORY_PREFIX + OTHER_ID)
   act(() => window.dispatchEvent(new StorageEvent('storage', { key: HISTORY_PREFIX + OTHER_ID, newValue: null, storageArea: localStorage })))
-  await waitFor(() => expect(screen.getAllByRole('button', { name: 'Open session' })).toHaveLength(1))
-  localStorage.removeItem(HISTORY_PREFIX + SESSION_ID)
   act(() => window.dispatchEvent(new StorageEvent('storage', { key: null, storageArea: localStorage })))
-  await screen.findByText('No sessions are remembered on this browser yet.')
+  expect(screen.getAllByRole('button', { name: 'Open session' })).toHaveLength(2)
+  expect(api.fetchMock.mock.calls).toHaveLength(reads)
   go('Practice')
   expect(screen.getByRole('textbox')).toBeTruthy()
   expect(sessionStorage.getItem(PRACTICE_KEY)).toBe(SESSION_ID)
 })
 
-test('a failed local clear rehydrates retained sessions without losing the Practice draft', async () => {
+test('server History reload does not access legacy browser removal even when storage policy rejects it', async () => {
   const api = mockAppApi(); render(<App />); await start()
   const editor = screen.getByRole('textbox')
   fireEvent.change(editor, { target: { value: 'Keep this draft after a storage failure' } })
-  vi.spyOn(window, 'confirm').mockReturnValue(true)
   go('History'); await screen.findByRole('button', { name: 'Open session' })
-  const readsBefore = api.posts('/api/history/summaries').length
   const original = Storage.prototype.removeItem
   vi.spyOn(Storage.prototype, 'removeItem').mockImplementation(function (this: Storage, key) {
-    if (this === localStorage && key.startsWith(HISTORY_PREFIX)) throw new DOMException('private storage details', 'SecurityError')
+    if (this === localStorage) throw new DOMException('private storage details', 'SecurityError')
     original.call(this, key)
   })
-  fireEvent.click(screen.getByRole('button', { name: 'Clear remembered history' }))
+  fireEvent.click(screen.getByRole('button', { name: 'Reload history' }))
   await screen.findByRole('button', { name: 'Open session' })
-  expect(api.posts('/api/history/summaries').length).toBeGreaterThan(readsBefore)
-  expect(within(screen.getByRole('region', { name: 'Remembered session history' }))
-    .getByText('History could not be saved in this browser.')).toBeTruthy()
   expect(document.body.textContent).not.toContain('private storage details')
-  expect(rememberedKeys()).toEqual([HISTORY_PREFIX + SESSION_ID])
+  expect(rememberedKeys()).toEqual([])
   expect(sessionStorage.getItem(PRACTICE_KEY)).toBe(SESSION_ID)
+  expect(api.posts('/api/history/summaries')).toHaveLength(0)
   go('Practice')
   expect(screen.getByRole('textbox')).toBe(editor)
   expect((editor as HTMLTextAreaElement).value).toBe('Keep this draft after a storage failure')
@@ -637,7 +654,7 @@ test('navigation is blocked while session creation is pending', async () => {
   const api = mockAppApi(); const pending = deferred<Response>()
   api.intercept((url) => url === '/api/sessions' ? pending.promise : undefined)
   render(<App />)
-  fireEvent.click(screen.getByRole('button', { name: 'Start Interview' }))
+  fireEvent.click(await screen.findByRole('button', { name: 'Start Interview' }))
   assertNavigationBlocked()
   await act(async () => pending.resolve(response(initialSession(), 201)))
   await screen.findByRole('textbox')
@@ -747,22 +764,22 @@ test('unavailable localStorage cannot prevent current-tab Practice creation', as
     throw new DOMException('private browser policy details', 'SecurityError')
   })
   render(<App />); await start()
-  expect(screen.getByText('History could not be saved in this browser.')).toBeTruthy()
+  expect(screen.queryByText('History could not be saved in this browser.')).toBeNull()
   expect(sessionStorage.getItem(PRACTICE_KEY)).toBe(SESSION_ID)
   expect(document.body.textContent).not.toContain('private browser policy details')
   expect((screen.getByRole('textbox') as HTMLTextAreaElement).disabled).toBe(false)
 })
 
-test('removing the live session from History does not remove the safe Practice draft or restoration ID', async () => {
+test('History has no browser removal control and preserves the safe Practice draft and restoration ID', async () => {
   const api = mockAppApi(); render(<App />); await start()
-  fireEvent.change(screen.getByRole('textbox'), { target: { value: 'Keep this draft after local removal' } })
-  go('History'); await screen.findByRole('button', { name: 'Remove from this browser' })
-  fireEvent.click(screen.getByRole('button', { name: 'Remove from this browser' }))
-  await screen.findByText('No sessions are remembered on this browser yet.')
+  fireEvent.change(screen.getByRole('textbox'), { target: { value: 'Keep this draft after viewing History' } })
+  go('History'); await screen.findByRole('button', { name: 'Open session' })
+  expect(screen.queryByRole('button', { name: 'Remove from this browser' })).toBeNull()
+  expect(screen.queryByRole('button', { name: 'Clear remembered history' })).toBeNull()
   expect(localStorage.getItem(HISTORY_PREFIX + SESSION_ID)).toBeNull()
   expect(sessionStorage.getItem(PRACTICE_KEY)).toBe(SESSION_ID)
   go('Practice')
-  expect((screen.getByRole('textbox') as HTMLTextAreaElement).value).toBe('Keep this draft after local removal')
+  expect((screen.getByRole('textbox') as HTMLTextAreaElement).value).toBe('Keep this draft after viewing History')
   expect(rememberedKeys()).toEqual([])
   expect(api.posts('/attempts')).toHaveLength(0)
   expect(api.posts('/continue')).toHaveLength(0)

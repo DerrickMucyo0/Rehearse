@@ -29,7 +29,7 @@ function summary(changes: Partial<HistorySummary> = {}): HistorySummary {
   }
 }
 function state(summaries: HistorySummary[] = [summary()], changes: Partial<HistoryHydrationState> = {}): HistoryHydrationState {
-  return { status: 'complete', summaries, missingIds: [], failedChunks: [], rememberedCount: summaries.length, ...changes }
+  return { status: 'complete', summaries, nextCursor: null, pageError: false, ...changes }
 }
 function setup(history: HistoryHydrationState = state()) {
   const props = { history, onRetry: vi.fn(), onReload: vi.fn(), onPractice: vi.fn() }
@@ -39,20 +39,20 @@ function setup(history: HistoryHydrationState = state()) {
 beforeEach(() => { vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new Error('Provider and other unmocked requests forbidden'))) })
 afterEach(() => { cleanup(); expect(fetch).not.toHaveBeenCalled(); vi.unstubAllGlobals() })
 
-test('loading remembered entries has a readable status and hides complete totals', () => {
-  setup(state([], { status: 'loading', rememberedCount: 1 }))
-  expect(screen.getByRole('status').textContent).toBe('Loading remembered sessions…')
+test('loading server History has a readable status and hides complete totals', () => {
+  setup(state([], { status: 'loading' }))
+  expect(screen.getByRole('status').textContent).toBe('Loading saved sessions…')
   expect(screen.queryByRole('region', { name: 'Progress overview' })).toBeNull()
-  expect(screen.getByText('Progress totals are unavailable until all remembered sessions load.')).toBeTruthy()
+  expect(screen.getByText('Progress totals are unavailable until all saved sessions load.')).toBeTruthy()
 })
 test('idle hydration is presented as loading rather than an empty server', () => {
-  setup(state([], { status: 'idle', rememberedCount: 1 }))
+  setup(state([], { status: 'idle' }))
   expect(screen.getByRole('status')).toBeTruthy()
-  expect(screen.queryByText('No sessions are remembered on this browser yet.')).toBeNull()
+  expect(screen.queryByText('No saved sessions yet.')).toBeNull()
 })
-test('empty remembered history explicitly identifies browser scope', () => {
+test('empty server History explicitly offers Practice', () => {
   const { props } = setup(state([]))
-  expect(screen.getByText('No sessions are remembered on this browser yet.')).toBeTruthy()
+  expect(screen.getByText('No saved sessions yet.')).toBeTruthy()
   expect(screen.queryByRole('region', { name: 'Progress overview' })).toBeNull()
   expect(screen.queryByRole('table')).toBeNull()
   fireEvent.click(screen.getByRole('button', { name: 'Practice' }))
@@ -65,20 +65,20 @@ test('complete hydration renders factual overview and five individual metric tab
   expect(screen.queryByRole('alert')).toBeNull()
 })
 test('partial hydration hides totals while preserving loaded chronological facts', () => {
-  const { props } = setup(state([summary()], { status: 'partial', rememberedCount: 2, failedChunks: [[SECOND]] }))
-  expect(screen.getByRole('alert').textContent).toBe('Some remembered sessions could not be loaded.')
+  const { props } = setup(state([summary()], { status: 'partial', nextCursor: 'next', pageError: true }))
+  expect(screen.getByRole('alert').textContent).toBe('More saved sessions could not be loaded.')
   expect(screen.queryByRole('region', { name: 'Progress overview' })).toBeNull()
   expect(screen.getByText('Showing finalized answers from loaded sessions only.')).toBeTruthy()
   expect(screen.getAllByRole('table')).toHaveLength(5)
-  fireEvent.click(screen.getByRole('button', { name: 'Retry failed history requests' }))
+  fireEvent.click(screen.getByRole('button', { name: 'Retry history request' }))
   expect(props.onRetry).toHaveBeenCalledOnce()
 })
 test('failed hydration is retryable and distinct from an empty registry', () => {
-  const { props } = setup(state([], { status: 'error', rememberedCount: 1, failedChunks: [[FIRST]] }))
-  expect(screen.getByRole('alert').textContent).toBe('Remembered sessions could not be loaded.')
-  expect(screen.queryByText('No sessions are remembered on this browser yet.')).toBeNull()
+  const { props } = setup(state([], { status: 'error', pageError: true }))
+  expect(screen.getByRole('alert').textContent).toBe('Saved sessions could not be loaded.')
+  expect(screen.queryByText('No saved sessions yet.')).toBeNull()
   expect(screen.queryByRole('region', { name: 'Progress overview' })).toBeNull()
-  fireEvent.click(screen.getByRole('button', { name: 'Retry failed history requests' }))
+  fireEvent.click(screen.getByRole('button', { name: 'Retry history request' }))
   expect(props.onRetry).toHaveBeenCalledOnce()
 })
 test('reload delegates to shared history owner without fetching itself', () => {
@@ -86,10 +86,13 @@ test('reload delegates to shared history owner without fetching itself', () => {
   fireEvent.click(screen.getByRole('button', { name: 'Reload history' }))
   expect(props.onReload).toHaveBeenCalledOnce()
 })
-test('storage errors remain nonblocking and clearly readable', () => {
-  render(<ProgressDashboard history={state()} onRetry={vi.fn()} onReload={vi.fn()} storageError="History could not be saved in this browser." />)
-  expect(screen.getByRole('status').textContent).toBe('History could not be saved in this browser.')
-  expect(screen.getByRole('region', { name: 'Progress overview' })).toBeTruthy()
+test('more server pages keep totals incomplete and provide an explicit load-more action', () => {
+  const onLoadMore = vi.fn()
+  render(<ProgressDashboard history={state([summary()], { status: 'partial', nextCursor: 'next' })} onRetry={vi.fn()} onReload={vi.fn()} onLoadMore={onLoadMore} />)
+  expect(screen.queryByRole('alert')).toBeNull()
+  expect(screen.queryByRole('region', { name: 'Progress overview' })).toBeNull()
+  fireEvent.click(screen.getByRole('button', { name: 'Load more sessions' }))
+  expect(onLoadMore).toHaveBeenCalledOnce()
 })
 
 test.each([
@@ -194,10 +197,6 @@ test('active and completed row contexts are displayed without raw UUIDs', () => 
   expect(screen.getAllByText('Completed')).toHaveLength(5)
   expect(container.textContent).not.toContain(FIRST)
   expect(container.textContent).not.toContain(SECOND)
-})
-test('unavailable remembered server entries are described without claiming their totals', () => {
-  setup(state([summary()], { missingIds: [SECOND], rememberedCount: 2 }))
-  expect(screen.getByText('1 remembered session is unavailable. These totals describe the available persisted sessions.')).toBeTruthy()
 })
 test('loaded sessions without finalized answers show factual no-points state', () => {
   setup(state([summary({ finalized_points: [], finalized_question_count: 0, measured_final_answer_count: 0 })]))
@@ -341,12 +340,12 @@ test('delivery rows retain chronological order and microseconds rather than supp
 })
 
 test('partial hydration shows loaded delivery facts while suppressing all overview totals', () => {
-  const { props } = setup(state([summary({ finalized_points: [recordedPoint()] })], { status: 'partial', failedChunks: [[SECOND]], rememberedCount: 2 }))
+  const { props } = setup(state([summary({ finalized_points: [recordedPoint()] })], { status: 'partial', nextCursor: 'next', pageError: true }))
   expect(screen.queryByRole('region', { name: 'Progress overview' })).toBeNull()
-  expect(screen.getByText('Progress totals are unavailable until all remembered sessions load.')).toBeTruthy()
+  expect(screen.getByText('Progress totals are unavailable until all saved sessions load.')).toBeTruthy()
   expect(screen.getByText('Showing finalized answers from loaded sessions only.')).toBeTruthy()
   expect(within(screen.getByRole('region', { name: 'Timed pauses' })).getAllByRole('table')).toHaveLength(3)
-  fireEvent.click(screen.getByRole('button', { name: 'Retry failed history requests' }))
+  fireEvent.click(screen.getByRole('button', { name: 'Retry history request' }))
   expect(props.onRetry).toHaveBeenCalledOnce()
 })
 

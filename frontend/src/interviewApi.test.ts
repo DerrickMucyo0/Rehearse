@@ -1,9 +1,11 @@
-import { afterEach, expect, test, vi } from 'vitest'
+import { afterEach, beforeEach, expect, test, vi } from 'vitest'
 import { ApiError, continueQuestion, getAttempts, getComparison, getSemanticDiagnosis, getSession, isConflictError, SemanticDiagnosisError, startInterview, submitAttempt, transcribeAudio, uploadAudio } from './interviewApi'
 import type { Attempt, DeliveryComparison, DeliveryMetricChange, InterviewSession, MetricChange, SemanticDiagnosis } from './interviewApi'
 import { DELIVERY_TIMING_REASONS } from './deliveryMetrics'
 import type { DeliveryMetrics } from './deliveryMetrics'
 import semanticDiagnosisContract from './fixtures/semanticDiagnosis.v1.json?raw'
+import { authenticateTestWorkspace } from './authTestUtils'
+import { AUTH_CONTEXT_HEADER, getAuthState } from './auth'
 
 const session: InterviewSession = {
   id: 'session-1', status: 'active', current_question_index: 2, current_question: 'Third',
@@ -29,7 +31,54 @@ function mockResponse(response: Response) {
   vi.stubGlobal('fetch', fetchMock)
   return fetchMock
 }
+beforeEach(async () => { await authenticateTestWorkspace() })
 afterEach(() => { vi.useRealTimers(); vi.unstubAllGlobals(); vi.restoreAllMocks() })
+
+test.each([
+  ['session', () => getSession(session.id)],
+  ['start', () => startInterview()],
+  ['attempt submission', () => submitAttempt(session, 'New attempt')],
+  ['continue', () => continueQuestion(session)],
+  ['attempt history', () => getAttempts(session)],
+  ['comparison', () => getComparison(session)],
+  ['audio upload', () => uploadAudio(session, new Blob(['audio']), new AbortController().signal)],
+  ['transcription', () => transcribeAudio(session, new Blob(['audio']), new AbortController().signal)],
+  ['diagnosis', () => getSemanticDiagnosis(session.id, 2, 4, new AbortController().signal)],
+] as const)('every %s Practice API uses the shared context-bearing same-origin boundary', async (_name, invoke) => {
+  const fetchMock = mockResponse(json({}))
+  await invoke().catch(() => undefined)
+  expect(fetchMock).toHaveBeenCalledTimes(1)
+  const [path, options] = fetchMock.mock.calls[0]
+  expect(path).toMatch(/^\/api\//)
+  expect(options.credentials).toBe('same-origin')
+  const headers = new Headers(options.headers)
+  expect(headers.get(AUTH_CONTEXT_HEADER)).toBe('context-A')
+  expect(headers.has('Authorization')).toBe(false)
+  expect(headers.has('Cookie')).toBe(false)
+  expect(headers.has('X-User-Id')).toBe(false)
+})
+
+test.each([[401, 'signed_out'], [403, 'stale']] as const)(
+  'attempt mutation %s preserves auth boundary invalidation and is never replayed', async (status, expected) => {
+    const fetchMock = mockResponse(json({ detail: 'private response' }, status))
+    await expect(submitAttempt(session, 'New attempt')).rejects.toMatchObject({ name: 'AuthBoundaryError', status })
+    expect(getAuthState()).toEqual({ status: expected })
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+  },
+)
+
+test('a late Practice JSON body cannot cross from authenticated A into B', async () => {
+  let resolve!: (value: unknown) => void
+  const response = json(session)
+  const body = vi.spyOn(response, 'json').mockReturnValue(new Promise((done) => { resolve = done }))
+  mockResponse(response)
+  const pending = getSession(session.id).catch((cause: unknown) => cause)
+  await vi.waitFor(() => expect(body).toHaveBeenCalledTimes(1))
+  await authenticateTestWorkspace('context-B', '144b50e1-0183-428c-943f-1850df006b66')
+  resolve(session)
+  expect(await pending).toMatchObject({ name: 'AuthBoundaryError' })
+  expect(getAuthState()).toMatchObject({ status: 'authenticated', requestContext: 'context-B' })
+})
 
 test('reads the authoritative session without submitting an answer', async () => {
   const fetchMock = mockResponse(json(session))
@@ -142,7 +191,8 @@ test('transcription sends the exact attempt revision without JSON headers', asyn
   const fetchMock = mockResponse(json(result))
   expect(await transcribeAudio(session, new Blob(['audio'], { type: 'audio/webm' }), new AbortController().signal)).toEqual(result)
   const options = fetchMock.mock.calls[0][1] as RequestInit
-  expect(options.headers).toBeUndefined()
+  expect(new Headers(options.headers).get('Content-Type')).toBeNull()
+  expect(new Headers(options.headers).get(AUTH_CONTEXT_HEADER)).toBe('context-A')
   const body = options.body as FormData
   expect(body.get('expected_last_attempt_number')).toBe('3')
   expect(body.get('question_index')).toBe('2')
@@ -316,9 +366,10 @@ test('requests exactly one bodyless semantic diagnosis POST for the specified pe
   expect(fetchMock.mock.calls[0][0]).toBe('/api/sessions/session-1/questions/2/attempts/4/diagnosis')
   const options = fetchMock.mock.calls[0][1] as RequestInit
   expect(options.method).toBe('POST')
-  expect(Object.keys(options).sort()).toEqual(['method', 'signal'])
+  expect(Object.keys(options).sort()).toEqual(['cache', 'credentials', 'headers', 'method', 'signal'])
   expect(options.body).toBeUndefined()
-  expect(options.headers).toBeUndefined()
+  expect(new Headers(options.headers).get('Content-Type')).toBeNull()
+  expect(new Headers(options.headers).get(AUTH_CONTEXT_HEADER)).toBe('context-A')
   expect(JSON.stringify(options)).not.toContain(session.current_question)
   expect(JSON.stringify(options)).not.toContain(attempt.answer)
 })

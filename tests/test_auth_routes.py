@@ -261,11 +261,11 @@ def cookie_header(response, name):
     return None
 
 
-def assert_cookie(response, name, *, path, max_age, deleted=False):
+def assert_cookie(response, name, *, path, max_age, deleted=False, secure=True):
     cookie = cookie_header(response, name)
     assert cookie is not None
     assert cookie["httponly"] is True
-    assert cookie["secure"] is True
+    assert bool(cookie["secure"]) is secure
     assert cookie["samesite"].lower() == "lax"
     assert cookie["path"] == path
     assert cookie["domain"] == ""
@@ -980,3 +980,95 @@ def test_committed_authentication_rows_are_unchanged_by_read_only_me(postgres_ha
         assert response.status_code == 200
         assert response.headers["Cache-Control"] == "no-store"
     assert rows() == before
+
+
+@pytest.mark.parametrize("origin,callback,secure", [
+    (ORIGIN, REDIRECT_URI, True),
+    ("http://localhost:5173", "http://localhost:8000/api/auth/callback", False),
+    ("http://127.0.0.1:5173", "http://127.0.0.1:8000/api/auth/callback", False),
+    ("http://[::1]:5173", "http://[::1]:8000/api/auth/callback", False),
+])
+def test_trusted_cookie_policy_applies_to_login_callback_and_logout_without_other_attribute_changes(origin, callback, secure):
+    config = auth_routes.AuthSettings(
+        oidc=OIDCConfiguration(issuer=ISSUER, client_id=CLIENT_ID, redirect_uri=callback),
+        app_origin=origin, session_ttl_seconds=3600,
+    )
+    transactions, verifier, sessions = Transactions(), Verifier(), Sessions()
+
+    async def authorization_url(*, transaction):
+        return AUTHORIZATION_URI + "?" + urlencode({
+            "response_type": "code", "scope": "openid", "client_id": CLIENT_ID,
+            "redirect_uri": callback, "state": transaction.state, "nonce": transaction.nonce,
+            "code_challenge": transaction.code_challenge, "code_challenge_method": "S256",
+        })
+
+    verifier.authorization_url = authorization_url
+    application = application_for(config, transactions, verifier, sessions)
+    with TestClient(application, base_url=origin, follow_redirects=False) as client:
+        started = client.get("/api/auth/login", headers={"X-Forwarded-Proto": "http" if secure else "https"})
+        assert started.status_code == 302
+        state = parse_qs(urlsplit(started.headers["Location"]).query)["state"][0]
+        assert_cookie(
+            started, auth_routes.OIDC_STATE_COOKIE_NAME,
+            path=auth_routes.OIDC_STATE_COOKIE_PATH, max_age=600, secure=secure,
+        )
+        diagnosed = client.get("/api/auth/callback", params={
+            "state": state, "code": CODE_A, "secure": "false" if secure else "true",
+        })
+        assert diagnosed.status_code == 302
+        assert diagnosed.headers["Location"] == origin
+        cookie = assert_cookie(diagnosed, AUTH_SESSION_COOKIE_NAME, path="/", max_age=3600, secure=secure)
+        assert_cookie(
+            diagnosed, auth_routes.OIDC_STATE_COOKIE_NAME,
+            path=auth_routes.OIDC_STATE_COOKIE_PATH, max_age=0, deleted=True, secure=secure,
+        )
+        assert cookie.value == sessions.issued[0].credential
+        assert cookie.value not in diagnosed.text + diagnosed.headers["Location"]
+        bootstrap = client.get("/api/auth/me")
+        assert bootstrap.status_code == 200
+        assert bootstrap.json() == {
+            "user_id": str(sessions.issued[0].principal.user_id),
+            "request_context": sessions.issued[0].principal.request_context,
+        }
+        ended = client.post("/api/auth/logout", headers={
+            AUTH_REQUEST_CONTEXT_HEADER: sessions.issued[0].principal.request_context,
+            "X-Forwarded-Proto": "http" if secure else "https",
+        })
+        assert ended.status_code == 204
+        assert_cookie(ended, AUTH_SESSION_COOKIE_NAME, path="/", max_age=0, deleted=True, secure=secure)
+        assert len(sessions.issued) == 1
+        assert sessions.revoked == [sessions.issued[0].principal.auth_session_id]
+        assert client.get("/api/auth/me").status_code == 401
+
+
+@pytest.mark.parametrize("phase", ["provider_error", "verification_failure"])
+def test_loopback_state_cookie_failure_cleanup_matches_issuance_attributes(phase):
+    config = auth_routes.AuthSettings(
+        oidc=OIDCConfiguration(
+            issuer=ISSUER, client_id=CLIENT_ID, redirect_uri="http://localhost:8000/api/auth/callback",
+        ), app_origin="http://localhost:5173", session_ttl_seconds=3600,
+    )
+    transactions, verifier, sessions = Transactions(), Verifier(), Sessions()
+    application = application_for(config, transactions, verifier, sessions)
+    with TestClient(application, base_url=config.app_origin, follow_redirects=False) as client:
+        started = client.get("/api/auth/login")
+        state = parse_qs(urlsplit(started.headers["Location"]).query)["state"][0]
+        if phase == "provider_error":
+            params = {"state": state, "error": "private-provider-error", "error_description": PRIVATE}
+        else:
+            verifier.error = OIDCFailure(OIDCFailureKind.INVALID_TOKEN)
+            params = {"state": state, "code": CODE_A}
+        failed = client.get("/api/auth/callback", params=params)
+        assert_failure(failed, 400, LOGIN_FAILURE, state)
+        assert_cookie(
+            failed, auth_routes.OIDC_STATE_COOKIE_NAME,
+            path=auth_routes.OIDC_STATE_COOKIE_PATH, max_age=0, deleted=True, secure=False,
+        )
+        assert sessions.issued == []
+
+
+def test_browser_insecure_mode_query_is_rejected_before_login_cookie_policy(harness):
+    response = harness.client.get("/api/auth/login?secure=false")
+    assert_failure(response, 400, LOGIN_FAILURE)
+    assert harness.transactions.created == []
+    assert cookie_header(response, auth_routes.OIDC_STATE_COOKIE_NAME) is None

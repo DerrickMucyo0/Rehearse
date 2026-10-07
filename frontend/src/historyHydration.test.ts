@@ -2,13 +2,13 @@ import { afterEach, beforeEach, expect, test, vi } from 'vitest'
 import { getHistorySummaries, HistoryApiError } from './historyApi'
 import type { HistorySummary } from './historyApi'
 import { hydrateHistory, sortHistorySummaries } from './historyHydration'
+import { AuthBoundaryError } from './auth'
 
 vi.mock('./historyApi', async (original) => ({
   ...await original<typeof import('./historyApi')>(), getHistorySummaries: vi.fn(),
 }))
 const load = vi.mocked(getHistorySummaries)
 const id = (index: number) => `00000000-0000-0000-0000-${index.toString(16).padStart(12, '0')}`
-const ids = (count: number) => Array.from({ length: count }, (_, index) => id(index + 1))
 function summary(session_id: string, date = '2026-10-01T10:00:00Z'): HistorySummary {
   return { session_id, status: 'active', created_at: date, completed_at: null, current_question_number: 1,
     total_questions: 5, finalized_question_count: 0, questions_practiced_count: 0, total_attempt_count: 0,
@@ -17,137 +17,82 @@ function summary(session_id: string, date = '2026-10-01T10:00:00Z'): HistorySumm
 beforeEach(() => { load.mockReset() })
 afterEach(() => { vi.restoreAllMocks(); vi.unstubAllGlobals() })
 
-test('empty valid registry is complete and distinct from loading or all-failed history', async () => {
-  expect(await hydrateHistory([])).toEqual({ status: 'complete', summaries: [], missingIds: [], failedChunks: [], rememberedCount: 0 })
-  expect(load).not.toHaveBeenCalled()
+test('empty server discovery differs from idle and failures and still performs a server read', async () => {
+  load.mockResolvedValue({ items: [], next_cursor: null })
+  expect(await hydrateHistory()).toEqual({ status: 'complete', summaries: [], nextCursor: null, pageError: false })
+  expect(load).toHaveBeenCalledOnce()
+  expect(load.mock.calls[0][0]).toEqual({ signal: undefined })
 })
-test.each([{ count: 1, sizes: [1] }, { count: 50, sizes: [50] }, { count: 51, sizes: [50, 1] },
-  { count: 100, sizes: [50, 50] }, { count: 500, sizes: Array.from({ length: 10 }, () => 50) }])(
-  'hydrates $count remembered IDs in bounded batches', async ({ count, sizes }) => {
-    load.mockImplementation(async (requested) => ({ summaries: [], missing_session_ids: [...requested] }))
-    const state = await hydrateHistory(ids(count))
-    expect(load.mock.calls.map(([requested]) => requested.length)).toEqual(sizes)
-    expect(state.status).toBe('complete')
-    expect(state.rememberedCount).toBe(count)
-    expect(state.missingIds).toEqual(ids(count))
-    expect(state.failedChunks).toEqual([])
-  },
-)
-test('canonicalizes duplicates and never requests malformed IDs', async () => {
-  load.mockResolvedValue({ summaries: [], missing_session_ids: [id(1)] })
-  const state = await hydrateHistory([id(1).toUpperCase(), 'invalid', null, {}, id(1)])
-  expect(load.mock.calls[0][0]).toEqual([id(1)])
-  expect(state.rememberedCount).toBe(1)
+test('initial page retains opaque continuation without interpreting identity', async () => {
+  load.mockResolvedValue({ items: [summary(id(1))], next_cursor: 'opaque-continuation' })
+  expect(await hydrateHistory()).toEqual({ status: 'partial', summaries: [summary(id(1))], nextCursor: 'opaque-continuation', pageError: false })
 })
-test('combines independently ordered batches and globally sorts activity then UUID', async () => {
-  const known = ids(51)
-  load.mockImplementation(async (requested) => ({ summaries: requested.map((item) => summary(item,
-    item === id(51) ? '2026-10-03T10:00:00Z' : '2026-10-01T10:00:00Z')).reverse(), missing_session_ids: [] }))
-  const state = await hydrateHistory(known)
-  expect(state.summaries.map((item) => item.session_id)).toEqual([id(51), ...known.slice(0, 50)])
-  expect(state.status).toBe('complete')
+test('next page deduplicates sessions, updates returned facts, and sorts exact saved activity', async () => {
+  load.mockResolvedValueOnce({ items: [summary(id(1))], next_cursor: 'next' })
+    .mockResolvedValueOnce({ items: [summary(id(2)), summary(id(1), '2026-10-02T10:00:00Z')], next_cursor: null })
+  const previous = await hydrateHistory()
+  const snapshot = JSON.stringify(previous)
+  const result = await hydrateHistory({ previous })
+  expect(load.mock.calls[1][0]).toEqual({ signal: undefined, cursor: 'next' })
+  expect(result.summaries.map((item) => item.session_id)).toEqual([id(1), id(2)])
+  expect(result.status).toBe('complete')
+  expect(JSON.stringify(previous)).toBe(snapshot)
 })
-test('global ordering preserves server microseconds and is independent of timezone spelling', () => {
+test('global ordering preserves server microseconds independently of timezone spelling', () => {
   const values = [summary(id(1), '2026-10-01T10:00:00.000001Z'), summary(id(2), '2026-10-01T10:00:00.000002Z'),
     summary(id(3), '2026-10-01T06:00:00.000002-04:00'), summary(id(4), '2026-10-01T10:00:00Z')]
   expect(sortHistorySummaries(values).map((item) => item.session_id)).toEqual([id(2), id(3), id(1), id(4)])
-  expect(values.map((item) => item.session_id)).toEqual(ids(4))
+  expect(values.map((item) => item.session_id)).toEqual([id(1), id(2), id(3), id(4)])
 })
-test('retains missing IDs and failed chunks without deleting remembered capabilities', async () => {
-  const known = ids(51)
-  const removeItem = vi.fn()
-  vi.stubGlobal('localStorage', { removeItem })
-  load.mockImplementation(async (requested) => {
-    if (requested.length === 1) throw new HistoryApiError('Unable to load history.')
-    return { summaries: requested.slice(1).map((item) => summary(item)), missing_session_ids: [requested[0]] }
-  })
-  const state = await hydrateHistory(known)
-  expect(state.status).toBe('partial')
-  expect(state.summaries).toHaveLength(49)
-  expect(state.missingIds).toEqual([id(1)])
-  expect(state.failedChunks).toEqual([[id(51)]])
-  expect(state.rememberedCount).toBe(51)
-  expect(known).toEqual(ids(51))
-  expect(removeItem).not.toHaveBeenCalled()
+test('failed next page retains successful results and retries the same continuation only on explicit demand', async () => {
+  load.mockResolvedValueOnce({ items: [summary(id(1))], next_cursor: 'next' })
+    .mockRejectedValueOnce(new HistoryApiError('Unable to load history.'))
+    .mockResolvedValueOnce({ items: [summary(id(2))], next_cursor: null })
+  const previous = await hydrateHistory()
+  const failed = await hydrateHistory({ previous })
+  expect(failed).toEqual({ ...previous, pageError: true })
+  expect(load).toHaveBeenCalledTimes(2)
+  expect(await hydrateHistory({ previous: failed })).toMatchObject({ status: 'complete', pageError: false, nextCursor: null })
+  expect(load.mock.calls[2][0]?.cursor).toBe('next')
 })
-test('all chunks failed is error, while all missing is complete with remembered entries', async () => {
+test('initial failure is not a successful empty history', async () => {
   load.mockRejectedValue(new HistoryApiError('Unable to load history.'))
-  const failed = await hydrateHistory(ids(51))
-  expect(failed).toEqual({ status: 'error', summaries: [], missingIds: [], failedChunks: [ids(50), [id(51)]], rememberedCount: 51 })
-  load.mockImplementation(async (requested) => ({ summaries: [], missing_session_ids: [...requested] }))
-  const missing = await hydrateHistory(ids(51))
-  expect(missing.status).toBe('complete')
-  expect(missing.missingIds).toHaveLength(51)
+  expect(await hydrateHistory()).toEqual({ status: 'error', summaries: [], nextCursor: null, pageError: true })
+  expect(load).toHaveBeenCalledOnce()
 })
-test('retries only failed chunks and globally merges retained successes and missing entries', async () => {
-  const known = ids(51)
-  load.mockImplementation(async (requested) => {
-    if (requested.length === 1) throw new HistoryApiError('Unable to load history.')
-    return { summaries: requested.slice(1).map((item) => summary(item)), missing_session_ids: [requested[0]] }
-  })
-  const previous = await hydrateHistory(known)
-  const snapshot = JSON.stringify(previous)
-  load.mockReset().mockResolvedValue({ summaries: [summary(id(51), '2026-10-03T10:00:00Z')], missing_session_ids: [] })
-  const retried = await hydrateHistory(known, { previous, retryChunks: previous.failedChunks })
-  expect(load).toHaveBeenCalledTimes(1)
-  expect(load.mock.calls[0][0]).toEqual([id(51)])
-  expect(retried.status).toBe('complete')
-  expect(retried.summaries).toHaveLength(50)
-  expect(retried.summaries[0].session_id).toBe(id(51))
-  expect(retried.missingIds).toEqual([id(1)])
-  expect(retried.failedChunks).toEqual([])
-  expect(JSON.stringify(previous)).toBe(snapshot)
+test('a repeated cursor cannot trigger automatic endless discovery', async () => {
+  load.mockResolvedValue({ items: [], next_cursor: 'same' })
+  const previous = await hydrateHistory()
+  expect(await hydrateHistory({ previous })).toMatchObject({ pageError: true, nextCursor: 'same' })
+  expect(load).toHaveBeenCalledTimes(2)
 })
-test('a repeated failed retry retains previous successes and the failure context', async () => {
-  load.mockImplementation(async (requested) => {
-    if (requested.length === 1) throw new HistoryApiError('Unable to load history.')
-    return { summaries: requested.map((item) => summary(item)), missing_session_ids: [] }
-  })
-  const previous = await hydrateHistory(ids(51))
-  const retried = await hydrateHistory(ids(51), { previous, retryChunks: previous.failedChunks })
-  expect(retried.status).toBe('partial')
-  expect(retried.summaries).toEqual(previous.summaries)
-  expect(retried.failedChunks).toEqual(previous.failedChunks)
+test('completed discovery does not request another page', async () => {
+  load.mockResolvedValue({ items: [summary(id(1))], next_cursor: null })
+  const previous = await hydrateHistory()
+  expect(await hydrateHistory({ previous })).toBe(previous)
+  expect(load).toHaveBeenCalledOnce()
 })
-test('retry does not reintroduce removed capabilities or request an unknown supplied chunk', async () => {
-  load.mockRejectedValue(new HistoryApiError('Unable to load history.'))
-  const previous = await hydrateHistory(ids(51))
-  load.mockReset().mockResolvedValue({ summaries: [summary(id(51))], missing_session_ids: [] })
-  const result = await hydrateHistory([id(51)], { previous, retryChunks: [[id(51), id(99), 'invalid']] })
-  expect(load.mock.calls[0][0]).toEqual([id(51)])
-  expect(result.status).toBe('complete')
-  expect(result.rememberedCount).toBe(1)
-  expect(result.failedChunks).toEqual([])
+test('discovery neither reads nor writes browser membership or private data', async () => {
+  const access = vi.fn(() => { throw new Error('Browser storage is forbidden') })
+  vi.stubGlobal('localStorage', { getItem: access, setItem: access, removeItem: access })
+  vi.stubGlobal('sessionStorage', { getItem: access, setItem: access, removeItem: access })
+  load.mockResolvedValue({ items: [summary(id(9))], next_cursor: null })
+  expect((await hydrateHistory()).summaries[0].session_id).toBe(id(9))
+  expect(access).not.toHaveBeenCalled()
 })
-test('bounds concurrently active batch reads to three', async () => {
-  let active = 0
-  let peak = 0
-  load.mockImplementation(async (requested) => {
-    active += 1
-    peak = Math.max(peak, active)
-    await Promise.resolve()
-    active -= 1
-    return { summaries: [], missing_session_ids: [...requested] }
-  })
-  await hydrateHistory(ids(500))
-  expect(peak).toBe(3)
-  expect(active).toBe(0)
-})
-test('an aborted older hydration cannot produce a late state after a newer hydration', async () => {
+test('caller cancellation rejects late pages and pre-aborted reads never start', async () => {
   const controller = new AbortController()
-  let resolve: (value: { summaries: HistorySummary[]; missing_session_ids: string[] }) => void = () => { throw new Error('not started') }
+  let resolve!: (value: { items: HistorySummary[]; next_cursor: null }) => void
   load.mockImplementationOnce(() => new Promise((done) => { resolve = done }))
-    .mockResolvedValueOnce({ summaries: [summary(id(2))], missing_session_ids: [] })
-  const old = hydrateHistory([id(1)], { signal: controller.signal })
+  const pending = hydrateHistory({ signal: controller.signal })
   controller.abort()
-  const latest = await hydrateHistory([id(2)])
-  resolve({ summaries: [summary(id(1))], missing_session_ids: [] })
-  await expect(old).rejects.toMatchObject({ cancelled: true })
-  expect(latest.summaries.map((item) => item.session_id)).toEqual([id(2)])
+  resolve({ items: [summary(id(1))], next_cursor: null })
+  await expect(pending).rejects.toMatchObject({ cancelled: true })
+  await expect(hydrateHistory({ signal: controller.signal })).rejects.toMatchObject({ cancelled: true })
+  expect(load).toHaveBeenCalledOnce()
 })
-test('pre-aborted hydration does no reads', async () => {
-  const controller = new AbortController()
-  controller.abort()
-  await expect(hydrateHistory(ids(500), { signal: controller.signal })).rejects.toMatchObject({ cancelled: true })
-  expect(load).not.toHaveBeenCalled()
+test('authentication boundary failures propagate without being recast as partial History', async () => {
+  load.mockRejectedValue(new AuthBoundaryError('stale'))
+  await expect(hydrateHistory()).rejects.toBeInstanceOf(AuthBoundaryError)
+  expect(load).toHaveBeenCalledOnce()
 })

@@ -30,6 +30,7 @@ _ASYMMETRIC_ALGORITHMS = frozenset({
     "ES256", "ES384", "ES512", "EdDSA",
 })
 OIDC_HTTP_TIMEOUT_SECONDS = 10
+OIDC_LOOPBACK_CALLBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
 _AUTHORIZATION_PARAMETERS = frozenset({
     "client_id", "redirect_uri", "response_type", "scope", "state", "nonce",
     "code_challenge", "code_challenge_method", "response_mode",
@@ -57,6 +58,31 @@ def _https_endpoint(value: object) -> bool:
         return False
 
 
+def is_loopback_http_browser_url(value: object) -> bool:
+    """Trusted browser URL exception; never use for provider transport endpoints."""
+    if (not _valid_text(value) or "\\" in value or "?" in value or "#" in value or
+            any(character.isspace() or ord(character) < 32 or ord(character) == 127
+                for character in value)):
+        return False
+    try:
+        parsed = urlsplit(value)
+        # urlsplit accepts junk after an IPv6 closing bracket as the same host.
+        # The complete authority must still be precisely the loopback host/port.
+        authority = "[::1]" if parsed.hostname == "::1" else parsed.hostname
+        host_port = parsed.netloc.lower()
+        if authority is None or not (host_port == authority or
+                (host_port.startswith(authority + ":") and
+                 host_port[len(authority) + 1:].isascii() and
+                 host_port[len(authority) + 1:].isdecimal())):
+            return False
+        return (parsed.scheme == "http" and parsed.hostname in OIDC_LOOPBACK_CALLBACK_HOSTS and
+                parsed.username is None and parsed.password is None and
+                not parsed.netloc.endswith(":") and
+                (parsed.port is None or 1 <= parsed.port <= 65535))
+    except ValueError:
+        return False
+
+
 def _exact(left: str, right: str) -> bool:
     return secrets.compare_digest(left.encode("utf-8"), right.encode("utf-8"))
 
@@ -78,8 +104,8 @@ class OIDCConfiguration:
             raise ValueError("OIDC issuer must be a trusted HTTPS URL without query or fragment.")
         if not _valid_text(self.client_id):
             raise ValueError("OIDC client ID must be nonblank text.")
-        if not _https_endpoint(self.redirect_uri):
-            raise ValueError("OIDC redirect URI must be a trusted HTTPS URL.")
+        if not _https_endpoint(self.redirect_uri) and not is_loopback_http_browser_url(self.redirect_uri):
+            raise ValueError("OIDC redirect URI must use HTTPS or an explicit loopback HTTP callback.")
         if self.client_secret is not None and not _valid_text(self.client_secret):
             raise ValueError("OIDC client secret must be nonblank text when configured.")
         if (type(self.allowed_algorithms) is not tuple or not self.allowed_algorithms or
