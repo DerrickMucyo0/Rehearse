@@ -6,6 +6,7 @@
     Background cleanup remains a future service responsibility.
 """
 from datetime import datetime, timedelta
+from re import fullmatch
 from uuid import UUID, uuid4
 
 from sqlalchemy import (
@@ -113,6 +114,54 @@ class AuthSession(Base):
     @validates("request_context")
     def validate_request_context(self, key, value):
         return _validate_auth_text(value)
+
+
+class OIDCLoginTransaction(Base):
+    """One-time redirect state with server-side nonce and PKCE verifier.
+
+    State is persisted only as its SHA-256 digest; no identity is known yet.
+    Expiry and atomic consumption belong to the dedicated login store.
+    """
+    __tablename__ = "oidc_login_transactions"
+    __table_args__ = (
+        UniqueConstraint("state_hash", name="uq_oidc_login_transactions_state_hash"),
+        CheckConstraint(
+            "octet_length(state_hash) = 32", name="ck_oidc_login_transactions_state_hash_length",
+        ),
+        CheckConstraint("nonce ~ '[^[:space:]]'", name="ck_oidc_login_transactions_nonce_nonblank"),
+        CheckConstraint(
+            "char_length(code_verifier) BETWEEN 43 AND 128 "
+            "AND code_verifier !~ '[^A-Za-z0-9._~-]'",
+            name="ck_oidc_login_transactions_code_verifier",
+        ),
+        CheckConstraint("expires_at > created_at", name="ck_oidc_login_transactions_expiration"),
+        Index("ix_oidc_login_transactions_expires_at", "expires_at"),
+    )
+
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    state_hash: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
+    nonce: Mapped[str] = mapped_column(Text(collation="C"), nullable=False)
+    code_verifier: Mapped[str] = mapped_column(Text(collation="C"), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(),
+    )
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+    @validates("state_hash")
+    def validate_state_hash(self, key, value):
+        if type(value) is not bytes or len(value) != 32:
+            raise ValueError("OIDC login state hash must be exactly 32 bytes.")
+        return value
+
+    @validates("nonce")
+    def validate_nonce(self, key, value):
+        return _validate_auth_text(value)
+
+    @validates("code_verifier")
+    def validate_code_verifier(self, key, value):
+        if type(value) is not str or fullmatch(r"[A-Za-z0-9._~-]{43,128}", value) is None:
+            raise ValueError("OIDC PKCE verifier must contain 43–128 ASCII unreserved characters.")
+        return value
 
 
 class StoredInterviewSession(Base):

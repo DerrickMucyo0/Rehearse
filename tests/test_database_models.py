@@ -77,14 +77,15 @@ def test_retention_rejects_ambiguous_naive_timestamps():
         record.unlinked_deletion_eligible(linked=False, now=datetime(2026, 1, 2, tzinfo=timezone.utc))
 
 
-def test_alembic_has_ownership_head_after_delivery_and_emits_postgresql_ddl_offline(monkeypatch):
+def test_alembic_has_login_transaction_head_after_ownership_and_emits_postgresql_ddl_offline(monkeypatch):
     monkeypatch.setenv("DATABASE_URL", "postgresql+psycopg://offline@localhost/rehearse_dev")
     output = StringIO()
     config = Config(str(ROOT / "alembic.ini"), output_buffer=output)
     config.attributes["skip_logging"] = True
     scripts = ScriptDirectory.from_config(config)
-    assert scripts.get_heads() == ["0003_auth_user_ownership"]
-    assert scripts.get_revision("head").down_revision == "0002_pause_delivery_metrics"
+    assert scripts.get_heads() == ["0004_oidc_login_transactions"]
+    assert scripts.get_revision("head").down_revision == "0003_auth_user_ownership"
+    assert scripts.get_revision("0003_auth_user_ownership").down_revision == "0002_pause_delivery_metrics"
     assert scripts.get_revision("0002_pause_delivery_metrics").down_revision == "0001_database_foundation"
     assert scripts.get_revision("0001_database_foundation").down_revision is None
     command.upgrade(config, "head", sql=True)
@@ -106,6 +107,8 @@ def test_alembic_has_ownership_head_after_delivery_and_emits_postgresql_ddl_offl
     for column in DELIVERY_COLUMNS:
         assert f"DROP COLUMN {column}" in sql
     assert sql.index("DROP COLUMN delivery_measurement_version") < sql.index("DROP TABLE question_attempts")
+    assert sql.index("DROP INDEX ix_oidc_login_transactions_expires_at") < sql.index("DROP TABLE oidc_login_transactions")
+    assert sql.index("DROP TABLE oidc_login_transactions") < sql.index("DROP TABLE auth_sessions")
     assert sql.index("DROP TABLE question_attempts") < sql.index("DROP TABLE transcription_measurements")
     assert "DROP FUNCTION rehearse_preserve_measurement()" in sql
 
@@ -133,7 +136,7 @@ def test_delivery_orm_declares_only_the_approved_extension_and_constraints():
     assert DELIVERY_CONSTRAINTS <= names
     assert set(Base.metadata.tables) == {
         "interview_sessions", "question_attempts", "transcription_measurements",
-        "users", "auth_sessions",
+        "users", "auth_sessions", "oidc_login_transactions",
     }
 
 

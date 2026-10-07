@@ -53,6 +53,15 @@ def migration_config(connection):
     return config
 
 
+def auth_revision_metadata():
+    """Compare the frozen ownership revision without later login persistence."""
+    metadata = MetaData()
+    for table in Base.metadata.sorted_tables:
+        if table.name != "oidc_login_transactions":
+            table.to_metadata(metadata)
+    return metadata
+
+
 def rejected(connection, operation, sqlstate):
     with pytest.raises(IntegrityError) as caught:
         with connection.begin_nested():
@@ -459,7 +468,7 @@ def test_populated_0002_upgrade_downgrade_and_reupgrade_preserve_all_legacy_fact
     assert set(after_facts["indexes"]) - set(prior_facts["indexes"]) == {OWNER_INDEX}
     assert after_facts["triggers"] == prior_facts["triggers"]
     assert after_facts["functions"] == prior_facts["functions"]
-    assert compare_metadata(MigrationContext.configure(connection), Base.metadata) == []
+    assert compare_metadata(MigrationContext.configure(connection), auth_revision_metadata()) == []
     assert prior_rows["question_attempts"][first_attempt]["measurement_id"] == available
     assert prior_rows["question_attempts"][retry_attempt]["measurement_id"] == unavailable
     assert prior_rows["transcription_measurements"][available]["timed_utterance_span_seconds"] == 1.234567890123
@@ -502,7 +511,7 @@ def test_populated_0002_upgrade_downgrade_and_reupgrade_preserve_all_legacy_fact
     for name in LEGACY_TABLES[1:]:
         assert rows(connection, tables[name]) == expected_legacy_rows[name]
     assert prior_schema_facts(connection) == after_facts
-    assert compare_metadata(MigrationContext.configure(connection), Base.metadata) == []
+    assert compare_metadata(MigrationContext.configure(connection), auth_revision_metadata()) == []
 
 
 def test_owned_session_real_service_preserves_retry_completion_and_exact_measurement_links(connection):
