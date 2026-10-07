@@ -1,4 +1,5 @@
 // @vitest-environment jsdom
+import { authenticateTestWorkspace } from './authTestUtils'
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { afterEach, beforeEach, expect, test, vi } from 'vitest'
 import Interview from './Interview'
@@ -7,7 +8,7 @@ import type { HistoryDetail } from './historyApi'
 import { personalizedDrillForFocus } from './personalizedDrills'
 import type { Attempt, AttemptComparison, DeliveryMetricChange, InterviewSession, MetricChange, SemanticDiagnosis } from './interviewApi'
 
-const storageKey = 'rehearse.session_id'
+const storageKey = 'rehearse.session_id:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
 const questions = ['Question one', 'Question two', 'Question three', 'Question four', 'Question five']
 const summarySessionId = '11111111-1111-4111-8111-111111111111'
 const nextSummarySessionId = '22222222-2222-4222-8222-222222222222'
@@ -151,7 +152,8 @@ function mockSessionApi(initial = freshSession()) {
     posts: (suffix: string) => fetchMock.mock.calls.filter(([url, options]) => String(url).endsWith(suffix) && options?.method === 'POST'),
     gets: (suffix: string) => fetchMock.mock.calls.filter(([url, options]) => String(url).endsWith(suffix) && options?.method !== 'POST') }
 }
-beforeEach(() => {
+beforeEach(async () => {
+  await authenticateTestWorkspace()
   sessionStorage.clear()
   vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new Error('Unmocked network is forbidden')))
   // Existing Practice fixtures use opaque toy IDs. Keep that legacy exception at

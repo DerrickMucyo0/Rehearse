@@ -25,7 +25,8 @@ from app.database_models import (
 from app.sessions import QUESTIONS
 
 ROOT = Path(__file__).resolve().parents[1]
-TABLES = {"interview_sessions", "question_attempts", "transcription_measurements"}
+FOUNDATION_TABLES = {"interview_sessions", "question_attempts", "transcription_measurements"}
+TABLES = FOUNDATION_TABLES | {"users", "auth_sessions", "oidc_login_transactions"}
 DELIVERY_FIELDS = (
     "delivery_measurement_version", "pause_count", "total_pause_duration_seconds",
     "longest_pause_seconds", "pause_unavailable_reason",
@@ -100,7 +101,7 @@ def rejected(connection, operation, sqlstate):
     assert caught.value.orig.sqlstate == sqlstate
 
 
-def test_initial_and_delivery_migrations_upgrade_empty_database_and_downgrade_deterministically(postgres_engine):
+def test_all_migrations_upgrade_empty_database_and_downgrade_deterministically(postgres_engine):
     with postgres_engine.begin() as connection:
         config = migration_config(connection)
         command.downgrade(config, "base")
@@ -114,11 +115,11 @@ def test_initial_and_delivery_migrations_upgrade_empty_database_and_downgrade_de
         assert initial_columns.isdisjoint(DELIVERY_FIELDS)
         command.upgrade(config, "head")
         assert set(inspect(connection).get_table_names()) == TABLES | {"alembic_version"}
-        assert connection.scalar(text("SELECT version_num FROM alembic_version")) == "0002_pause_delivery_metrics"
+        assert connection.scalar(text("SELECT version_num FROM alembic_version")) == "0004_oidc_login_transactions"
         assert {column["name"] for column in inspect(connection).get_columns("transcription_measurements")} == initial_columns | set(DELIVERY_FIELDS)
         command.downgrade(config, "0001_database_foundation")
         assert {column["name"] for column in inspect(connection).get_columns("transcription_measurements")} == initial_columns
-        assert set(inspect(connection).get_table_names()) == TABLES | {"alembic_version"}
+        assert set(inspect(connection).get_table_names()) == FOUNDATION_TABLES | {"alembic_version"}
         command.upgrade(config, "head")
 
 
@@ -129,7 +130,7 @@ def test_migrated_schema_matches_orm_metadata(connection):
                             if isinstance(constraint, CheckConstraint)}
     assert actual_constraints == expected_constraints
     assert DELIVERY_CONSTRAINTS <= actual_constraints
-    assert connection.scalar(text("SELECT version_num FROM alembic_version")) == "0002_pause_delivery_metrics"
+    assert connection.scalar(text("SELECT version_num FROM alembic_version")) == "0004_oidc_login_transactions"
 
 
 def test_populated_foundation_upgrade_preserves_legacy_rows_links_and_speaking_facts(connection):

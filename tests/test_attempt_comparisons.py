@@ -50,15 +50,15 @@ def no_provider_requests(monkeypatch):
 
 
 @pytest.fixture
-def sessions(postgres_session_factory):
-    return InterviewSessionService(postgres_session_factory)
+def sessions(postgres_session_factory, authenticated_principal):
+    return InterviewSessionService(postgres_session_factory, authenticated_principal)
 
 
 @pytest.fixture
-def client(sessions):
-    app.dependency_overrides[get_session_service] = lambda: sessions
+def client(sessions, authenticated_session_override, authenticated_http_headers):
+    app.dependency_overrides[get_session_service] = authenticated_session_override(sessions)
     try:
-        with TestClient(app) as result:
+        with TestClient(app, headers=authenticated_http_headers) as result:
             yield result
     finally:
         app.dependency_overrides.pop(get_session_service, None)
@@ -428,14 +428,14 @@ def test_current_finalized_and_completed_questions_remain_comparable(sessions):
     assert payload(sessions, created.id) == expected
 
 
-def test_comparison_survives_service_and_engine_reconstruction(sessions, postgres_engine):
+def test_comparison_survives_service_and_engine_reconstruction(sessions, postgres_engine, authenticated_principal):
     created = sessions.start()
     measured_attempt(sessions, created.id)
     measured_attempt(sessions, created.id, metrics(recognized_word_count=15), revision=1)
     before = payload(sessions, created.id)
     postgres_engine.dispose()
     engine = create_database_engine(postgres_engine.url)
-    rebuilt = InterviewSessionService(create_session_factory(engine))
+    rebuilt = InterviewSessionService(create_session_factory(engine), authenticated_principal)
     try:
         assert payload(rebuilt, created.id) == before
     finally:

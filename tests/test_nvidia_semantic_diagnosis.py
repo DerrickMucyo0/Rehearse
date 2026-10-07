@@ -621,6 +621,11 @@ def test_total_deadline_preserves_application_http_504_and_persisted_context(
     context, monkeypatch, capsys, caplog,
 ):
     from fastapi.testclient import TestClient
+    from app.auth import AuthenticatedPrincipal, AuthenticationFailure, AuthenticationFailureKind
+    from app.auth_http import (
+        AUTH_REQUEST_CONTEXT_HEADER, AUTH_SESSION_COOKIE_NAME,
+        AuthenticatedPrincipalDependency, get_auth_session_store,
+    )
     from app.main import app
     from app.session_routes import get_session_service
     from app.semantic_diagnosis_composition import get_semantic_diagnosis_adapter
@@ -644,13 +649,37 @@ def test_total_deadline_preserves_application_http_504_and_persisted_context(
             return context
 
     reader = Reader()
+    principal = AuthenticatedPrincipal(
+        user_id=UUID("00000000-0000-4000-8000-000000000018"),
+        auth_session_id=UUID("00000000-0000-4000-8000-000000000019"),
+        request_context="synthetic-nvidia-timeout-context",
+    )
+
+    class Store:
+        def resolve(self, *, credential):
+            if credential != "synthetic-nvidia-timeout-credential":
+                raise AuthenticationFailure(AuthenticationFailureKind.UNAUTHENTICATED)
+            return principal
+
+        def revalidate(self, *, principal):
+            raise AssertionError("Provider timeout must not reach post-provider authentication revalidation.")
+
+    def session_override(resolved: AuthenticatedPrincipalDependency):
+        assert resolved == principal
+        return reader
+
+    headers = {
+        "Cookie": f"{AUTH_SESSION_COOKIE_NAME}=synthetic-nvidia-timeout-credential",
+        AUTH_REQUEST_CONTEXT_HEADER: principal.request_context,
+    }
     adapter = JSONSemanticDiagnosisAdapter(Client(transport=httpx.MockTransport(stalled)))
     monkeypatch.setattr(provider, "asyncio", SimpleNamespace(timeout=immediate_deadline))
     original_overrides = app.dependency_overrides.copy()
     try:
-        app.dependency_overrides[get_session_service] = lambda: reader
+        app.dependency_overrides[get_session_service] = session_override
+        app.dependency_overrides[get_auth_session_store] = lambda: Store()
         app.dependency_overrides[get_semantic_diagnosis_adapter] = lambda: adapter
-        with TestClient(app) as client:
+        with TestClient(app, headers=headers) as client:
             response = client.post(
                 "/api/sessions/00000000-0000-4000-8000-000000000017/questions/4/attempts/2/diagnosis"
             )

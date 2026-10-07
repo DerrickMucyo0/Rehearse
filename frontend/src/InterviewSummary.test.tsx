@@ -1,4 +1,5 @@
 // @vitest-environment jsdom
+import { authenticateTestWorkspace } from './authTestUtils'
 import { StrictMode } from 'react'
 import { act, cleanup, render, screen, waitFor, within } from '@testing-library/react'
 import { afterEach, beforeEach, expect, test, vi } from 'vitest'
@@ -100,7 +101,9 @@ function expectReadRequests(calls: readonly [string, RequestInit?][], ids: reado
   })
 }
 
-beforeEach(() => { vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new Error('Unmocked network is forbidden.'))) })
+beforeEach(async () => {
+  await authenticateTestWorkspace()
+  vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new Error('Unmocked network is forbidden.'))) })
 afterEach(() => { cleanup(); vi.restoreAllMocks(); vi.unstubAllGlobals() })
 
 test.each([

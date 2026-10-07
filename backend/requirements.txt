@@ -1,8 +1,13 @@
 fastapi>=0.115,<1
+pydantic>=2.9,<3
+starlette>=0.46,<2
 uvicorn>=0.34,<1
 python-multipart>=0.0.20,<1
 elevenlabs>=2.70,<3
 httpx>=0.28,<1
+httpx2>=2.13,<3
+Authlib>=1.8,<1.9
+joserfc>=1.7.5,<1.8
 SQLAlchemy>=2.0,<3
 psycopg[binary]>=3.2,<4
 alembic>=1.13,<2

@@ -1,29 +1,30 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { hydrateHistory } from './historyHydration'
 import type { HistoryHydrationState } from './historyHydration'
+import { getAuthState, isAuthWorkspaceCurrent } from './auth'
 
-function initialHistory(count: number): HistoryHydrationState {
-  return { status: count ? 'loading' : 'complete', summaries: [], missingIds: [],
-    failedChunks: [], rememberedCount: count }
+function initialHistory(): HistoryHydrationState {
+  return { status: 'loading', summaries: [], nextCursor: null, pageError: false }
 }
 
 export interface SharedHistoryHydration {
   history: HistoryHydrationState
   retry: () => void
   reload: () => void
-  discard: () => void
+  loadMore: () => void
+  canLoadMore: boolean
 }
 
-// One memory-only owner serves both read views. Membership and persisted-write
-// generations invalidate it; navigating between views does not.
-export function useHistoryHydration(sessionIds: string[], version: number, enabled: boolean): SharedHistoryHydration {
-  const membership = sessionIds.join('\n')
-  const ids = useMemo(() => membership ? membership.split('\n') : [], [membership])
-  const key = JSON.stringify([membership, version])
-  const [snapshot, setSnapshot] = useState(() => ({ key, history: initialHistory(ids.length) }))
+// The authenticated workspace owns this memory-only cache. Persisted writes
+// invalidate it; History/Progress navigation reuses it without extra requests.
+export function useHistoryHydration(version: number, enabled: boolean): SharedHistoryHydration {
+  const auth = getAuthState()
+  const workspaceGeneration = auth.status === 'authenticated' ? auth.generation : null
+  const key = JSON.stringify([version, workspaceGeneration])
+  const [snapshot, setSnapshot] = useState(() => ({ key, history: initialHistory() }))
   const [request, setRequest] = useState(0)
   const cache = useRef<{ key: string; history: HistoryHydrationState } | null>(null)
-  const retryState = useRef<{ key: string; history: HistoryHydrationState } | null>(null)
+  const continuation = useRef<{ key: string; history: HistoryHydrationState } | null>(null)
   const controller = useRef<AbortController | null>(null)
   const generation = useRef(0)
 
@@ -32,43 +33,38 @@ export function useHistoryHydration(sessionIds: string[], version: number, enabl
     const pending = new AbortController()
     controller.current = pending
     const read = ++generation.current
-    const previous = retryState.current?.key === key ? retryState.current.history : undefined
-    retryState.current = null
-    void hydrateHistory(ids, {
-      signal: pending.signal,
-      ...(previous?.failedChunks.length ? { previous, retryChunks: previous.failedChunks } : {}),
-    }).then((history) => {
-      if (pending.signal.aborted || generation.current !== read) return
+    const previous = continuation.current?.key === key ? continuation.current.history : undefined
+    continuation.current = null
+    void hydrateHistory({ signal: pending.signal, ...(previous ? { previous } : {}) }).then((history) => {
+      if (pending.signal.aborted || generation.current !== read || workspaceGeneration === null || !isAuthWorkspaceCurrent(workspaceGeneration)) return
       cache.current = { key, history }
       setSnapshot({ key, history })
     }).catch(() => {
-      if (pending.signal.aborted || generation.current !== read) return
-      const history = { ...(previous ?? initialHistory(ids.length)), status: 'error' as const }
+      if (pending.signal.aborted || generation.current !== read || workspaceGeneration === null || !isAuthWorkspaceCurrent(workspaceGeneration)) return
+      const history: HistoryHydrationState = { ...(previous ?? initialHistory()), status: previous?.summaries.length ? 'partial' : 'error', pageError: true }
       cache.current = { key, history }
       setSnapshot({ key, history })
     })
     return () => { pending.abort(); generation.current += 1 }
-  }, [enabled, ids, key, request])
+  }, [enabled, key, request, workspaceGeneration])
 
-  const readAgain = useCallback((failedOnly: boolean) => {
+  const readAgain = useCallback((append: boolean) => {
+    if (controller.current && !controller.current.signal.aborted && cache.current?.key !== key) return
     controller.current?.abort()
     generation.current += 1
     const previous = cache.current?.key === key ? cache.current.history : undefined
-    retryState.current = failedOnly && previous ? { key, history: previous } : null
+    continuation.current = append && previous ? { key, history: previous } : null
     cache.current = null
-    setSnapshot({ key, history: { ...(previous ?? initialHistory(ids.length)), status: 'loading' } })
+    setSnapshot({ key, history: { ...(append && previous ? previous : initialHistory()), status: 'loading' } })
     setRequest((value) => value + 1)
-  }, [ids.length, key])
+  }, [key])
   const retry = useCallback(() => readAgain(true), [readAgain])
   const reload = useCallback(() => readAgain(false), [readAgain])
-  const discard = useCallback(() => {
-    controller.current?.abort()
-    generation.current += 1
-    retryState.current = null
-    const empty = { key, history: initialHistory(0) }
-    cache.current = empty
-    setSnapshot(empty)
-  }, [key])
+  const history = snapshot.key === key ? snapshot.history : initialHistory()
+  const canLoadMore = history.status !== 'loading' && history.nextCursor !== null && !history.pageError
+  const loadMore = useCallback(() => {
+    if (cache.current?.key === key && cache.current.history.nextCursor !== null && !cache.current.history.pageError) readAgain(true)
+  }, [readAgain, key])
 
-  return { history: snapshot.key === key ? snapshot.history : initialHistory(ids.length), retry, reload, discard }
+  return { history, retry, reload, loadMore, canLoadMore }
 }

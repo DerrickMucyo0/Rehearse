@@ -284,6 +284,8 @@ test('projection makes no network, storage, clock or random calls', () => {
 })
 
 test('fixtures satisfy the unchanged History HTTP validator using only mocked responses', async () => {
+  const { authenticateTestWorkspace } = await import('./authTestUtils')
+  await authenticateTestWorkspace()
   const fixtures = [completedDetail(), completedDetail([2, 1, 3, 1, 2], [7, 4, 12, 1, 5]), typedFinalDetail(),
     ...measurementCases.map(({ measurement }) => {
       const detail = completedDetail(); setMeasurement(detail, 0, measurement); return detail

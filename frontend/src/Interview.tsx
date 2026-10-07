@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
 import type { FormEvent } from 'react'
 import AudioAnswer from './AudioAnswer'
 import Comparison from './AttemptComparison'
@@ -9,6 +9,7 @@ import {
 } from './interviewApi'
 import type { Attempt, AttemptComparison, InterviewSession, SemanticDiagnosis } from './interviewApi'
 import { personalizedDrillForFocus } from './personalizedDrills'
+import { getAuthState, isAuthWorkspaceCurrent } from './auth'
 
 const SESSION_KEY = 'rehearse.session_id'
 type Mode = 'composing' | 'review'
@@ -57,14 +58,17 @@ function ownsDiagnosis(view: SavedView | null, target: DiagnosisTarget): boolean
     latest.attempt_number === target.attemptNumber
 }
 
-function storedSessionId(): string | null {
-  try { return sessionStorage.getItem(SESSION_KEY) } catch { return null }
+function storedSessionId(key: string | null): string | null {
+  if (key === null) return null
+  try { return sessionStorage.getItem(key) } catch { return null }
 }
-function rememberSession(id: string | null) {
-  // Restore only an opaque session ID in this tab, never drafts or recordings.
+function rememberSession(key: string | null, id: string | null) {
+  if (key === null) return
+  // Only an opaque ID is retained in this tab, scoped to the server-bootstrap
+  // user. It never establishes membership/ownership; every restore is secured.
   try {
-    if (id === null) sessionStorage.removeItem(SESSION_KEY)
-    else sessionStorage.setItem(SESSION_KEY, id)
+    if (id === null) sessionStorage.removeItem(key)
+    else sessionStorage.setItem(key, id)
   } catch { /* The current interview works if browser storage is disabled. */ }
 }
 function recoveryFor(view: SavedView, kind: Recovery['kind']): Recovery {
@@ -100,7 +104,11 @@ interface Props {
 }
 
 export default function Interview({ onSessionAccess, onNavigationBusyChange, onHistoryFactsChange }: Props = {}) {
-  const [restoreId] = useState(storedSessionId)
+  const [workspace] = useState(() => {
+    const auth = getAuthState()
+    return auth.status === 'authenticated' ? { generation: auth.generation, storageKey: `${SESSION_KEY}:${auth.userId}` } : null
+  })
+  const [restoreId] = useState(() => storedSessionId(workspace?.storageKey ?? null))
   const [view, setView] = useState<SavedView | null>(null)
   const [draft, setDraft] = useState<{ text: string; measurementId: string | null }>({ text: '', measurementId: null })
   const [draftGeneration, setDraftGeneration] = useState(0)
@@ -120,6 +128,8 @@ export default function Interview({ onSessionAccess, onNavigationBusyChange, onH
   useLayoutEffect(() => { accessCallback.current = onSessionAccess }, [onSessionAccess])
   const factsCallback = useRef(onHistoryFactsChange)
   useLayoutEffect(() => { factsCallback.current = onHistoryFactsChange }, [onHistoryFactsChange])
+  const currentWorkspace = useCallback(() => mounted.current && workspace !== null &&
+    isAuthWorkspaceCurrent(workspace.generation), [workspace])
   const session = view?.session
   const blocked = operation !== null || transcribing || recovery !== null
   const navigationBlocked = blocked || audioBusy
@@ -132,30 +142,34 @@ export default function Interview({ onSessionAccess, onNavigationBusyChange, onH
 
   useEffect(() => {
     mounted.current = true
-    return () => { mounted.current = false; invalidateDiagnosis() }
-  }, [])
+    return () => {
+      mounted.current = false
+      invalidateDiagnosis()
+      if (workspace && !isAuthWorkspaceCurrent(workspace.generation)) rememberSession(workspace.storageKey, null)
+    }
+  }, [workspace])
   useEffect(() => {
     if (!restoreId) return
     let active = true
     void readSavedView(restoreId).then((saved) => {
-      if (active) {
+      if (active && currentWorkspace()) {
         showView(saved)
         accessCallback.current?.(saved.session.id)
       }
     }).catch((cause: unknown) => {
-      if (!active) return
+      if (!active || !currentWorkspace()) return
       if (cause instanceof ApiError && cause.status === 404) {
-        rememberSession(null)
+        rememberSession(workspace?.storageKey ?? null, null)
         setError('The saved interview was not found. Start a new interview.')
       } else {
         setRecovery({ sessionId: restoreId, kind: 'restore' })
         setError('Unable to restore the interview. Recheck saved state before continuing.')
       }
     }).finally(() => {
-      if (active) { locked.current = false; setOperation(null) }
+      if (active && currentWorkspace()) { locked.current = false; setOperation(null) }
     })
     return () => { active = false }
-  }, [restoreId])
+  }, [restoreId, workspace, currentWorkspace])
 
   function invalidateDiagnosis() {
     diagnosisGeneration.current += 1
@@ -171,14 +185,14 @@ export default function Interview({ onSessionAccess, onNavigationBusyChange, onH
     setView(saved)
   }
   function requestDiagnosis(target: DiagnosisTarget) {
-    if (!mounted.current || !ownsDiagnosis(currentView.current, target)) return
+    if (!currentWorkspace() || !ownsDiagnosis(currentView.current, target)) return
     invalidateDiagnosis()
     const pending = new AbortController()
     const generation = diagnosisGeneration.current
     diagnosisController.current = pending
     diagnosisOwner.current = target
     setDiagnosis({ status: 'loading', target })
-    const current = () => mounted.current && !pending.signal.aborted &&
+    const current = () => currentWorkspace() && !pending.signal.aborted &&
       diagnosisGeneration.current === generation && diagnosisOwner.current === target &&
       ownsDiagnosis(currentView.current, target)
     void getSemanticDiagnosis(target.sessionId, target.questionIndex, target.attemptNumber, pending.signal)
@@ -200,7 +214,7 @@ export default function Interview({ onSessionAccess, onNavigationBusyChange, onH
   }
   function install(saved: SavedView) {
     showView(saved)
-    rememberSession(saved.session.id)
+    rememberSession(workspace?.storageKey ?? null, saved.session.id)
     clearDraft()
   }
   async function start() {
@@ -211,15 +225,15 @@ export default function Interview({ onSessionAccess, onNavigationBusyChange, onH
     setError('')
     try {
       const created = await startInterview()
-      if (!mounted.current) return
+      if (!currentWorkspace()) return
       install({ session: created, attempts: [], comparison: null, mode: 'composing' })
       accessCallback.current?.(created.id)
       factsCallback.current?.()
       setRecovery(null)
     } catch (cause) {
-      if (mounted.current) setError(cause instanceof Error ? cause.message : 'Unable to start interview.')
+      if (currentWorkspace()) setError(cause instanceof Error ? cause.message : 'Unable to start interview.')
     } finally {
-      if (mounted.current) { locked.current = false; setOperation(null) }
+      if (currentWorkspace()) { locked.current = false; setOperation(null) }
     }
   }
   async function reconcileConflict(context: Recovery) {
@@ -227,13 +241,13 @@ export default function Interview({ onSessionAccess, onNavigationBusyChange, onH
     clearDraft()
     try {
       const saved = await readSavedView(context.sessionId)
-      if (!mounted.current) return
+      if (!currentWorkspace()) return
       install(saved)
       factsCallback.current?.()
       setRecovery(null)
       setError('The interview changed. Reloaded the saved state; review it before continuing.')
     } catch {
-      if (!mounted.current) return
+      if (!currentWorkspace()) return
       setRecovery({ ...context, kind: 'conflict' })
       setError('The interview changed. Unable to reload it; recheck saved state before continuing.')
     }
@@ -254,7 +268,7 @@ export default function Interview({ onSessionAccess, onNavigationBusyChange, onH
       if (kind === 'submit') {
         const result = await submitAttempt(view.session, draft.text.trim(), draft.measurementId)
         acknowledged = true
-        if (!mounted.current) return
+        if (!currentWorkspace()) return
         submittedTarget = { sessionId: result.session.id, questionIndex: result.attempt.question_index,
           attemptNumber: result.attempt.attempt_number, attemptId: result.attempt.id }
         install({ session: result.session, attempts: [...view.attempts, result.attempt], comparison: null, mode: 'review' })
@@ -262,18 +276,18 @@ export default function Interview({ onSessionAccess, onNavigationBusyChange, onH
       } else {
         const updated = await continueQuestion(view.session)
         acknowledged = true
-        if (!mounted.current) return
+        if (!currentWorkspace()) return
         install({ session: updated, attempts: [], comparison: null, mode: 'composing' })
         factsCallback.current?.()
       }
       const saved = await readSavedView(view.session.id)
-      if (mounted.current) {
+      if (currentWorkspace()) {
         install(saved)
         setRecovery(null)
         if (submittedTarget && ownsDiagnosis(saved, submittedTarget)) diagnosisAfterSubmit = submittedTarget
       }
     } catch (cause) {
-      if (!mounted.current) return
+      if (!currentWorkspace()) return
       if (!acknowledged && isConflictError(cause)) {
         await reconcileConflict(context)
       } else if (acknowledged || !(cause instanceof ApiError) || cause.ambiguousWrite ||
@@ -286,7 +300,7 @@ export default function Interview({ onSessionAccess, onNavigationBusyChange, onH
         setError(cause.message)
       }
     } finally {
-      if (mounted.current) { locked.current = false; setOperation(null) }
+      if (currentWorkspace()) { locked.current = false; setOperation(null) }
     }
     // Feedback has its own lifecycle; its failures never classify a persisted write.
     if (diagnosisAfterSubmit) requestDiagnosis(diagnosisAfterSubmit)
@@ -315,7 +329,7 @@ export default function Interview({ onSessionAccess, onNavigationBusyChange, onH
     setOperation('Rechecking saved state…')
     try {
       const saved = await readSavedView(recovery.sessionId)
-      if (!mounted.current) return
+      if (!currentWorkspace()) return
       const unchangedDraft = (recovery.kind === 'submit' || recovery.kind === 'transcription') &&
         saved.session.status === 'active' && saved.session.current_question_index === recovery.questionIndex &&
         saved.session.current_question_latest_attempt_number === recovery.revision
@@ -328,9 +342,9 @@ export default function Interview({ onSessionAccess, onNavigationBusyChange, onH
       setRecovery(null)
       setError('Saved state rechecked. Choose your next action; no request was resubmitted.')
     } catch {
-      if (mounted.current) setError('Unable to recheck saved state. Check your connection and recheck before continuing.')
+      if (currentWorkspace()) setError('Unable to recheck saved state. Check your connection and recheck before continuing.')
     } finally {
-      if (mounted.current) { locked.current = false; setOperation(null) }
+      if (currentWorkspace()) { locked.current = false; setOperation(null) }
     }
   }
   async function audioConflict() {
@@ -338,7 +352,7 @@ export default function Interview({ onSessionAccess, onNavigationBusyChange, onH
     locked.current = true
     setOperation('Reloading saved state…')
     try { await reconcileConflict(recoveryFor(view, 'conflict')) }
-    finally { if (mounted.current) { locked.current = false; setOperation(null) } }
+    finally { if (currentWorkspace()) { locked.current = false; setOperation(null) } }
   }
   function uncertainTranscription() {
     if (!view) return

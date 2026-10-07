@@ -11,11 +11,14 @@ from app.sessions import InterviewSessionService
 
 
 @pytest.fixture
-def client(postgres_session_factory) -> Iterator[TestClient]:
-    service = InterviewSessionService(postgres_session_factory)
-    app.dependency_overrides[get_session_service] = lambda: service
+def client(
+    postgres_session_factory, authenticated_principal,
+    authenticated_http_headers, authenticated_session_override,
+) -> Iterator[TestClient]:
+    service = InterviewSessionService(postgres_session_factory, authenticated_principal)
+    app.dependency_overrides[get_session_service] = authenticated_session_override(service)
     try:
-        with TestClient(app) as test_client:
+        with TestClient(app, headers=authenticated_http_headers) as test_client:
             yield test_client
     finally:
         app.dependency_overrides.pop(get_session_service)

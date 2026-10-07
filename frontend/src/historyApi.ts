@@ -1,7 +1,12 @@
 import type { TimingUnavailableReason } from './interviewApi'
 import { validDeliveryMetrics } from './deliveryMetrics'
 import type { DeliveryMetrics } from './deliveryMetrics'
-import { normalizeSessionId } from './historyStorage'
+import { assertProtectedResponseCurrent, isAuthBoundaryError, protectedFetch, readProtectedJson } from './auth'
+
+function normalizeSessionId(value: unknown): string | null {
+  return typeof value === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value)
+    ? value.toLowerCase() : null
+}
 
 export interface HistoryMeasurement {
   measurement_version: string
@@ -38,7 +43,7 @@ export interface HistorySummary {
   last_saved_activity_at: string
   finalized_points: HistoryFinalizedPoint[]
 }
-export interface HistorySummaries { summaries: HistorySummary[]; missing_session_ids: string[] }
+export interface HistorySummaryPage { items: HistorySummary[]; next_cursor: string | null }
 export interface HistoryQuestion {
   question_index: number
   question_text: string
@@ -76,6 +81,7 @@ export class HistoryApiError extends Error {
   }
 }
 export interface HistoryReadOptions { signal?: AbortSignal }
+export interface HistoryDiscoveryOptions extends HistoryReadOptions { cursor?: string; limit?: number }
 export interface HistoryDetailOptions extends HistoryReadOptions { questionIndex?: number; afterAttemptNumber?: number; limit?: number }
 
 const timingReasons: readonly unknown[] = ['missing_timings', 'timing_coverage_mismatch', 'invalid_timing', 'invalid_timing_order', 'unusable_span']
@@ -132,11 +138,11 @@ function summary(value: unknown): value is HistorySummary {
     Date.parse(value.last_saved_activity_at) === Math.max(...dates.map((date) => Date.parse(date))) &&
     (value.completed_at === null || Date.parse(value.completed_at) >= Date.parse(value.created_at))
 }
-function validSummaries(value: unknown, requested: string[]): value is HistorySummaries {
-  if (!shape(value, ['summaries', 'missing_session_ids']) || !Array.isArray(value.summaries) || !value.summaries.every(summary) ||
-      !Array.isArray(value.missing_session_ids) || !value.missing_session_ids.every(uuid)) return false
-  const returned = [...value.summaries.map((item) => (item as HistorySummary).session_id), ...value.missing_session_ids]
-  return returned.length === requested.length && new Set(returned).size === returned.length && returned.every((id) => requested.includes(id))
+function validSummaryPage(value: unknown, limit: number): value is HistorySummaryPage {
+  if (!shape(value, ['items', 'next_cursor']) || !Array.isArray(value.items) ||
+      value.items.length > limit || !value.items.every(summary) ||
+      !(value.next_cursor === null || (typeof value.next_cursor === 'string' && value.next_cursor.length > 0 && value.next_cursor.length <= 512))) return false
+  return new Set(value.items.map((item) => (item as HistorySummary).session_id)).size === value.items.length
 }
 function question(value: unknown): value is HistoryQuestion {
   if (!shape(value, questionKeys) || !integer(value.question_index) || typeof value.question_text !== 'string' || !value.question_text.trim() ||
@@ -181,12 +187,14 @@ async function read<T>(path: string, valid: (value: unknown) => value is T, opti
   let response: Response
   try {
     const timeout = AbortSignal.timeout(10000)
-    response = await fetch(path, { ...options, cache: 'no-store', signal: signal ? AbortSignal.any([signal, timeout]) : timeout })
-  } catch {
+    response = await protectedFetch(path, { ...options, cache: 'no-store', signal: signal ? AbortSignal.any([signal, timeout]) : timeout })
+  } catch (error) {
+    if (isAuthBoundaryError(error)) throw error
     if (signal?.aborted) throw cancelled()
     throw new HistoryApiError('Unable to load history. Check your connection and try again.')
   }
   if (signal?.aborted) throw cancelled()
+  assertProtectedResponseCurrent(response)
   if (!response.ok) {
     const messages: Record<number, string> = {
       404: 'This session is unavailable.', 422: 'The history request was not accepted.',
@@ -195,7 +203,8 @@ async function read<T>(path: string, valid: (value: unknown) => value is T, opti
     throw new HistoryApiError(messages[response.status] ?? 'Unable to load history. Please try again.', response.status)
   }
   let result: unknown
-  try { result = await response.json() } catch {
+  try { result = await readProtectedJson(response) } catch (error) {
+    if (isAuthBoundaryError(error)) throw error
     if (signal?.aborted) throw cancelled()
     throw new HistoryApiError('Unexpected history response. Please try again.', response.status)
   }
@@ -204,14 +213,17 @@ async function read<T>(path: string, valid: (value: unknown) => value is T, opti
   return result
 }
 
-export async function getHistorySummaries(ids: readonly string[], options: HistoryReadOptions = {}): Promise<HistorySummaries> {
-  if (!Array.isArray(ids) || ids.length < 1 || ids.length > 50) throw new HistoryApiError('The history request was not accepted.', 422)
-  const normalized = ids.map(normalizeSessionId)
-  if (normalized.some((id) => id === null)) throw new HistoryApiError('The history request was not accepted.', 422)
-  const requested = [...new Set(normalized as string[])]
-  return read('/api/history/summaries', (value): value is HistorySummaries => validSummaries(value, requested), {
-    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ session_ids: requested }),
-  }, options.signal)
+export async function getHistorySummaries(options: HistoryDiscoveryOptions = {}): Promise<HistorySummaryPage> {
+  const limit = options.limit ?? 10
+  if (!positive(limit) || limit > 20 || (options.cursor !== undefined &&
+      (typeof options.cursor !== 'string' || options.cursor.length < 1 || options.cursor.length > 512))) {
+    throw new HistoryApiError('The history request was not accepted.', 422)
+  }
+  const query = new URLSearchParams()
+  if (options.limit !== undefined) query.set('limit', String(limit))
+  if (options.cursor !== undefined) query.set('cursor', options.cursor)
+  return read(`/api/history/summaries${query.size ? `?${query}` : ''}`,
+    (value): value is HistorySummaryPage => validSummaryPage(value, limit), { method: 'GET' }, options.signal)
 }
 
 export async function getHistoryDetail(value: string, options: HistoryDetailOptions = {}): Promise<HistoryDetail> {

@@ -1,3 +1,4 @@
+import { assertProtectedResponseCurrent, isAuthBoundaryError, protectedFetch, readProtectedJson } from './auth'
 import { DELIVERY_TIMING_REASONS, validLiveDeliveryMetrics } from './deliveryMetrics'
 import type { DeliveryMetrics, DeliveryTimingReason } from './deliveryMetrics'
 
@@ -152,10 +153,12 @@ async function request<T>(path: string, valid: (value: unknown) => value is T, o
   const write = options?.method === 'POST'
   let response: Response
   try {
-    response = await fetch(path, { ...options, signal: AbortSignal.timeout(10000) })
-  } catch {
+    response = await protectedFetch(path, { ...options, signal: AbortSignal.timeout(10000) })
+  } catch (error) {
+    if (isAuthBoundaryError(error)) throw error
     throw new ApiError('Unable to reach the backend. Check your connection and recheck the interview.', null, write)
   }
+  assertProtectedResponseCurrent(response)
   if (!response.ok) {
     const messages: Record<number, string> = {
       404: 'Session or attempt not found. Recheck the interview or start a new one.',
@@ -165,7 +168,8 @@ async function request<T>(path: string, valid: (value: unknown) => value is T, o
     throw new ApiError(messages[response.status] || 'Unable to update the interview. Please try again.', response.status)
   }
   let result: unknown
-  try { result = await response.json() } catch {
+  try { result = await readProtectedJson(response) } catch (error) {
+    if (isAuthBoundaryError(error)) throw error
     throw new ApiError('Unexpected backend response. Recheck the interview before continuing.', response.status, write)
   }
   if (!valid(result)) {
@@ -239,14 +243,16 @@ export async function getSemanticDiagnosis(
   checkCancellation()
   let response: Response
   try {
-    response = await fetch(`/api/sessions/${sessionId}/questions/${questionIndex}/attempts/${attemptNumber}/diagnosis`, {
+    response = await protectedFetch(`/api/sessions/${sessionId}/questions/${questionIndex}/attempts/${attemptNumber}/diagnosis`, {
       method: 'POST', signal: AbortSignal.any([signal, timeout]),
     })
-  } catch {
+  } catch (error) {
+    if (isAuthBoundaryError(error)) throw error
     checkCancellation()
     throw new SemanticDiagnosisError('Unable to load feedback right now. You can still retry or continue.')
   }
   checkCancellation()
+  assertProtectedResponseCurrent(response)
   if (!response.ok) {
     const messages: Record<number, string> = {
       404: 'Feedback is no longer available for this attempt.',
@@ -257,7 +263,8 @@ export async function getSemanticDiagnosis(
     throw new SemanticDiagnosisError(messages[response.status] ?? malformedMessage, response.status)
   }
   let result: unknown
-  try { result = await response.json() } catch {
+  try { result = await readProtectedJson(response) } catch (error) {
+    if (isAuthBoundaryError(error)) throw error
     checkCancellation()
     throw new SemanticDiagnosisError(malformedMessage, response.status)
   }
@@ -373,12 +380,14 @@ export interface AudioAccepted {
 export async function uploadAudio(session: InterviewSession, audio: Blob, signal: AbortSignal): Promise<AudioAccepted> {
   let response: Response
   try {
-    response = await fetch(`/api/sessions/${session.id}/audio`, {
+    response = await protectedFetch(`/api/sessions/${session.id}/audio`, {
       method: 'POST', body: audioForm(session, audio), signal: AbortSignal.any([signal, AbortSignal.timeout(30000)]),
     })
-  } catch {
+  } catch (error) {
+    if (isAuthBoundaryError(error)) throw error
     throw new ApiError('Audio upload failed or timed out. Check your connection and try again.')
   }
+  assertProtectedResponseCurrent(response)
   if (!response.ok) {
     const messages: Record<number, string> = {
       404: 'Session not found. Start a new interview.',
@@ -390,7 +399,10 @@ export async function uploadAudio(session: InterviewSession, audio: Blob, signal
     throw new ApiError(messages[response.status] || 'Audio upload failed. Please try again.', response.status)
   }
   let result: unknown
-  try { result = await response.json() } catch { throw new ApiError('Unexpected upload confirmation. Please try again.', response.status) }
+  try { result = await readProtectedJson(response) } catch (error) {
+    if (isAuthBoundaryError(error)) throw error
+    throw new ApiError('Unexpected upload confirmation. Please try again.', response.status)
+  }
   if (!object(result) || result.status !== 'accepted' || result.session_id !== session.id || result.question_index !== session.current_question_index) {
     throw new ApiError('Unexpected upload confirmation. Please try again.', response.status)
   }
@@ -445,13 +457,15 @@ function validSpeakingMetrics(value: unknown): value is SpeakingMetrics {
 export async function transcribeAudio(session: InterviewSession, audio: Blob, signal: AbortSignal): Promise<TranscriptionResult> {
   let response: Response
   try {
-    response = await fetch(`/api/sessions/${session.id}/transcriptions`, {
+    response = await protectedFetch(`/api/sessions/${session.id}/transcriptions`, {
       method: 'POST', body: audioForm(session, audio, true),
       signal: AbortSignal.any([signal, AbortSignal.timeout(75000)]),
     })
-  } catch {
+  } catch (error) {
+    if (isAuthBoundaryError(error)) throw error
     throw new ApiError('Transcription failed or timed out. Check your connection and recheck the interview.', null, true)
   }
+  assertProtectedResponseCurrent(response)
   if (!response.ok) {
     const messages: Record<number, string> = {
       404: 'Session not found. Start a new interview.',
@@ -466,7 +480,8 @@ export async function transcribeAudio(session: InterviewSession, audio: Blob, si
     throw new ApiError(messages[response.status] || 'Transcription failed. Please try again.', response.status)
   }
   let result: unknown
-  try { result = await response.json() } catch {
+  try { result = await readProtectedJson(response) } catch (error) {
+    if (isAuthBoundaryError(error)) throw error
     throw new ApiError('No usable transcript was returned. Recheck the interview before continuing.', response.status, true)
   }
   if (!object(result) || typeof result.text !== 'string' || !result.text.trim() || result.text.length > 10000 ||

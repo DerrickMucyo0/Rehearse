@@ -6,6 +6,7 @@ from pydantic import BaseModel, ConfigDict, Field, StringConstraints, computed_f
 from sqlalchemy import and_, func, select
 from sqlalchemy.orm import Session, sessionmaker
 
+from app.auth import AuthenticatedPrincipal
 from app.comparisons import (
     AttemptComparison, ComparedAttempt, MeasurementSnapshot, compare_delivery_measurements,
     compare_measurements, delivery_snapshot,
@@ -91,14 +92,31 @@ class InvalidComparisonSelection(Exception):
 
 
 class InterviewSessionService:
-    """PostgreSQL storage; each operation owns and closes its ORM transaction."""
+    """One authenticated owner; every operation closes its own transaction.
 
-    def __init__(self, session_factory: sessionmaker[Session]) -> None:
+    Authentication belongs to the HTTP/store boundary. This service authorizes
+    by filtering the root session in the same SELECT, including row locks, before
+    interpreting child rows, question state, revisions or measurement references.
+    The shared factory carries no identity; this service is never globally cached.
+    """
+
+    def __init__(
+        self, session_factory: sessionmaker[Session], principal: AuthenticatedPrincipal,
+    ) -> None:
+        if type(principal) is not AuthenticatedPrincipal:
+            raise TypeError("An authenticated principal is required.")
         self._session_factory = session_factory
+        self._principal = principal
+
+    def _session_predicate(self, session_id: UUID):
+        return and_(
+            StoredInterviewSession.id == session_id,
+            StoredInterviewSession.user_id == self._principal.user_id,
+        )
 
     def start(self) -> InterviewSession:
         with self._session_factory.begin() as database:
-            stored = StoredInterviewSession(questions=QUESTIONS)
+            stored = StoredInterviewSession(questions=QUESTIONS, user_id=self._principal.user_id)
             database.add(stored)
             database.flush()
             return self._response(stored, [])
@@ -116,7 +134,7 @@ class InterviewSessionService:
                     QuestionAttempt.session_id == StoredInterviewSession.id,
                     QuestionAttempt.question_index == question_index,
                 ))
-                .where(StoredInterviewSession.id == session_id)
+                .where(self._session_predicate(session_id))
                 .order_by(QuestionAttempt.attempt_number)
             ).all()
             if not rows:
@@ -289,10 +307,9 @@ class InterviewSessionService:
         if expected_last_attempt_number is not None:
             self._check_revision(session.current_question_latest_attempt_number, expected_last_attempt_number)
 
-    @staticmethod
-    def _locked_session(database: Session, session_id: UUID) -> StoredInterviewSession:
+    def _locked_session(self, database: Session, session_id: UUID) -> StoredInterviewSession:
         stored = database.scalar(
-            select(StoredInterviewSession).where(StoredInterviewSession.id == session_id).with_for_update()
+            select(StoredInterviewSession).where(self._session_predicate(session_id)).with_for_update()
         )
         if stored is None:
             raise SessionNotFound("Session not found.")
@@ -309,9 +326,8 @@ class InterviewSessionService:
         if expected != latest:
             raise SessionConflict("Attempt revision does not match the current question.")
 
-    @staticmethod
     def _read_question_attempts(
-        database: Session, session_id: UUID, question_index: int,
+        self, database: Session, session_id: UUID, question_index: int,
     ) -> tuple[StoredInterviewSession, dict[int, tuple[QuestionAttempt, TranscriptionMeasurement | None]]]:
         # One statement selects the immutable question snapshot, scoped attempts
         # and their exact linked measurements. No read lock or latest-measurement
@@ -328,7 +344,7 @@ class InterviewSessionService:
                 TranscriptionMeasurement.session_id == QuestionAttempt.session_id,
                 TranscriptionMeasurement.question_index == QuestionAttempt.question_index,
             ))
-            .where(StoredInterviewSession.id == session_id)
+            .where(self._session_predicate(session_id))
             .order_by(QuestionAttempt.attempt_number)
         ).all()
         if not rows:
@@ -346,7 +362,7 @@ class InterviewSessionService:
         rows = database.execute(
             select(StoredInterviewSession, QuestionAttempt)
             .outerjoin(QuestionAttempt, QuestionAttempt.session_id == StoredInterviewSession.id)
-            .where(StoredInterviewSession.id == session_id)
+            .where(self._session_predicate(session_id))
             .order_by(QuestionAttempt.question_index, QuestionAttempt.attempt_number)
         ).all()
         if not rows:

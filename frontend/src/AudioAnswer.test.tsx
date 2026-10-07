@@ -1,4 +1,5 @@
 // @vitest-environment jsdom
+import { authenticateTestWorkspace } from './authTestUtils'
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { afterEach, beforeEach, expect, test, vi } from 'vitest'
 import AudioAnswer from './AudioAnswer'
@@ -60,7 +61,8 @@ class Recorder {
   }
 }
 
-beforeEach(() => {
+beforeEach(async () => {
+  await authenticateTestWorkspace()
   sessionStorage.clear()
   Recorder.instances = []
   Recorder.isTypeSupported.mockImplementation((type) => type === 'audio/webm;codecs=opus')
@@ -224,7 +226,8 @@ test('requests permission only on click, prevents duplicate starts, stops tracks
   expect(screen.getByText('Uploading recording…')).toBeTruthy()
   const [url, options] = fetchMock.mock.calls[0] as unknown as [string, RequestInit]
   expect(url).toBe('/api/sessions/session-1/audio')
-  expect(options.headers).toBeUndefined()
+  expect(new Headers(options.headers).get('X-Rehearse-Auth-Context')).toBe('context-A')
+  expect(new Headers(options.headers).has('Content-Type')).toBe(false)
   const body = options.body as FormData
   expect(body.get('question_index')).toBe('0')
   expect((body.get('audio') as File).type).toBe('audio/webm;codecs=opus')
@@ -443,7 +446,8 @@ test('transcribes once, preserves original measurements on edits, and advances o
   expect((screen.getByRole('button', { name: 'Submit Attempt' }) as HTMLButtonElement).disabled).toBe(true)
   const [url, options] = fetchMock.mock.calls[1]
   expect(url).toBe('/api/sessions/session-1/transcriptions')
-  expect(options?.headers).toBeUndefined()
+  expect(new Headers(options?.headers).get('X-Rehearse-Auth-Context')).toBe('context-A')
+  expect(new Headers(options?.headers).has('Content-Type')).toBe(false)
   const body = options?.body as FormData
   expect(body.get('question_index')).toBe('0')
   expect(body.get('expected_last_attempt_number')).toBe('0')

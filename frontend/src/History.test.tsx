@@ -1,3 +1,4 @@
+import { authenticateTestWorkspace } from './authTestUtils'
 // @vitest-environment jsdom
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { afterEach, beforeEach, expect, test, vi } from 'vitest'
@@ -43,12 +44,9 @@ function summary(id = FIRST, status: 'active' | 'completed' = 'active'): History
 }
 
 function state(summaries: HistorySummary[] = [], changes: Partial<HistoryHydrationState> = {}): HistoryHydrationState {
-  return { status: 'complete', summaries, missingIds: [], failedChunks: [], rememberedCount: summaries.length, ...changes }
+  return { status: 'complete', summaries, nextCursor: null, pageError: false, ...changes }
 }
-
-function props(ids = [FIRST]) {
-  return { sessionIds: ids, storageError: null, onRemove: vi.fn(), onClear: vi.fn(), onPractice: vi.fn() }
-}
+function props() { return { onPractice: vi.fn() } }
 
 function deferred<T>() {
   let resolve!: (value: T) => void
@@ -56,7 +54,8 @@ function deferred<T>() {
   return { promise, resolve }
 }
 
-beforeEach(() => {
+beforeEach(async () => {
+  await authenticateTestWorkspace()
   hydrate.mockReset()
   readDetail.mockReset()
   hydrate.mockResolvedValue(state())
@@ -64,145 +63,94 @@ beforeEach(() => {
 })
 afterEach(() => { cleanup(); vi.unstubAllGlobals(); vi.restoreAllMocks() })
 
-test('empty history describes this browser and offers Practice without a backend request', async () => {
-  const options = props([])
+test('empty server History offers Practice and does not offer local membership deletion', async () => {
+  const options = props()
   render(<History {...options} />)
-  expect(screen.getByText('No sessions are remembered on this browser yet.')).toBeTruthy()
+  await screen.findByText('No saved sessions yet.')
   fireEvent.click(screen.getByRole('button', { name: 'Practice' }))
   expect(options.onPractice).toHaveBeenCalledOnce()
-  expect(screen.queryByRole('button', { name: 'Clear remembered history' })).toBeNull()
-  await waitFor(() => expect(hydrate).toHaveBeenCalledOnce())
+  expect(screen.queryByRole('button', { name: /Clear|Remove/ })).toBeNull()
+  expect(hydrate).toHaveBeenCalledOnce()
   expect(readDetail).not.toHaveBeenCalled()
   expect(fetch).not.toHaveBeenCalled()
 })
-
-test('active and completed rows display objective counts and no raw UUIDs or quality judgments', async () => {
+test('server-discovered active and completed rows display facts without raw UUIDs or judgments', async () => {
   hydrate.mockResolvedValue(state([summary(SECOND, 'completed'), summary(FIRST)]))
-  const view = render(<History {...props([FIRST, SECOND])} />)
+  const view = render(<History {...props()} />)
   await screen.findByRole('heading', { name: 'Active session' })
   const rows = view.container.querySelectorAll('.history-summary')
   expect(rows).toHaveLength(2)
   expect(within(rows[0] as HTMLElement).getByRole('heading').textContent).toBe('Completed session')
-  expect(within(rows[1] as HTMLElement).getByRole('heading').textContent).toBe('Active session')
   const active = within(rows[1] as HTMLElement)
   expect(active.getByText('2 / 5')).toBeTruthy()
   expect(active.getByText('Attempts').nextElementSibling?.textContent).toBe('5')
   expect(active.getByText('Retries').nextElementSibling?.textContent).toBe('2')
-  expect(active.getByText('Measured final answers').nextElementSibling?.textContent).toBe('2')
   expect(active.getByText('Current question').nextElementSibling?.textContent).toBe('3 of 5')
-  expect(within(rows[0] as HTMLElement).queryByText('Current question')).toBeNull()
   expect(view.container.textContent).not.toContain(FIRST)
   expect(view.container.textContent).not.toContain(SECOND)
-  expect(view.container.textContent).not.toMatch(/\b(improved|better|worse|good|bad|score|performance|readiness|confidence)\b/i)
+  expect(view.container.textContent).not.toMatch(/\b(improved|better|worse|score|readiness|confidence)\b/i)
 })
-
-test('known and missing entries offer local removal without silently removing missing IDs', async () => {
-  const options = props([FIRST, SECOND])
-  hydrate.mockResolvedValue(state([summary()], { missingIds: [SECOND], rememberedCount: 2 }))
-  render(<History {...options} />)
+test('legacy browser registry is ignored and server sessions alone appear', async () => {
+  localStorage.setItem('rehearse.history.v1', JSON.stringify([THIRD]))
+  sessionStorage.setItem('rehearse.session_id', THIRD)
+  hydrate.mockResolvedValue(state([summary(FIRST)]))
+  const view = render(<History {...props()} />)
   await screen.findByRole('heading', { name: 'Active session' })
-  expect(options.onRemove).not.toHaveBeenCalled()
-  const missing = screen.getByRole('region', { name: 'Unavailable remembered sessions' })
-  fireEvent.click(within(missing).getByRole('button', { name: 'Remove from this browser' }))
-  expect(options.onRemove).toHaveBeenLastCalledWith(SECOND)
-  fireEvent.click(screen.getAllByRole('button', { name: 'Remove from this browser' })[0])
-  expect(options.onRemove).toHaveBeenLastCalledWith(FIRST)
-  expect(fetch).not.toHaveBeenCalled()
+  expect(view.container.querySelectorAll('.history-summary')).toHaveLength(1)
+  expect(hydrate.mock.calls[0][0]).not.toHaveProperty('sessionIds')
+  expect(localStorage.getItem('rehearse.history.v1')).toBe(JSON.stringify([THIRD]))
+  expect(sessionStorage.getItem('rehearse.session_id')).toBe(THIRD)
+  localStorage.clear(); sessionStorage.clear()
 })
-
-test('clear requires confirmation and removes only remembered history through its callback', async () => {
-  const options = props()
-  hydrate.mockResolvedValue(state([summary()]))
-  const confirm = vi.spyOn(window, 'confirm').mockReturnValue(false)
-  const view = render(<History {...options} />)
+test('pagination is explicit and keeps earlier rows until the new page loads', async () => {
+  const first = state([summary()], { status: 'partial', nextCursor: 'next' })
+  hydrate.mockResolvedValueOnce(first).mockResolvedValueOnce(state([summary(SECOND, 'completed'), summary()]))
+  render(<History {...props()} />)
   await screen.findByRole('heading', { name: 'Active session' })
-  sessionStorage.setItem('rehearse.session_id', FIRST)
-  fireEvent.click(screen.getByRole('button', { name: 'Clear remembered history' }))
-  expect(confirm).toHaveBeenCalledWith('Clear sessions remembered on this browser?\n\nThis removes the local history list. It does not delete sessions stored on the server.')
-  expect(options.onClear).not.toHaveBeenCalled()
-  confirm.mockReturnValue(true)
-  fireEvent.click(screen.getByRole('button', { name: 'Clear remembered history' }))
-  expect(options.onClear).toHaveBeenCalledOnce()
-  view.rerender(<History {...options} sessionIds={[]} />)
-  expect(screen.getByText('No sessions are remembered on this browser yet.')).toBeTruthy()
-  expect(screen.queryByRole('heading', { name: 'Active session' })).toBeNull()
-  expect(sessionStorage.getItem('rehearse.session_id')).toBe(FIRST)
-  sessionStorage.removeItem('rehearse.session_id')
-})
-
-test('partial results stay visible and retry only failed chunks with previous results', async () => {
-  const partial = state([summary()], { status: 'partial', failedChunks: [[SECOND]], rememberedCount: 2 })
-  hydrate.mockResolvedValueOnce(partial).mockResolvedValueOnce(state([summary(SECOND, 'completed'), summary()], { rememberedCount: 2 }))
-  render(<History {...props([FIRST, SECOND])} />)
-  await screen.findByRole('heading', { name: 'Active session' })
-  expect(screen.getByRole('alert').textContent).toContain('incomplete')
-  fireEvent.click(screen.getByRole('button', { name: 'Retry failed history requests' }))
-  await screen.findByRole('heading', { name: 'Completed session' })
-  expect(hydrate.mock.calls[1][1]?.previous).toEqual(partial)
-  expect(hydrate.mock.calls[1][1]?.retryChunks).toEqual([[SECOND]])
   expect(screen.queryByRole('alert')).toBeNull()
-})
-
-test('all failed requests differ from an empty registry and retain remembered entries', async () => {
-  const options = props()
-  hydrate.mockResolvedValue(state([], { status: 'error', failedChunks: [[FIRST]], rememberedCount: 1 }))
-  render(<History {...options} />)
-  await screen.findByRole('alert')
-  expect(screen.getByRole('alert').textContent).toBe('Remembered sessions could not be loaded.')
-  expect(screen.queryByText('No sessions are remembered on this browser yet.')).toBeNull()
-  expect(screen.getByRole('button', { name: 'Retry failed history requests' })).toBeTruthy()
-  expect(options.onRemove).not.toHaveBeenCalled()
-  expect(options.onClear).not.toHaveBeenCalled()
-})
-
-test('a storage warning keeps the empty-state Practice action usable', () => {
-  const options = props([])
-  render(<History {...options} storageError="History could not be saved in this browser." />)
-  expect(screen.getByRole('status').textContent).toContain('History could not be saved')
-  fireEvent.click(screen.getByRole('button', { name: 'Practice' }))
-  expect(options.onPractice).toHaveBeenCalledOnce()
-})
-
-test('a registry change aborts old hydration and excludes its late results', async () => {
-  const old = deferred<HistoryHydrationState>()
-  hydrate.mockReturnValueOnce(old.promise).mockResolvedValueOnce(state([summary(SECOND, 'completed')]))
-  const options = props()
-  const view = render(<History {...options} />)
-  const oldSignal = hydrate.mock.calls[0][1]?.signal
-  view.rerender(<History {...options} sessionIds={[SECOND]} />)
+  fireEvent.click(screen.getByRole('button', { name: 'Load more sessions' }))
   await screen.findByRole('heading', { name: 'Completed session' })
-  expect(oldSignal?.aborted).toBe(true)
-  await act(async () => old.resolve(state([summary()])))
-  expect(screen.queryByRole('heading', { name: 'Active session' })).toBeNull()
+  expect(hydrate.mock.calls[1][0]?.previous).toEqual(first)
+  expect(screen.queryByRole('button', { name: 'Load more sessions' })).toBeNull()
 })
-
-test('clearing or unmounting cancels hydration and cannot restore late rows', async () => {
+test('failed continuation retains rows and retries only the failed continuation', async () => {
+  const failed = state([summary()], { status: 'partial', nextCursor: 'next', pageError: true })
+  hydrate.mockResolvedValueOnce(failed).mockResolvedValueOnce(state([summary()]))
+  render(<History {...props()} />)
+  await screen.findByRole('alert')
+  expect(screen.getByRole('alert').textContent).toContain('incomplete')
+  expect(screen.getByRole('heading', { name: 'Active session' })).toBeTruthy()
+  fireEvent.click(screen.getByRole('button', { name: 'Retry history request' }))
+  await waitFor(() => expect(screen.queryByRole('alert')).toBeNull())
+  expect(hydrate.mock.calls[1][0]?.previous).toEqual(failed)
+})
+test('initial failure differs from empty saved History', async () => {
+  hydrate.mockResolvedValue(state([], { status: 'error', pageError: true }))
+  render(<History {...props()} />)
+  expect((await screen.findByRole('alert')).textContent).toBe('Saved sessions could not be loaded.')
+  expect(screen.queryByText('No saved sessions yet.')).toBeNull()
+})
+test('unmount cancels hydration and cannot restore late rows', async () => {
   const old = deferred<HistoryHydrationState>()
   hydrate.mockReturnValueOnce(old.promise)
-  vi.spyOn(window, 'confirm').mockReturnValue(true)
-  const options = props()
-  const view = render(<History {...options} />)
-  const signal = hydrate.mock.calls[0][1]?.signal
-  fireEvent.click(screen.getByRole('button', { name: 'Clear remembered history' }))
-  expect(signal?.aborted).toBe(true)
-  await act(async () => old.resolve(state([summary()])))
-  expect(screen.queryByRole('heading', { name: 'Active session' })).toBeNull()
+  const view = render(<History {...props()} />)
+  const signal = hydrate.mock.calls[0][0]?.signal
   view.unmount()
+  await act(async () => old.resolve(state([summary()])))
+  expect(signal?.aborted).toBe(true)
   expect(fetch).not.toHaveBeenCalled()
 })
-
-test('opening detail uses app state and removal closes it without leaving stale sensitive content', async () => {
+test('opening owned detail uses memory selection and Back preserves discovery cache', async () => {
   hydrate.mockResolvedValue(state([summary()]))
   readDetail.mockResolvedValue({ summary: summary(), questions: [], selected_question: null })
-  const options = props()
   const originalUrl = window.location.href
-  const view = render(<History {...options} />)
+  render(<History {...props()} />)
   fireEvent.click(await screen.findByRole('button', { name: 'Open session' }))
   await screen.findByRole('heading', { name: 'Session detail' })
   expect(window.location.href).toBe(originalUrl)
   expect(readDetail.mock.calls[0][0]).toBe(FIRST)
-  view.rerender(<History {...options} sessionIds={[THIRD]} />)
-  await waitFor(() => expect(screen.queryByRole('heading', { name: 'Session detail' })).toBeNull())
-  view.rerender(<History {...options} sessionIds={[FIRST]} />)
-  expect(screen.queryByRole('heading', { name: 'Session detail' })).toBeNull()
+  expect(screen.queryByRole('button', { name: /Remove/ })).toBeNull()
+  fireEvent.click(screen.getByRole('button', { name: 'Back to History' }))
+  await screen.findByRole('heading', { name: 'Active session' })
+  expect(hydrate).toHaveBeenCalledOnce()
 })

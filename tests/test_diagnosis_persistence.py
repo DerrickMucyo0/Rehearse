@@ -62,8 +62,8 @@ def forbid_providers_semantics_and_recalculation(monkeypatch):
 
 
 @pytest.fixture
-def sessions(postgres_session_factory):
-    return InterviewSessionService(postgres_session_factory)
+def sessions(postgres_session_factory, authenticated_principal):
+    return InterviewSessionService(postgres_session_factory, authenticated_principal)
 
 
 def metrics(**changes):
@@ -544,7 +544,7 @@ def test_builder_receives_authoritative_projection_and_only_adjacent_comparison(
 
 @pytest.mark.parametrize("lifecycle", ["active", "continued", "completed"])
 def test_diagnosis_uses_one_unlocked_read_transaction_without_mutation_or_public_reads(
-        sessions, postgres_engine, postgres_session_factory, monkeypatch, lifecycle):
+        sessions, postgres_engine, postgres_session_factory, monkeypatch, lifecycle, authenticated_principal):
     created = sessions.start()
     measured_attempt(sessions, created.id, pauses=delivery())
     measured_attempt(sessions, created.id, metrics(recognized_word_count=13), revision=1, pauses=delivery())
@@ -559,7 +559,7 @@ def test_diagnosis_uses_one_unlocked_read_transaction_without_mutation_or_public
     class ReadSession(Session):
         pass
 
-    audited = InterviewSessionService(sessionmaker(bind=postgres_engine, class_=ReadSession))
+    audited = InterviewSessionService(sessionmaker(bind=postgres_engine, class_=ReadSession), authenticated_principal)
     transactions, statements = [], []
 
     def transaction_created(database, transaction):

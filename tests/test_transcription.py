@@ -11,7 +11,9 @@ from sqlalchemy import select
 from app.audio import MAX_AUDIO_BYTES, MAX_BODY_BYTES
 from app.database_models import TranscriptionMeasurement
 from app.main import app
-from app.session_routes import SessionTranscription, get_session_service
+from app.session_routes import (
+    SessionTranscription, get_session_service,
+)
 from app.sessions import AttemptRequest, ContinueRequest, InterviewSessionService
 from app.transcription import (
     ElevenLabsTranscriptionService, TranscriptionFailed, TranscriptionResult,
@@ -48,13 +50,16 @@ class FakeTranscriber:
 
 
 @pytest.fixture
-def setup(postgres_session_factory):
-    service = InterviewSessionService(postgres_session_factory)
+def setup(
+    postgres_session_factory, authenticated_principal,
+    authenticated_http_headers, authenticated_session_override,
+):
+    service = InterviewSessionService(postgres_session_factory, authenticated_principal)
     fake = FakeTranscriber()
-    app.dependency_overrides[get_session_service] = lambda: service
+    app.dependency_overrides[get_session_service] = authenticated_session_override(service)
     app.dependency_overrides[get_transcription_service] = lambda: fake
     try:
-        with TestClient(app) as client:
+        with TestClient(app, headers=authenticated_http_headers) as client:
             yield client, service, fake
     finally:
         app.dependency_overrides.clear()

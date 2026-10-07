@@ -636,9 +636,9 @@ def stored_rows(factory):
     ("first", 1), ("historical", 2), ("gap", 3),
 ))
 def test_persisted_context_transaction_ends_before_adapter_and_rows_remain_unchanged(
-    postgres_engine, postgres_session_factory, monkeypatch, scenario, selected_number,
+    postgres_engine, postgres_session_factory, authenticated_principal, monkeypatch, scenario, selected_number,
 ):
-    setup_service = InterviewSessionService(postgres_session_factory)
+    setup_service = InterviewSessionService(postgres_session_factory, authenticated_principal)
     created = setup_service.start()
     expected_measurement = None
     if scenario == "first":
@@ -678,7 +678,9 @@ def test_persisted_context_transaction_ends_before_adapter_and_rows_remain_uncha
     class ReadSession(Session):
         pass
 
-    service: DiagnosisContextReader = InterviewSessionService(sessionmaker(bind=postgres_engine, class_=ReadSession))
+    service: DiagnosisContextReader = InterviewSessionService(
+        sessionmaker(bind=postgres_engine, class_=ReadSession), authenticated_principal,
+    )
     read_calls, returned, transactions, ended, statements, timeline = [], [], [], [], [], []
     active = set()
     original_read = service.get_diagnosis_context

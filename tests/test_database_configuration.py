@@ -1,5 +1,13 @@
+from concurrent.futures import ThreadPoolExecutor
+from datetime import timedelta
+import inspect
+from threading import Barrier, Event
+from uuid import uuid4
+
 import pytest
 from sqlalchemy.engine import make_url
+from sqlalchemy.orm import Session, sessionmaker
+from starlette.requests import Request
 
 from app.database import (
     DatabaseConfigurationError, create_database_engine, create_session_factory,
@@ -8,6 +16,28 @@ from app.database import (
 
 APPLICATION = "postgresql+psycopg://local_dev:PRIVATE_SENTINEL@localhost/rehearse_dev"
 TEST = "postgresql+psycopg://rehearse_test:PRIVATE_SENTINEL@localhost/rehearse_test"
+
+
+@pytest.fixture
+def shared_factory_engines(monkeypatch):
+    from app import database
+
+    database.get_database_session_factory.cache_clear()
+    engines = []
+    actual_create_engine = database.create_database_engine
+
+    def captured_engine(*args, **kwargs):
+        engine = actual_create_engine(*args, **kwargs)
+        engines.append(engine)
+        return engine
+
+    monkeypatch.setattr(database, "create_database_engine", captured_engine)
+    try:
+        yield engines
+    finally:
+        database.get_database_session_factory.cache_clear()
+        for engine in engines:
+            engine.dispose()
 
 
 @pytest.mark.parametrize("environment", [{}, {"DATABASE_URL": ""}, {"DATABASE_URL": " "}])
@@ -140,3 +170,164 @@ def test_engine_does_not_accept_sqlite_or_unvalidated_string():
     for target in (make_url("sqlite://"), APPLICATION):
         with pytest.raises(DatabaseConfigurationError):
             create_database_engine(target)
+
+
+@pytest.mark.parametrize("raw", [
+    None, "", " ", "PRIVATE_SENTINEL", "sqlite:///PRIVATE_SENTINEL",
+    APPLICATION + "?dbname=rehearse_test",
+])
+def test_shared_factory_preserves_configuration_errors_without_test_url_fallback(
+    monkeypatch, shared_factory_engines, raw,
+):
+    from app import database
+
+    monkeypatch.setenv("TEST_DATABASE_URL", TEST)
+    if raw is None:
+        monkeypatch.delenv("DATABASE_URL", raising=False)
+    else:
+        monkeypatch.setenv("DATABASE_URL", raw)
+
+    def forbidden_factory(*args, **kwargs):
+        raise AssertionError("Invalid application configuration must not create a session factory.")
+
+    monkeypatch.setattr(database, "create_session_factory", forbidden_factory)
+    with pytest.raises(DatabaseConfigurationError) as caught:
+        database.get_database_session_factory()
+    assert "PRIVATE_SENTINEL" not in str(caught.value)
+    if raw is None or not raw.strip():
+        assert str(caught.value) == "DATABASE_URL must be explicitly configured."
+    assert shared_factory_engines == []
+    assert database.get_database_session_factory.cache_info().currsize == 0
+
+
+def test_both_consumers_share_one_lazy_factory_without_request_or_session_state(
+    monkeypatch, shared_factory_engines,
+):
+    import psycopg
+    from app import auth_http, database, session_routes
+    from app.auth import AuthenticatedPrincipal
+
+    monkeypatch.setenv("DATABASE_URL", APPLICATION)
+    monkeypatch.setenv("TEST_DATABASE_URL", TEST)
+    factory_calls, service_calls, store_calls = [], [], []
+    actual_create_factory = database.create_session_factory
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("Factory composition must not open connections or construct ORM sessions.")
+
+    def captured_factory(engine):
+        factory = actual_create_factory(engine)
+        factory_calls.append((engine, factory))
+        return factory
+
+    def interview_service(factory, principal):
+        service = object()
+        service_calls.append((factory, principal, service))
+        return service
+
+    def authentication_store(factory, *, session_lifetime):
+        store = object()
+        store_calls.append((factory, session_lifetime, store))
+        return store
+
+    monkeypatch.setattr(psycopg, "connect", forbidden)
+    monkeypatch.setattr(Session, "__init__", forbidden)
+    monkeypatch.setattr(database, "create_session_factory", captured_factory)
+    monkeypatch.setattr(session_routes, "InterviewSessionService", interview_service)
+    monkeypatch.setattr(auth_http, "PostgreSQLAuthSessionStore", authentication_store)
+    assert shared_factory_engines == factory_calls == []
+    helper = database.get_database_session_factory
+    assert session_routes.get_database_session_factory is auth_http.get_database_session_factory is helper
+    assert tuple(inspect.signature(helper).parameters) == ()
+    assert helper.cache_info().currsize == 0
+
+    first_principal = AuthenticatedPrincipal(
+        user_id=uuid4(), auth_session_id=uuid4(), request_context="first-login-context",
+    )
+    second_principal = AuthenticatedPrincipal(
+        user_id=uuid4(), auth_session_id=uuid4(), request_context="replacement-login-context",
+    )
+    service = session_routes.get_session_service(first_principal)
+    replacement_service = session_routes.get_session_service(second_principal)
+    stores = []
+    for credential in ("first-login-credential", "replacement-login-credential"):
+        request = Request({
+            "type": "http", "method": "GET", "path": "/future-private",
+            "headers": [(b"cookie", f"{auth_http.AUTH_SESSION_COOKIE_NAME}={credential}".encode("ascii"))],
+        })
+        stores.append(auth_http.get_auth_session_store(request))
+    factory = helper()
+    assert isinstance(factory, sessionmaker) and not isinstance(factory, Session)
+    assert len(shared_factory_engines) == len(factory_calls) == 1
+    engine = shared_factory_engines[0]
+    assert factory_calls == [(engine, factory)]
+    assert service_calls == [
+        (factory, first_principal, service), (factory, second_principal, replacement_service),
+    ]
+    assert replacement_service is not service
+    assert store_calls == [(factory, timedelta(hours=8), store) for store in stores]
+    assert engine.url == get_database_url({"DATABASE_URL": APPLICATION})
+    assert engine.echo is False and engine.hide_parameters is True
+    assert engine.pool.checkedout() == 0
+    repeated_service = session_routes.get_session_service(first_principal)
+    assert repeated_service is not service and repeated_service is not replacement_service
+    assert service_calls[-1] == (factory, first_principal, repeated_service)
+    assert len(service_calls) == 3
+    monkeypatch.setenv("DATABASE_URL", TEST)
+    assert helper() is factory
+    assert len(shared_factory_engines) == len(factory_calls) == 1
+    assert helper.cache_info().maxsize == helper.cache_info().currsize == 1
+
+
+def test_concurrent_initial_factory_calls_construct_one_engine_and_sessionmaker(
+    monkeypatch, shared_factory_engines,
+):
+    import psycopg
+    from app import database
+
+    monkeypatch.setenv("DATABASE_URL", APPLICATION)
+    actual_create_engine = database.create_database_engine
+    actual_create_factory = database.create_session_factory
+    creator_calls, factory_calls = [], []
+    callers = 4
+    start = Barrier(callers)
+    requested = [Event() for _ in range(callers)]
+    creator_started, release_creator = Event(), Event()
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("Concurrent configuration must not connect or construct ORM sessions.")
+
+    def gated_engine():
+        creator_calls.append(object())
+        creator_started.set()
+        assert release_creator.wait(5), "Test did not release lazy engine creation."
+        return actual_create_engine()
+
+    def captured_factory(engine):
+        factory = actual_create_factory(engine)
+        factory_calls.append(factory)
+        return factory
+
+    def configure(index):
+        start.wait(timeout=5)
+        requested[index].set()
+        return database.get_database_session_factory()
+
+    monkeypatch.setattr(psycopg, "connect", forbidden)
+    monkeypatch.setattr(Session, "__init__", forbidden)
+    monkeypatch.setattr(database, "create_database_engine", gated_engine)
+    monkeypatch.setattr(database, "create_session_factory", captured_factory)
+    with ThreadPoolExecutor(max_workers=callers) as executor:
+        futures = [executor.submit(configure, index) for index in range(callers)]
+        try:
+            assert all(caller.wait(5) for caller in requested)
+            assert creator_started.wait(5)
+            assert all(not future.done() for future in futures)
+        finally:
+            release_creator.set()
+        factories = [future.result(timeout=5) for future in futures]
+    assert len(creator_calls) == len(shared_factory_engines) == len(factory_calls) == 1
+    assert all(factory is factories[0] for factory in factories)
+    assert isinstance(factories[0], sessionmaker)
+    assert database.get_database_session_factory() is factories[0]
+    assert database.get_database_session_factory.cache_info().currsize == 1

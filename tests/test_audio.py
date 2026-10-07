@@ -11,11 +11,14 @@ from app.sessions import InterviewSessionService
 
 
 @pytest.fixture
-def client(postgres_session_factory) -> Iterator[TestClient]:
-    service = InterviewSessionService(postgres_session_factory)
-    app.dependency_overrides[get_session_service] = lambda: service
+def client(
+    postgres_session_factory, authenticated_principal,
+    authenticated_http_headers, authenticated_session_override,
+) -> Iterator[TestClient]:
+    service = InterviewSessionService(postgres_session_factory, authenticated_principal)
+    app.dependency_overrides[get_session_service] = authenticated_session_override(service)
     try:
-        with TestClient(app) as test_client:
+        with TestClient(app, headers=authenticated_http_headers) as test_client:
             yield test_client
     finally:
         app.dependency_overrides.pop(get_session_service)
@@ -140,12 +143,12 @@ def test_temporary_files_closed_on_success_and_rejection(client, monkeypatch):
     assert closed == [True, True]
 
 
-def test_rechecks_current_question_after_transfer(client, monkeypatch):
+def test_rechecks_current_question_after_transfer(client, monkeypatch, authenticated_principal):
     import app.session_routes as routes
     from app.sessions import AttemptRequest, ContinueRequest
 
     original = routes.bounded_multipart_request
-    service = app.dependency_overrides[get_session_service]()
+    service = app.dependency_overrides[get_session_service](authenticated_principal)
     session = service.start()
 
     async def advance_during_transfer(request):

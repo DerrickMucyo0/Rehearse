@@ -6,11 +6,12 @@
     Background cleanup remains a future service responsibility.
 """
 from datetime import datetime, timedelta
+from re import fullmatch
 from uuid import UUID, uuid4
 
 from sqlalchemy import (
-    CheckConstraint, DateTime, Double, ForeignKey, ForeignKeyConstraint, Integer,
-    Text, UniqueConstraint, func,
+    CheckConstraint, DateTime, Double, ForeignKey, ForeignKeyConstraint, Index,
+    Integer, LargeBinary, Text, UniqueConstraint, func,
 )
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, validates
@@ -48,6 +49,121 @@ class Base(DeclarativeBase):
     pass
 
 
+def _validate_auth_text(value: str) -> str:
+    """Validate opaque authentication text without normalizing or exposing it."""
+    if type(value) is not str or not value.strip() or "\x00" in value:
+        raise ValueError("Authentication text must be nonblank text without U+0000.")
+    return value
+
+
+# TODO(auth): This transitional schema is not deployable authentication. Trusted
+# identity verification, session issuance and owner enforcement belong to later slices.
+class User(Base):
+    """Identity keyed by the exact trusted issuer and opaque provider subject."""
+    __tablename__ = "users"
+    __table_args__ = (
+        UniqueConstraint("auth_provider", "provider_subject", name="uq_users_auth_identity"),
+        CheckConstraint("auth_provider ~ '[^[:space:]]'", name="ck_users_auth_provider_nonblank"),
+        CheckConstraint("provider_subject ~ '[^[:space:]]'", name="ck_users_provider_subject_nonblank"),
+    )
+
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    auth_provider: Mapped[str] = mapped_column(Text(collation="C"), nullable=False)
+    provider_subject: Mapped[str] = mapped_column(Text(collation="C"), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(),
+    )
+
+    @validates("auth_provider", "provider_subject")
+    def validate_identity(self, key, value):
+        return _validate_auth_text(value)
+
+
+class AuthSession(Base):
+    """A digest-only credential record with a login-bound request context."""
+    __tablename__ = "auth_sessions"
+    __table_args__ = (
+        UniqueConstraint("token_hash", name="uq_auth_sessions_token_hash"),
+        CheckConstraint("octet_length(token_hash) = 32", name="ck_auth_sessions_token_hash_length"),
+        CheckConstraint(
+            "request_context ~ '[^[:space:]]'", name="ck_auth_sessions_request_context_nonblank",
+        ),
+        CheckConstraint("expires_at > created_at", name="ck_auth_sessions_expiration"),
+    )
+
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    # The future credential store hashes the raw credential to a SHA-256 digest.
+    token_hash: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
+    user_id: Mapped[UUID] = mapped_column(
+        ForeignKey("users.id", name="fk_auth_sessions_user", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(),
+    )
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    # A future login flow must issue an unpredictable context for each login.
+    request_context: Mapped[str] = mapped_column(Text, nullable=False)
+
+    @validates("token_hash")
+    def validate_token_hash(self, key, value):
+        if type(value) is not bytes or len(value) != 32:
+            raise ValueError("Authentication token hash must be exactly 32 bytes.")
+        return value
+
+    @validates("request_context")
+    def validate_request_context(self, key, value):
+        return _validate_auth_text(value)
+
+
+class OIDCLoginTransaction(Base):
+    """One-time redirect state with server-side nonce and PKCE verifier.
+
+    State is persisted only as its SHA-256 digest; no identity is known yet.
+    Expiry and atomic consumption belong to the dedicated login store.
+    """
+    __tablename__ = "oidc_login_transactions"
+    __table_args__ = (
+        UniqueConstraint("state_hash", name="uq_oidc_login_transactions_state_hash"),
+        CheckConstraint(
+            "octet_length(state_hash) = 32", name="ck_oidc_login_transactions_state_hash_length",
+        ),
+        CheckConstraint("nonce ~ '[^[:space:]]'", name="ck_oidc_login_transactions_nonce_nonblank"),
+        CheckConstraint(
+            "char_length(code_verifier) BETWEEN 43 AND 128 "
+            "AND code_verifier !~ '[^A-Za-z0-9._~-]'",
+            name="ck_oidc_login_transactions_code_verifier",
+        ),
+        CheckConstraint("expires_at > created_at", name="ck_oidc_login_transactions_expiration"),
+        Index("ix_oidc_login_transactions_expires_at", "expires_at"),
+    )
+
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    state_hash: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
+    nonce: Mapped[str] = mapped_column(Text(collation="C"), nullable=False)
+    code_verifier: Mapped[str] = mapped_column(Text(collation="C"), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(),
+    )
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+    @validates("state_hash")
+    def validate_state_hash(self, key, value):
+        if type(value) is not bytes or len(value) != 32:
+            raise ValueError("OIDC login state hash must be exactly 32 bytes.")
+        return value
+
+    @validates("nonce")
+    def validate_nonce(self, key, value):
+        return _validate_auth_text(value)
+
+    @validates("code_verifier")
+    def validate_code_verifier(self, key, value):
+        if type(value) is not str or fullmatch(r"[A-Za-z0-9._~-]{43,128}", value) is None:
+            raise ValueError("OIDC PKCE verifier must contain 43–128 ASCII unreserved characters.")
+        return value
+
+
 class StoredInterviewSession(Base):
     __tablename__ = "interview_sessions"
     __table_args__ = (
@@ -71,9 +187,15 @@ class StoredInterviewSession(Base):
             name="ck_sessions_completion",
         ),
         CheckConstraint("completed_at IS NULL OR completed_at >= created_at", name="ck_sessions_dates"),
+        Index("ix_interview_sessions_user_created_at", "user_id", "created_at", "id"),
     )
 
     id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    # TODO(auth): Keep anonymous sessions valid until a later slice enforces ownership.
+    user_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("users.id", name="fk_interview_sessions_user", ondelete="RESTRICT"),
+        nullable=True,
+    )
     questions: Mapped[tuple[str, ...]] = mapped_column(QuestionSnapshot(), nullable=False)
     current_question_index: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
     status: Mapped[str] = mapped_column(Text, default="active", server_default="active")

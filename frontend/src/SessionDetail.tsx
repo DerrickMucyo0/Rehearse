@@ -1,12 +1,12 @@
-import { useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { getHistoryDetail, HistoryApiError } from './historyApi'
 import type { HistoryAttempt, HistoryDetail, HistorySummary } from './historyApi'
 import DeliveryFacts from './DeliveryFacts'
+import { getAuthState, isAuthWorkspaceCurrent } from './auth'
 
 interface Props {
   sessionId: string
   onBack: () => void
-  onRemove: (id: string) => void
 }
 
 interface AttemptPage {
@@ -50,7 +50,11 @@ function mergeAttempts(previous: HistoryAttempt[], incoming: HistoryAttempt[]): 
   return [...attempts.values()].sort((left, right) => left.attempt_number - right.attempt_number)
 }
 
-function SessionDetailView({ sessionId, onBack, onRemove }: Props) {
+function SessionDetailView({ sessionId, onBack }: Props) {
+  const auth = getAuthState()
+  const workspaceGeneration = useRef(auth.status === 'authenticated' ? auth.generation : null).current
+  const ownsWorkspace = useCallback(() => workspaceGeneration !== null &&
+    isAuthWorkspaceCurrent(workspaceGeneration), [workspaceGeneration])
   const [overview, setOverview] = useState<HistoryDetail | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<{ sessionId: string; missing: boolean } | null>(null)
@@ -72,14 +76,14 @@ function SessionDetailView({ sessionId, onBack, onRemove }: Props) {
     const controller = new AbortController()
     overviewController.current = controller
     void getHistoryDetail(sessionId, { signal: controller.signal }).then((detail) => {
-      if (controller.signal.aborted || sessionGeneration.current !== generation) return
+      if (controller.signal.aborted || sessionGeneration.current !== generation || !ownsWorkspace()) return
       setOverview({ ...detail, selected_question: null })
     }).catch((cause: unknown) => {
-      if (controller.signal.aborted || sessionGeneration.current !== generation) return
+      if (controller.signal.aborted || sessionGeneration.current !== generation || !ownsWorkspace()) return
       if (cause instanceof HistoryApiError && cause.cancelled) return
       setError({ sessionId, missing: cause instanceof HistoryApiError && cause.status === 404 })
     }).finally(() => {
-      if (!controller.signal.aborted && sessionGeneration.current === generation) setLoading(false)
+      if (!controller.signal.aborted && sessionGeneration.current === generation && ownsWorkspace()) setLoading(false)
     })
     return () => {
       controller.abort()
@@ -88,7 +92,7 @@ function SessionDetailView({ sessionId, onBack, onRemove }: Props) {
       pageGeneration.current += 1
       pageBusy.current = false
     }
-  }, [sessionId, reload])
+  }, [sessionId, reload, ownsWorkspace])
 
   function retryOverview() {
     overviewController.current?.abort()
@@ -120,7 +124,7 @@ function SessionDetailView({ sessionId, onBack, onRemove }: Props) {
       questionIndex, afterAttemptNumber: after, limit: 10, signal: controller.signal,
     }).then((detail) => {
       if (controller.signal.aborted || sessionGeneration.current !== sessionRead ||
-          pageGeneration.current !== generation) return
+          pageGeneration.current !== generation || !ownsWorkspace()) return
       const result = detail.selected_question
       if (detail.summary.session_id !== sessionId || result === null || result.question_index !== questionIndex) {
         throw new Error('Unexpected saved question response.')
@@ -134,7 +138,7 @@ function SessionDetailView({ sessionId, onBack, onRemove }: Props) {
       }))
     }).catch((cause: unknown) => {
       if (controller.signal.aborted || sessionGeneration.current !== sessionRead ||
-          pageGeneration.current !== generation) return
+          pageGeneration.current !== generation || !ownsWorkspace()) return
       if (cause instanceof HistoryApiError && cause.cancelled) return
       if (cause instanceof HistoryApiError && cause.status === 404) {
         setOverview(null)
@@ -146,7 +150,7 @@ function SessionDetailView({ sessionId, onBack, onRemove }: Props) {
       }
     }).finally(() => {
       if (!controller.signal.aborted && sessionGeneration.current === sessionRead &&
-          pageGeneration.current === generation) {
+          pageGeneration.current === generation && ownsWorkspace()) {
         pageBusy.current = false
         pageController.current = null
         setPageLoading(false)
@@ -182,7 +186,6 @@ function SessionDetailView({ sessionId, onBack, onRemove }: Props) {
     {currentError && <div>
       <p role="alert">{currentError.missing ? 'This session is unavailable.' : 'Session history could not be loaded.'}</p>
       <button type="button" onClick={retryOverview}>Retry session request</button>
-      {currentError.missing && <button type="button" onClick={() => onRemove(sessionId)}>Remove from this browser</button>}
     </div>}
     {current && <>
       <p>{current.summary.status === 'active' ? 'Active' : 'Completed'}</p>
