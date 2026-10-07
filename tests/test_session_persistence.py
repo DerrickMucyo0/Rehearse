@@ -494,7 +494,8 @@ def test_default_dependency_requires_application_url_and_never_falls_back_to_tes
 
 
 def test_default_http_dependency_persists_without_service_override(
-        postgres_session_factory, postgres_engine, monkeypatch, default_dependency_engines, authenticated_principal):
+        postgres_session_factory, postgres_engine, monkeypatch, default_dependency_engines,
+        authenticated_principal, offline_roleplay):
     monkeypatch.setenv("DATABASE_URL", postgres_engine.url.render_as_string(hide_password=False))
     assert get_session_service not in app.dependency_overrides
     credential = "synthetic-default-dependency-credential"
@@ -503,6 +504,10 @@ def test_default_http_dependency_persists_without_service_override(
         def resolve(self, *, credential):
             assert credential == "synthetic-default-dependency-credential"
             return authenticated_principal
+
+        def revalidate_in_transaction(self, *, database, principal):
+            assert database.in_transaction()
+            assert principal is authenticated_principal
 
     monkeypatch.setitem(app.dependency_overrides, get_auth_session_store, lambda: AuthStore())
     headers = {

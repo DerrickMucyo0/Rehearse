@@ -5,14 +5,19 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, Path, Query, Request, Response
 from pydantic import Field
 from starlette.concurrency import run_in_threadpool
+from starlette.responses import JSONResponse
 
 from app.audio import AudioAccepted, bounded_multipart_request, validated_audio
 from app.auth_http import (
     AuthenticatedPrincipalDependency, AuthSessionStoreDependency, revalidate_authenticated_principal,
+    revalidate_authenticated_principal_in_transaction,
 )
 from app.comparisons import AttemptComparison
 from app.database import get_database_session_factory
 from app.delivery_metrics import DeliveryMetrics, measure_delivery
+from app.roleplay import RoleplayAdapter, RoleplayUnavailable
+from app.roleplay_application import continue_application_attempt
+from app.roleplay_composition import get_roleplay_adapter
 from app.semantic_diagnosis import SemanticDiagnosis
 from app.semantic_diagnosis_adapter import SemanticDiagnosisAdapter
 from app.semantic_diagnosis_application import (
@@ -57,12 +62,14 @@ SemanticDiagnosisService = Annotated[
     Depends(get_semantic_diagnosis_adapter),
 ]
 
+RoleplayService = Annotated[RoleplayAdapter, Depends(get_roleplay_adapter)]
+
 
 @router.post("", response_model=InterviewSession, status_code=201)
 def start_session(
     response: Response, sessions: SessionService, body: StartSessionRequest | None = None,
 ) -> InterviewSession:
-    session = sessions.start(body.scenario_type if body is not None else "job_interview")
+    session = sessions.start_adaptive(body.scenario_type if body is not None else "job_interview")
     response.headers["Location"] = f"/api/sessions/{session.id}"
     return session
 
@@ -91,16 +98,29 @@ def submit_attempt(
 
 
 @router.post("/{session_id}/questions/{question_index}/continue", response_model=InterviewSession)
-def continue_question(
+async def continue_question(
     session_id: UUID, question_index: Annotated[int, Path(ge=0)],
     request: ContinueRequest, sessions: SessionService,
-) -> InterviewSession:
+    roleplayer: RoleplayService,
+    principal: AuthenticatedPrincipalDependency,
+    auth_store: AuthSessionStoreDependency,
+) -> InterviewSession | JSONResponse:
     try:
-        return sessions.continue_question(session_id, question_index, request)
+        return await continue_application_attempt(
+            sessions, roleplayer, session_id=session_id, question_index=question_index,
+            request=request, principal_guard=lambda database:
+                revalidate_authenticated_principal_in_transaction(principal, auth_store, database),
+        )
     except SessionNotFound as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except SessionConflict as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except RoleplayUnavailable:
+        return JSONResponse(status_code=503, content={
+            "detail": "Interviewer is unavailable right now. Try Continue again.",
+            "code": "roleplay_generation_unavailable",
+            "write_outcome": "not_applied",
+        }, headers={"Cache-Control": "no-store"})
 
 
 @router.get("/{session_id}/questions/{question_index}/attempts", response_model=list[Attempt])

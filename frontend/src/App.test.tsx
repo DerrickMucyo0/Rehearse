@@ -27,7 +27,7 @@ const semanticDiagnosis: SemanticDiagnosis = {
 }
 function response(value: unknown, status = 200) { return new Response(JSON.stringify(value), { status }) }
 function initialSession(id = SESSION_ID): InterviewSession {
-  return { id, scenario_type: 'job_interview', status: 'active', current_question_index: 0, current_question: questions[0],
+  return { id, scenario_type: 'job_interview', question_engine: 'deterministic-v1', total_questions: 5, status: 'active', current_question_index: 0, current_question: questions[0],
     current_question_latest_attempt_number: 0, questions, answers: [] }
 }
 function deferred<T>() {
@@ -109,7 +109,7 @@ function mockAppApi(initial = initialSession()) {
       return { question_index: questionIndex, attempt_id: attempt?.id ?? '55555555-5555-4555-8555-555555555555',
         attempt_number: attempt?.attempt_number ?? 1, submitted_at: submittedAt, measurement: null }
     })
-    return { session_id: forSession.id, scenario_type: forSession.scenario_type, status: forSession.status, created_at: submittedAt,
+    return { session_id: forSession.id, scenario_type: forSession.scenario_type, question_engine: 'deterministic-v1', status: forSession.status, created_at: submittedAt,
       completed_at: forSession.status === 'completed' ? submittedAt : null,
       current_question_number: forSession.status === 'active' ? forSession.current_question_index + 1 : null,
       total_questions: questions.length, finalized_question_count: forSession.current_question_index,

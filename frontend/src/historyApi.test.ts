@@ -11,7 +11,7 @@ const attemptId = '00000000-0000-0000-0000-000000000001'
 const created = '2026-10-01T10:00:00.000001Z'
 const submitted = '2026-10-01T10:00:01.000002Z'
 function summary(): HistorySummary {
-  return { session_id: id, scenario_type: 'job_interview', status: 'active', created_at: created, completed_at: null, current_question_number: 1,
+  return { session_id: id, scenario_type: 'job_interview', question_engine: 'deterministic-v1', status: 'active', created_at: created, completed_at: null, current_question_number: 1,
     total_questions: 5, finalized_question_count: 0, questions_practiced_count: 0, total_attempt_count: 0,
     total_retry_count: 0, measured_final_answer_count: 0, last_submitted_at: null, last_saved_activity_at: created, finalized_points: [] }
 }
@@ -273,4 +273,49 @@ test('an A detail body completing after B bootstrap cannot escape the authentica
   resolveBody(detail())
   await expect(pending).rejects.toMatchObject({ name: 'AuthBoundaryError' })
   expect(getAuthState().status).toBe('authenticated')
+})
+
+
+test('adaptive history preserves the generated prefix and stable planned total', async () => {
+  const value = detail()
+  value.summary.question_engine = 'live-ai-roleplay-v1'
+  value.questions = value.questions.slice(0, 1)
+  mock(value)
+  expect(await getHistoryDetail(id)).toEqual(value)
+  expect(value.summary.total_questions).toBe(5)
+})
+
+test('adaptive selected history retains finalized measurements and saved question text', async () => {
+  const value = finalDetail()
+  value.summary.question_engine = 'live-ai-roleplay-v1'
+  value.questions = value.questions.slice(0, 2)
+  mock(value)
+  expect(await getHistoryDetail(id, { questionIndex: 0 })).toEqual(value)
+})
+
+test.each([0, 2, 5])('adaptive active history rejects a prefix of the wrong length %s', async (count) => {
+  const value = detail()
+  value.summary.question_engine = 'live-ai-roleplay-v1'
+  value.questions = value.questions.slice(0, count)
+  mock(value)
+  await expect(getHistoryDetail(id)).rejects.toMatchObject({ name: 'HistoryApiError', status: 200 })
+})
+
+test('deterministic history still requires all five preselected question overviews', async () => {
+  const value = detail()
+  value.questions = value.questions.slice(0, 1)
+  mock(value)
+  await expect(getHistoryDetail(id)).rejects.toMatchObject({ name: 'HistoryApiError', status: 200 })
+})
+
+test.each([undefined, null, 'unknown', 'live-ai-roleplay-v2'])('history rejects missing or unknown engines (case %#)', async (engine) => {
+  mock({ items: [{ ...summary(), question_engine: engine }], next_cursor: null })
+  await expect(getHistorySummaries()).rejects.toMatchObject({ name: 'HistoryApiError', status: 200 })
+})
+
+test('mixed adaptive and deterministic discovery preserves canonical engines without detail generation', async () => {
+  const items = [summary(), { ...summary(), session_id: other, question_engine: 'live-ai-roleplay-v1' }]
+  const calls = mock({ items, next_cursor: null })
+  expect((await getHistorySummaries()).items).toEqual(items)
+  expect(calls).toHaveBeenCalledOnce()
 })

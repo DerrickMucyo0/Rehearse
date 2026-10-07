@@ -1,7 +1,7 @@
 """PostgreSQL persistence mappings, separate from public API response models.
 
-    Session snapshots and measurements are immutable in PostgreSQL (migration
-    triggers). Session progression and current-question checks belong to the
+    Published questions and measurements are immutable in PostgreSQL (migration
+    triggers). Adaptive questions append only alongside progression. Checks belong to the
     transactional session service, as does explicit measurement attachment.
     Background cleanup remains a future service responsibility.
 """
@@ -18,6 +18,7 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, validates
 from sqlalchemy.types import TypeDecorator
 
 from app.scenarios import ScenarioType, questions_for_scenario
+from app.roleplay import QuestionEngine
 
 MEASUREMENT_VERSION = "speaking-metrics-v1"
 UNLINKED_MEASUREMENT_RETENTION = timedelta(hours=24)
@@ -174,8 +175,14 @@ class StoredInterviewSession(Base):
             name="ck_sessions_scenario_type",
         ),
         CheckConstraint(
+            "question_engine IN ('deterministic-v1', 'live-ai-roleplay-v1')",
+            name="ck_sessions_question_engine",
+        ),
+        CheckConstraint(
             "CASE WHEN jsonb_typeof(questions) = 'array' "
-            "THEN jsonb_array_length(questions) = 5 ELSE false END",
+            "THEN ((question_engine = 'deterministic-v1' AND jsonb_array_length(questions) = 5) OR "
+            "(question_engine = 'live-ai-roleplay-v1' AND jsonb_array_length(questions) BETWEEN 1 AND 5)) "
+            "ELSE false END",
             name="ck_sessions_question_snapshot",
         ),
         CheckConstraint(
@@ -186,9 +193,11 @@ class StoredInterviewSession(Base):
         CheckConstraint("current_question_index >= 0", name="ck_sessions_nonnegative_index"),
         CheckConstraint(
             "CASE WHEN jsonb_typeof(questions) = 'array' THEN "
-            "((status = 'active' AND current_question_index < jsonb_array_length(questions) "
-            "AND completed_at IS NULL) OR "
-            "(status = 'completed' AND current_question_index = jsonb_array_length(questions) "
+            "((status = 'active' AND current_question_index BETWEEN 0 AND 4 "
+            "AND completed_at IS NULL AND "
+            "((question_engine = 'deterministic-v1' AND current_question_index < jsonb_array_length(questions)) OR "
+            "(question_engine = 'live-ai-roleplay-v1' AND jsonb_array_length(questions) = current_question_index + 1))) OR "
+            "(status = 'completed' AND current_question_index = 5 AND jsonb_array_length(questions) = 5 "
             "AND completed_at IS NOT NULL)) ELSE false END",
             name="ck_sessions_completion",
         ),
@@ -203,6 +212,9 @@ class StoredInterviewSession(Base):
         nullable=True,
     )
     questions: Mapped[tuple[str, ...]] = mapped_column(QuestionSnapshot(), nullable=False)
+    question_engine: Mapped[QuestionEngine] = mapped_column(
+        Text(collation="C"), nullable=False, default="deterministic-v1", server_default="deterministic-v1",
+    )
     scenario_type: Mapped[ScenarioType] = mapped_column(
         Text(collation="C"), nullable=False, default="job_interview", server_default="job_interview",
     )
@@ -213,10 +225,16 @@ class StoredInterviewSession(Base):
 
     @validates("questions")
     def validate_questions(self, key, value):
-        if (not isinstance(value, (list, tuple)) or len(value) != 5 or
+        if (not isinstance(value, (list, tuple)) or not 1 <= len(value) <= 5 or
                 any(not isinstance(item, str) or not item.strip() or "\x00" in item for item in value)):
-            raise ValueError("Question snapshot must contain five nonempty text questions.")
+            raise ValueError("Question snapshot must contain one to five nonempty text questions.")
         return tuple(value)
+
+    @validates("question_engine")
+    def validate_question_engine(self, key, value):
+        if value not in ("deterministic-v1", "live-ai-roleplay-v1"):
+            raise ValueError("Unsupported question engine.")
+        return value
 
     @validates("scenario_type")
     def validate_scenario_type(self, key, value):

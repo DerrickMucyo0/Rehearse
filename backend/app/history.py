@@ -21,6 +21,7 @@ from sqlalchemy.orm import Session
 from app.auth import AuthenticatedPrincipal
 from app.comparisons import MeasurementSnapshot, delivery_snapshot
 from app.database_models import QuestionAttempt, StoredInterviewSession, TranscriptionMeasurement
+from app.roleplay import QuestionEngine
 from app.scenarios import ScenarioType, questions_for_scenario
 from app.sessions import SessionNotFound
 
@@ -107,11 +108,12 @@ class FinalizedPoint(ReadModel):
 class SessionSummary(ReadModel):
     session_id: UUID
     scenario_type: ScenarioType = "job_interview"
+    question_engine: QuestionEngine = "deterministic-v1"
     status: Literal["active", "completed"]
     created_at: AwareDatetime
     completed_at: AwareDatetime | None
     current_question_number: Positive | None
-    total_questions: Positive
+    total_questions: Literal[5] = 5
     finalized_question_count: Nonnegative
     questions_practiced_count: Nonnegative
     total_attempt_count: Nonnegative
@@ -324,7 +326,7 @@ class HistoryReadService:
                 raise SessionNotFound()
             page = None
             if query.question_index is not None:
-                if query.question_index >= read.summary.total_questions:
+                if query.question_index >= len(read.questions):
                     raise SessionNotFound()
                 overview = read.questions[query.question_index]
                 rows = database.execute(
@@ -376,6 +378,7 @@ class HistoryReadService:
             select(
                 StoredInterviewSession.id.label("session_id"), StoredInterviewSession.status,
                 StoredInterviewSession.scenario_type,
+                StoredInterviewSession.question_engine,
                 StoredInterviewSession.questions, StoredInterviewSession.current_question_index,
                 StoredInterviewSession.created_at, StoredInterviewSession.completed_at,
                 counts.c.question_index, counts.c.attempt_count,
@@ -407,6 +410,7 @@ class HistoryReadService:
     def _project_session(rows) -> _SessionRead:
         first = rows[0]
         scenario_type = first["scenario_type"]
+        question_engine = first["question_engine"]
         try:
             questions_for_scenario(scenario_type)
         except ValueError:
@@ -415,11 +419,14 @@ class HistoryReadService:
         current = first["current_question_index"]
         status = first["status"]
         completed = first["completed_at"]
-        if (not isinstance(questions, (tuple, list)) or len(questions) != 5 or
+        if (question_engine not in ("deterministic-v1", "live-ai-roleplay-v1") or
+                not isinstance(questions, (tuple, list)) or not 1 <= len(questions) <= 5 or
+                (question_engine == "deterministic-v1" and len(questions) != 5) or
                 any(not isinstance(value, str) or not value.strip() for value in questions) or
                 type(current) is not int or
-                not ((status == "active" and 0 <= current < len(questions) and completed is None) or
-                     (status == "completed" and current == len(questions) and completed is not None))):
+                not ((status == "active" and 0 <= current < len(questions) and completed is None and
+                      (question_engine == "deterministic-v1" or len(questions) == current + 1)) or
+                     (status == "completed" and current == 5 and len(questions) == 5 and completed is not None))):
             raise HistoryIntegrityError()
         per_question = {}
         for row in rows:
@@ -465,10 +472,10 @@ class HistoryReadService:
         total_attempts = sum(row["attempt_count"] for row in per_question.values())
         return _SessionRead(
             summary=SessionSummary(
-                session_id=first["session_id"], scenario_type=scenario_type,
+                session_id=first["session_id"], scenario_type=scenario_type, question_engine=question_engine,
                 status=status, created_at=first["created_at"],
                 completed_at=completed, current_question_number=current + 1 if status == "active" else None,
-                total_questions=len(questions), finalized_question_count=current,
+                total_questions=5, finalized_question_count=current,
                 questions_practiced_count=len(per_question), total_attempt_count=total_attempts,
                 total_retry_count=total_attempts - len(per_question),
                 measured_final_answer_count=sum(point.measurement is not None for point in points),

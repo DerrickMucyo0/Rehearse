@@ -10,7 +10,7 @@ vi.mock('./historyApi', async (original) => ({
 const load = vi.mocked(getHistorySummaries)
 const id = (index: number) => `00000000-0000-0000-0000-${index.toString(16).padStart(12, '0')}`
 function summary(session_id: string, date = '2026-10-01T10:00:00Z'): HistorySummary {
-  return { session_id, scenario_type: 'job_interview', status: 'active', created_at: date, completed_at: null, current_question_number: 1,
+  return { session_id, scenario_type: 'job_interview', question_engine: 'deterministic-v1', status: 'active', created_at: date, completed_at: null, current_question_number: 1,
     total_questions: 5, finalized_question_count: 0, questions_practiced_count: 0, total_attempt_count: 0,
     total_retry_count: 0, measured_final_answer_count: 0, last_submitted_at: null, last_saved_activity_at: date, finalized_points: [] }
 }

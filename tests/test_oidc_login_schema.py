@@ -83,12 +83,29 @@ def historical_metadata(*, include_login):
         if include_login or table.name != TABLE_NAME:
             table.to_metadata(metadata)
     sessions = metadata.tables[StoredInterviewSession.__tablename__]
-    # Remove only the later Scenario Setup column and its matching check from
-    # our private metadata copy; all historical constraints stay comparable.
-    sessions._columns.remove(sessions.c.scenario_type)
-    scenario_check = next(constraint for constraint in sessions.constraints
-                          if constraint.name == "ck_sessions_scenario_type")
-    sessions.constraints.remove(scenario_check)
+    # Strip later scenario/engine extensions and restore the exact historical
+    # five-question checks in this private copy, preserving 0003/0004 coverage.
+    for name in ("scenario_type", "question_engine"):
+        sessions._columns.remove(sessions.c[name])
+    for name in (
+        "ck_sessions_scenario_type", "ck_sessions_question_engine",
+        "ck_sessions_question_snapshot", "ck_sessions_completion",
+    ):
+        constraint = next(item for item in sessions.constraints if item.name == name)
+        sessions.constraints.remove(constraint)
+    sessions.append_constraint(CheckConstraint(
+        "CASE WHEN jsonb_typeof(questions) = 'array' "
+        "THEN jsonb_array_length(questions) = 5 ELSE false END",
+        name="ck_sessions_question_snapshot",
+    ))
+    sessions.append_constraint(CheckConstraint(
+        "CASE WHEN jsonb_typeof(questions) = 'array' THEN "
+        "((status = 'active' AND current_question_index < jsonb_array_length(questions) "
+        "AND completed_at IS NULL) OR "
+        "(status = 'completed' AND current_question_index = jsonb_array_length(questions) "
+        "AND completed_at IS NOT NULL)) ELSE false END",
+        name="ck_sessions_completion",
+    ))
     return metadata
 
 

@@ -25,7 +25,7 @@ function point(changes: Partial<HistoryFinalizedPoint> = {}): HistoryFinalizedPo
 }
 function summary(changes: Partial<HistorySummary> = {}): HistorySummary {
   return {
-    session_id: FIRST, scenario_type: 'job_interview', status: 'active', created_at: '2026-10-05T10:00:00Z', completed_at: null,
+    session_id: FIRST, scenario_type: 'job_interview', question_engine: 'deterministic-v1', status: 'active', created_at: '2026-10-05T10:00:00Z', completed_at: null,
     current_question_number: 2, total_questions: 5, finalized_question_count: 1,
     questions_practiced_count: 2, total_attempt_count: 4, total_retry_count: 2,
     measured_final_answer_count: 1, last_submitted_at: '2026-10-05T12:00:00Z',
@@ -370,4 +370,16 @@ test('delivery projection leaves frozen source snapshots and precision unchanged
   const before = JSON.stringify(source)
   projectProgress([source])
   expect(JSON.stringify(source)).toBe(before)
+})
+
+
+test('mixed adaptive and deterministic sessions contribute only their persisted finalized facts', () => {
+  const deterministic = summary()
+  const adaptive = summary({ session_id: SECOND, question_engine: 'live-ai-roleplay-v1',
+    finalized_points: [point({ attempt_id: SECOND, measurement: null })], measured_final_answer_count: 0 })
+  const result = projectProgress([deterministic, adaptive])
+  expect(result.overview.finalizedQuestions).toBe(2)
+  expect(result.overview.savedAttempts).toBe(8)
+  expect(result.points.map((item) => item.attempt_id)).toEqual([FIRST, SECOND])
+  expect(result.groups.find((group) => group.kind === 'no_measurement')?.points).toHaveLength(1)
 })

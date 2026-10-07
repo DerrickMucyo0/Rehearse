@@ -20,6 +20,8 @@ from app.auth_http import (
 from app.database_models import StoredInterviewSession, User
 from app.history import HistoryIntegrityError, HistoryReadService
 from app.main import app
+from app.roleplay import RoleplayContext, RoleplayQuestion
+from app.roleplay_composition import get_roleplay_adapter
 from app.scenarios import SCENARIO_QUESTIONS, ScenarioType, questions_for_scenario
 from app.sessions import (
     QUESTIONS, AttemptRequest, ContinueRequest, InterviewSession, InterviewSessionService,
@@ -100,10 +102,21 @@ class OfflineSessionService:
     def __init__(self):
         self.calls = []
 
-    def start(self, scenario_type="job_interview"):
+    def start_adaptive(self, scenario_type="job_interview"):
         self.calls.append(scenario_type)
         return InterviewSession(id=uuid4(), scenario_type=scenario_type,
-                                questions=list(questions_for_scenario(scenario_type)))
+                                question_engine="live-ai-roleplay-v1",
+                                questions=list(questions_for_scenario(scenario_type)[:1]))
+
+
+class CatalogRoleplayAdapter:
+    """Returns catalog fixtures only to exercise the persisted HTTP lifecycle."""
+
+    async def generate(self, context: RoleplayContext) -> RoleplayQuestion:
+        return RoleplayQuestion(
+            roleplay_version="live-ai-roleplay-v1",
+            next_question=questions_for_scenario(context.scenario_type)[context.next_question_number - 1],
+        )
 
 
 @pytest.fixture
@@ -133,6 +146,7 @@ def offline_client(monkeypatch):
     previous = app.dependency_overrides.copy()
     app.dependency_overrides[session_routes.get_session_service] = owned_service
     app.dependency_overrides[get_auth_session_store] = lambda: Store()
+    monkeypatch.setitem(app.dependency_overrides, get_roleplay_adapter, lambda: CatalogRoleplayAdapter())
     try:
         with TestClient(app, headers={
             "Cookie": f"{AUTH_SESSION_COOKIE_NAME}=scenario-credential",
@@ -153,7 +167,9 @@ def test_creation_accepts_bodyless_empty_and_each_explicit_scenario(offline_clie
     expected = "job_interview" if body is None else body.get("scenario_type", "job_interview")
     assert service.calls == [expected]
     assert session["scenario_type"] == expected
-    assert session["questions"] == list(questions_for_scenario(expected))
+    assert session["question_engine"] == "live-ai-roleplay-v1"
+    assert session["total_questions"] == 5
+    assert session["questions"] == list(questions_for_scenario(expected)[:1])
     assert session["current_question"] == session["questions"][0]
     assert response.headers["Location"] == f"/api/sessions/{session['id']}"
 
@@ -189,7 +205,8 @@ def test_scenario_creation_still_requires_authenticated_owner(offline_client):
 
 def stored_history_root(scenario_type):
     return {
-        "session_id": uuid4(), "scenario_type": scenario_type, "status": "active",
+        "session_id": uuid4(), "scenario_type": scenario_type,
+        "question_engine": "deterministic-v1", "status": "active",
         "created_at": datetime(2026, 1, 1, tzinfo=timezone.utc), "completed_at": None,
         "current_question_index": 0, "questions": tuple(f"Stored snapshot question {index}" for index in range(5)),
         "question_index": None,
@@ -230,6 +247,7 @@ def scenario_client(
     previous = app.dependency_overrides.copy()
     app.dependency_overrides[session_routes.get_session_service] = authenticated_session_override(sessions)
     app.dependency_overrides[history_routes.get_history_service] = authenticated_session_override(history)
+    monkeypatch.setitem(app.dependency_overrides, get_roleplay_adapter, lambda: CatalogRoleplayAdapter())
     try:
         with TestClient(app, headers=authenticated_http_headers) as client:
             yield client, sessions, history
@@ -248,12 +266,16 @@ def test_every_scenario_persists_retries_completion_and_history(
     created = created_response.json()
     identifier = UUID(created["id"])
     assert client.get(created_response.headers["Location"]).json() == created
-    assert created["questions"] == list(questions_for_scenario(scenario_type))
+    catalog_questions = questions_for_scenario(scenario_type)
+    assert created["question_engine"] == "live-ai-roleplay-v1"
+    assert created["total_questions"] == 5
+    assert created["questions"] == list(catalog_questions[:1])
     with postgres_session_factory() as database:
         stored = database.get(StoredInterviewSession, identifier)
         assert stored.user_id == authenticated_principal.user_id
         assert stored.scenario_type == scenario_type
-        assert stored.questions == questions_for_scenario(scenario_type)
+        assert stored.question_engine == "live-ai-roleplay-v1"
+        assert stored.questions == catalog_questions[:1]
 
     for index in range(5):
         root = f"/api/sessions/{identifier}/questions/{index}"
@@ -267,23 +289,27 @@ def test_every_scenario_persists_retries_completion_and_history(
         })
         assert retry.status_code == 201
         assert retry.json()["session"]["current_question_index"] == index
+        assert retry.json()["session"]["questions"] == list(catalog_questions[:index + 1])
         continued = client.post(f"{root}/continue", json={"expected_last_attempt_number": 2})
         assert continued.status_code == 200
         assert continued.json()["scenario_type"] == scenario_type
+        assert continued.json()["questions"] == list(catalog_questions[:min(index + 2, 5)])
+        assert continued.json()["total_questions"] == 5
     completed = continued.json()
     assert completed["status"] == "completed" and completed["current_question"] is None
-    assert completed["questions"] == created["questions"]
+    assert completed["questions"] == list(catalog_questions)
     assert completed["answers"] == [f"Final answer {index}" for index in range(5)]
     rebuilt = InterviewSessionService(postgres_session_factory, authenticated_principal)
     assert rebuilt.get(identifier).model_dump(mode="json") == completed
     summary = client.get("/api/history/summaries").json()["items"][0]
     assert summary["scenario_type"] == scenario_type
+    assert summary["question_engine"] == "live-ai-roleplay-v1" and summary["total_questions"] == 5
     assert summary["total_attempt_count"] == 10 and summary["total_retry_count"] == 5
     assert summary["finalized_question_count"] == 5
     assert client.post("/api/history/summaries", json={"session_ids": [str(identifier)]}).json()["summaries"] == [summary]
     detail = client.get(f"/api/sessions/{identifier}/history-detail").json()
     assert detail["summary"] == summary
-    assert [question["question_text"] for question in detail["questions"]] == created["questions"]
+    assert [question["question_text"] for question in detail["questions"]] == completed["questions"]
     assert history.get_detail(identifier).summary.scenario_type == scenario_type
 
 

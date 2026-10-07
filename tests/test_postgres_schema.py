@@ -115,7 +115,7 @@ def test_all_migrations_upgrade_empty_database_and_downgrade_deterministically(p
         assert initial_columns.isdisjoint(DELIVERY_FIELDS)
         command.upgrade(config, "head")
         assert set(inspect(connection).get_table_names()) == TABLES | {"alembic_version"}
-        assert connection.scalar(text("SELECT version_num FROM alembic_version")) == "0005_session_scenarios"
+        assert connection.scalar(text("SELECT version_num FROM alembic_version")) == "0006_live_ai_roleplay"
         assert {column["name"] for column in inspect(connection).get_columns("transcription_measurements")} == initial_columns | set(DELIVERY_FIELDS)
         command.downgrade(config, "0001_database_foundation")
         assert {column["name"] for column in inspect(connection).get_columns("transcription_measurements")} == initial_columns
@@ -130,7 +130,12 @@ def test_migrated_schema_matches_orm_metadata(connection):
                             if isinstance(constraint, CheckConstraint)}
     assert actual_constraints == expected_constraints
     assert DELIVERY_CONSTRAINTS <= actual_constraints
-    assert connection.scalar(text("SELECT version_num FROM alembic_version")) == "0005_session_scenarios"
+    assert connection.scalar(text("SELECT version_num FROM alembic_version")) == "0006_live_ai_roleplay"
+    actual_session_checks = {constraint["name"] for constraint in inspect(connection).get_check_constraints("interview_sessions")}
+    expected_session_checks = {constraint.name for constraint in StoredInterviewSession.__table__.constraints
+                              if isinstance(constraint, CheckConstraint)}
+    assert actual_session_checks == expected_session_checks
+    assert "ck_sessions_question_engine" in actual_session_checks
 
 
 def test_populated_foundation_upgrade_preserves_legacy_rows_links_and_speaking_facts(connection):
@@ -177,6 +182,7 @@ def test_populated_foundation_upgrade_preserves_legacy_rows_links_and_speaking_f
         assert all(migrated[measurement_id][field] is None for field in DELIVERY_FIELDS)
     assert {row["id"]: dict(row) for row in connection.execute(select(attempts)).mappings()} == prior_attempts
     assert {row["id"]: dict(row) for row in connection.execute(select(sessions)).mappings()} == prior_sessions
+    assert set(connection.scalars(select(StoredInterviewSession.question_engine))) == {"deterministic-v1"}
     assert prior_attempts[first_attempt]["measurement_id"] == available_id
     assert prior_attempts[second_attempt]["measurement_id"] == unavailable_id
     assert connection.scalar(text(
@@ -344,6 +350,7 @@ def test_uuid_keys_jsonb_and_default_session_state_round_trip(connection):
         loaded = session.get(StoredInterviewSession, identifier)
         assert isinstance(loaded.id, UUID)
         assert loaded.questions == QUESTIONS
+        assert loaded.question_engine == "deterministic-v1"
         assert loaded.status == "active"
         assert loaded.current_question_index == 0
         assert loaded.created_at.tzinfo is not None

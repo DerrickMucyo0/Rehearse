@@ -667,8 +667,9 @@ def test_authenticated_session_routes_preserve_response_bytes_and_add_private_ca
         location = f"/api/sessions/{body['id']}"
         assert body == {
             "id": body["id"], "scenario_type": "job_interview",
+            "question_engine": "live-ai-roleplay-v1", "total_questions": 5,
             "status": "active", "current_question_index": 0,
-            "questions": list(QUESTIONS), "answers": [],
+            "questions": list(QUESTIONS[:1]), "answers": [],
             "current_question_latest_attempt_number": 0, "current_question": QUESTIONS[0],
         }
         read = client.get(location, headers=headers)

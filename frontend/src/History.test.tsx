@@ -29,7 +29,7 @@ const measurement = {
 function summary(id = FIRST, status: 'active' | 'completed' = 'active'): HistorySummary {
   const finalized = status === 'active' ? 2 : 5
   return {
-    session_id: id, scenario_type: 'job_interview', status, created_at: '2026-10-05T10:00:00Z',
+    session_id: id, scenario_type: 'job_interview', question_engine: 'deterministic-v1', status, created_at: '2026-10-05T10:00:00Z',
     completed_at: status === 'completed' ? '2026-10-05T13:00:00Z' : null,
     current_question_number: status === 'active' ? 3 : null, total_questions: 5,
     finalized_question_count: finalized, questions_practiced_count: status === 'active' ? 3 : 5,

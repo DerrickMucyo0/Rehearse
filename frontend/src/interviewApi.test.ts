@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, expect, test, vi } from 'vitest'
-import { ApiError, continueQuestion, getAttempts, getComparison, getSemanticDiagnosis, getSession, isConflictError, SemanticDiagnosisError, startInterview, submitAttempt, transcribeAudio, uploadAudio } from './interviewApi'
+import { ApiError, continueQuestion, getAttempts, getComparison, getSemanticDiagnosis, getSession, isConflictError, RoleplayUnavailableError, SemanticDiagnosisError, startInterview, submitAttempt, transcribeAudio, uploadAudio } from './interviewApi'
 import type { Attempt, DeliveryComparison, DeliveryMetricChange, InterviewSession, MetricChange, SemanticDiagnosis } from './interviewApi'
 import { DELIVERY_TIMING_REASONS } from './deliveryMetrics'
 import type { DeliveryMetrics } from './deliveryMetrics'
@@ -9,8 +9,8 @@ import { AUTH_CONTEXT_HEADER, AUTH_UNAVAILABLE_MESSAGE, getAuthState } from './a
 import type { ScenarioType } from './scenarios'
 
 const session: InterviewSession = {
-  id: 'session-1', scenario_type: 'job_interview', status: 'active', current_question_index: 2, current_question: 'Third',
-  current_question_latest_attempt_number: 3, questions: ['First', 'Second', 'Third', 'Fourth'], answers: ['One', 'Two'],
+  id: 'session-1', scenario_type: 'job_interview', question_engine: 'deterministic-v1', total_questions: 5, status: 'active', current_question_index: 2, current_question: 'Third',
+  current_question_latest_attempt_number: 3, questions: ['First', 'Second', 'Third', 'Fourth', 'Fifth'], answers: ['One', 'Two'],
 }
 const attempt: Attempt = {
   id: 'attempt-4', question_index: 2, attempt_number: 4, answer: 'New attempt',
@@ -100,7 +100,7 @@ test('starts a session with the required current-question attempt revision', asy
 
 test.each(['job_interview', 'public_speaking', 'thesis_defense', 'salary_negotiation'] as const)(
   'Start sends only the selected canonical scenario %s', async (scenarioType) => {
-    const created = { ...session, scenario_type: scenarioType, current_question_latest_attempt_number: 0 }
+    const created = { ...session, scenario_type: scenarioType, question_engine: 'deterministic-v1', current_question_latest_attempt_number: 0 }
     const fetchMock = mockResponse(json(created, 201))
     expect(await startInterview(scenarioType)).toEqual(created)
     expect(fetchMock).toHaveBeenCalledOnce()
@@ -693,3 +693,186 @@ test.each(['caller first', 'timeout first'] as const)(
     expect(fetchMock).toHaveBeenCalledTimes(1)
   },
 )
+
+
+const adaptive: InterviewSession = {
+  ...session, question_engine: 'live-ai-roleplay-v1', questions: session.questions.slice(0, 3),
+}
+const adaptiveNext: InterviewSession = {
+  ...adaptive, current_question_index: 3, current_question: 'Adaptive follow-up',
+  current_question_latest_attempt_number: 0, questions: [...adaptive.questions, 'Adaptive follow-up'],
+  answers: [...adaptive.answers, 'Selected'],
+}
+const roleplayFailure = {
+  detail: 'Interviewer is unavailable right now. Try Continue again.',
+  code: 'roleplay_generation_unavailable', write_outcome: 'not_applied',
+}
+
+test.each(['job_interview', 'public_speaking', 'thesis_defense', 'salary_negotiation'] as const)(
+  'new adaptive %s session preserves the scenario and fixed first question with a five-question plan', async (scenarioType) => {
+    const created: InterviewSession = { ...adaptive, scenario_type: scenarioType, current_question_index: 0,
+      current_question: 'Fixed first question', current_question_latest_attempt_number: 0,
+      questions: ['Fixed first question'], answers: [] }
+    const fetchMock = mockResponse(json(created, 201))
+    expect(await startInterview(scenarioType)).toEqual(created)
+    expect(JSON.parse(fetchMock.mock.calls[0][1].body)).toEqual({ scenario_type: scenarioType })
+    expect(fetchMock).toHaveBeenCalledOnce()
+  },
+)
+
+test.each([
+  { question_engine: undefined }, { question_engine: 'future-engine' }, { total_questions: undefined }, { total_questions: 4 },
+  { questions: ['First', 'Second'] }, { questions: [...adaptive.questions, 'Premature future question'] },
+  { current_question: 'Wrong current question' }, { answers: [] }, { current_question_index: 5 },
+])('adaptive session rejects corrupt plan or generated prefix (case %#)', async (changes) => {
+  mockResponse(json({ ...adaptive, ...changes }))
+  await expect(getSession(adaptive.id)).rejects.toMatchObject({ name: 'ApiError', ambiguousWrite: false })
+})
+
+test('adaptive Continue appends the validated next question and sends only the selected attempt revision', async () => {
+  const timeout = vi.spyOn(AbortSignal, 'timeout')
+  const fetchMock = mockResponse(json(adaptiveNext))
+  expect(await continueQuestion(adaptive)).toEqual(adaptiveNext)
+  expect(timeout).toHaveBeenCalledWith(135_000)
+  expect(JSON.parse(fetchMock.mock.calls[0][1].body)).toEqual({ expected_last_attempt_number: 3 })
+  expect(fetchMock).toHaveBeenCalledOnce()
+})
+
+test.each([
+  { questions: ['Changed first', 'Second', 'Third', 'Adaptive follow-up'] },
+  { answers: ['Changed final answer', 'Two', 'Selected'] },
+  { question_engine: 'deterministic-v1', questions: session.questions },
+  { scenario_type: 'thesis_defense' }, { current_question_latest_attempt_number: 1 },
+])('adaptive malformed successful Continue remains an uncertain write (case %#)', async (changes) => {
+  const mock = mockResponse(json({ ...adaptiveNext, ...changes }))
+  await expect(continueQuestion(adaptive)).rejects.toMatchObject({ name: 'ApiError', ambiguousWrite: true })
+  expect(mock).toHaveBeenCalledOnce()
+})
+
+test('only exact closed no-commit roleplay 503 is safe to retry directly', async () => {
+  const before = getAuthState()
+  const mock = mockResponse(json(roleplayFailure, 503))
+  const error = await continueQuestion(adaptive).catch((cause: unknown) => cause)
+  expect(error).toBeInstanceOf(RoleplayUnavailableError)
+  expect(error).toMatchObject({ status: 503, ambiguousWrite: false, message: roleplayFailure.detail })
+  expect(getAuthState()).toEqual(before)
+  expect(mock).toHaveBeenCalledOnce()
+})
+
+test.each([
+  { ...roleplayFailure, extra: 'PRIVATE' }, { ...roleplayFailure, code: 'unknown' },
+  { ...roleplayFailure, write_outcome: 'unknown' }, { ...roleplayFailure, detail: 'PRIVATE' },
+  { detail: roleplayFailure.detail }, null,
+])('unrecognized roleplay 503 remains uncertain and hides arbitrary body text (case %#)', async (failure) => {
+  const mock = mockResponse(json(failure, 503))
+  const error = await continueQuestion(adaptive).catch((cause: unknown) => cause)
+  expect(error).toBeInstanceOf(ApiError)
+  expect(error).not.toBeInstanceOf(RoleplayUnavailableError)
+  expect(error).toMatchObject({ status: 503, ambiguousWrite: true })
+  expect((error as Error).message).not.toContain('PRIVATE')
+  expect(mock).toHaveBeenCalledOnce()
+})
+
+test('malformed roleplay failure JSON remains uncertain', async () => {
+  mockResponse(new Response('PRIVATE', { status: 503 }))
+  await expect(continueQuestion(adaptive)).rejects.toMatchObject({ name: 'ApiError', ambiguousWrite: true })
+})
+
+test('legacy Continue never classifies a roleplay 503 as a safe generation retry', async () => {
+  const timeout = vi.spyOn(AbortSignal, 'timeout')
+  mockResponse(json(roleplayFailure, 503))
+  await expect(continueQuestion(session)).rejects.toMatchObject({ name: 'ApiError', ambiguousWrite: true })
+  expect(timeout).toHaveBeenCalledWith(10_000)
+})
+
+test('final adaptive Continue uses ten seconds and completes without appending a question', async () => {
+  const final: InterviewSession = { ...adaptive, current_question_index: 4, current_question: 'Fifth',
+    questions: session.questions, answers: ['One', 'Two', 'Three', 'Four'] }
+  const completed: InterviewSession = { ...final, status: 'completed', current_question_index: 5,
+    current_question: null, current_question_latest_attempt_number: 0, answers: [...final.answers, 'Five'] }
+  const timeout = vi.spyOn(AbortSignal, 'timeout')
+  const mock = mockResponse(json(completed))
+  expect(await continueQuestion(final)).toEqual(completed)
+  expect(timeout).toHaveBeenCalledWith(10_000)
+  expect(mock).toHaveBeenCalledOnce()
+})
+
+test.each([[401, 'signed_out'], [403, 'stale']] as const)(
+  'adaptive Continue %s preserves the auth boundary without replay', async (status, expected) => {
+    const mock = mockResponse(json(roleplayFailure, status))
+    await expect(continueQuestion(adaptive)).rejects.toMatchObject({ name: 'AuthBoundaryError', status })
+    expect(getAuthState()).toEqual({ status: expected })
+    expect(mock).toHaveBeenCalledOnce()
+  },
+)
+
+test('auth 503 on adaptive Continue retains auth notice and uncertain-write recovery', async () => {
+  const mock = mockResponse(json({ detail: 'Authentication is temporarily unavailable.' }, 503))
+  await expect(continueQuestion(adaptive)).rejects.toMatchObject({ name: 'ApiError', ambiguousWrite: true })
+  expect(getAuthState()).toMatchObject({ status: 'authenticated', notice: AUTH_UNAVAILABLE_MESSAGE })
+  expect(mock).toHaveBeenCalledOnce()
+})
+
+test.each(['caller', 'deadline'] as const)('adaptive Continue %s cancellation remains uncertain and is never replayed', async (source) => {
+  const caller = new AbortController()
+  const deadline = new AbortController()
+  const timeout = vi.spyOn(AbortSignal, 'timeout').mockReturnValue(deadline.signal)
+  const mock = vi.fn((_url: string, options: RequestInit) => new Promise<Response>((_resolve, reject) => {
+    options.signal?.addEventListener('abort', () => reject(options.signal?.reason), { once: true })
+  }))
+  vi.stubGlobal('fetch', mock)
+  const pending = continueQuestion(adaptive, caller.signal).catch((cause: unknown) => cause)
+  ;(source === 'caller' ? caller : deadline).abort(new DOMException('PRIVATE', 'AbortError'))
+  expect(await pending).toMatchObject({ name: 'ApiError', ambiguousWrite: true })
+  expect(timeout).toHaveBeenCalledWith(135_000)
+  expect(mock).toHaveBeenCalledOnce()
+})
+
+test('adaptive Continue stays pending until its bounded 135-second deadline', async () => {
+  vi.useFakeTimers()
+  vi.spyOn(AbortSignal, 'timeout').mockImplementation((milliseconds) => {
+    const controller = new AbortController()
+    setTimeout(() => controller.abort(new DOMException('Timeout', 'TimeoutError')), milliseconds)
+    return controller.signal
+  })
+  const mock = vi.fn((_url: string, options: RequestInit) => new Promise<Response>((_resolve, reject) => {
+    options.signal?.addEventListener('abort', () => reject(options.signal?.reason), { once: true })
+  }))
+  vi.stubGlobal('fetch', mock)
+  let settled = false
+  const pending = continueQuestion(adaptive).catch((cause: unknown) => { settled = true; return cause })
+  await vi.advanceTimersByTimeAsync(134_999)
+  expect(settled).toBe(false)
+  await vi.advanceTimersByTimeAsync(1)
+  expect(await pending).toMatchObject({ name: 'ApiError', ambiguousWrite: true })
+  expect(mock).toHaveBeenCalledOnce()
+})
+
+test.each(['success', 'roleplay failure'] as const)('late adaptive Continue %s body cannot cross auth workspaces', async (kind) => {
+  let resolve!: (value: unknown) => void
+  const value = kind === 'success' ? adaptiveNext : roleplayFailure
+  const response = json(value, kind === 'success' ? 200 : 503)
+  const body = vi.spyOn(response, 'json').mockReturnValue(new Promise((done) => { resolve = done }))
+  mockResponse(response)
+  const pending = continueQuestion(adaptive).catch((cause: unknown) => cause)
+  await vi.waitFor(() => expect(body).toHaveBeenCalledOnce())
+  await authenticateTestWorkspace('context-B', '144b50e1-0183-428c-943f-1850df006b66')
+  resolve(value)
+  expect(await pending).toMatchObject({ name: 'AuthBoundaryError' })
+  expect(getAuthState()).toMatchObject({ requestContext: 'context-B', notice: null })
+})
+
+
+test.each(['success', 'roleplay failure'] as const)('adaptive Continue caller cancellation during %s JSON remains uncertain', async (kind) => {
+  const caller = new AbortController()
+  let resolve!: (value: unknown) => void
+  const value = kind === 'success' ? adaptiveNext : roleplayFailure
+  const response = json(value, kind === 'success' ? 200 : 503)
+  const body = vi.spyOn(response, 'json').mockReturnValue(new Promise((done) => { resolve = done }))
+  mockResponse(response)
+  const pending = continueQuestion(adaptive, caller.signal).catch((cause: unknown) => cause)
+  await vi.waitFor(() => expect(body).toHaveBeenCalledOnce())
+  caller.abort()
+  resolve(value)
+  expect(await pending).toMatchObject({ name: 'ApiError', ambiguousWrite: true })
+})

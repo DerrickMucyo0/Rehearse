@@ -51,7 +51,7 @@ function overview(
   const attemptCount = questions.reduce((total, question) => total + question.attempt_count, 0)
   return {
     summary: {
-      session_id: sessionId, scenario_type: 'job_interview', status: completed ? 'completed' : 'active', created_at: CREATED,
+      session_id: sessionId, scenario_type: 'job_interview', question_engine: 'deterministic-v1', status: completed ? 'completed' : 'active', created_at: CREATED,
       completed_at: completed ? COMPLETED : null, current_question_number: completed ? null : 2,
       total_questions: 5, finalized_question_count: finalizedCount, questions_practiced_count: practiced,
       total_attempt_count: attemptCount, total_retry_count: attemptCount - practiced,
@@ -574,4 +574,19 @@ test('a paginated selected question preserves delivery facts attached to each pe
   expect(within(article).getByText('Pause count').nextElementSibling?.textContent).toBe('0')
   expect(within(screen.getByRole('heading', { name: 'Attempt 1' }).closest('article')!).getAllByText('Not recorded').length).toBeGreaterThan(0)
   expect(readDetail.mock.calls[2][1]?.afterAttemptNumber).toBe(19)
+})
+
+
+test('adaptive session detail renders only the two persisted questions with a five-question plan', async () => {
+  const detail = overview()
+  detail.summary.question_engine = 'live-ai-roleplay-v1'
+  detail.questions = detail.questions.slice(0, 2)
+  readDetail.mockResolvedValueOnce(detail)
+  render(<SessionDetail {...props()} />)
+  await screen.findByText('Persisted question 2.')
+  expect(screen.getByText('2 of 5')).toBeTruthy()
+  expect(screen.getByText('1 / 5')).toBeTruthy()
+  expect(screen.queryByText('Persisted question 3.')).toBeNull()
+  expect(screen.queryByRole('button', { name: 'Question 3' })).toBeNull()
+  expect(readDetail).toHaveBeenCalledOnce()
 })

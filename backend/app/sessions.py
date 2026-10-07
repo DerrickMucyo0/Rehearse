@@ -1,3 +1,5 @@
+from collections.abc import Callable
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Annotated, Literal
 from uuid import UUID
@@ -17,6 +19,7 @@ from app.database_models import (
 )
 from app.delivery_metrics import DeliveryMetrics
 from app.diagnosis import DiagnosisContext, build_diagnosis_context
+from app.roleplay import QuestionEngine, RoleplayContext, RoleplayQuestion, RoleplayTurn
 from app.scenarios import SCENARIO_QUESTIONS, ScenarioType, questions_for_scenario
 from app.speaking_metrics import SpeakingMetrics
 
@@ -62,6 +65,8 @@ class Attempt(BaseModel):
 class InterviewSession(BaseModel):
     id: UUID
     scenario_type: ScenarioType = "job_interview"
+    question_engine: QuestionEngine = "deterministic-v1"
+    total_questions: Literal[5] = 5
     status: Literal["active", "completed"] = "active"
     current_question_index: int = 0
     questions: list[str]
@@ -93,6 +98,48 @@ class InvalidComparisonSelection(Exception):
     pass
 
 
+@dataclass(frozen=True)
+class ContinueAttemptSnapshot:
+    question_index: int
+    attempt_id: UUID = field(repr=False)
+    attempt_number: int
+    answer: str = field(repr=False)
+
+
+@dataclass(frozen=True)
+class ContinueSnapshot:
+    """Closed-transaction facts; internal identities never enter provider context."""
+
+    session_id: UUID = field(repr=False)
+    principal: AuthenticatedPrincipal = field(repr=False)
+    question_engine: QuestionEngine
+    scenario_type: ScenarioType
+    questions: tuple[str, ...] = field(repr=False)
+    current_question_index: int
+    expected_last_attempt_number: int
+    attempts: tuple[ContinueAttemptSnapshot, ...] = field(repr=False)
+
+    @property
+    def requires_generation(self) -> bool:
+        return self.question_engine == "live-ai-roleplay-v1" and self.current_question_index < 4
+
+    @property
+    def context(self) -> RoleplayContext | None:
+        if not self.requires_generation:
+            return None
+        return RoleplayContext(
+            scenario_type=self.scenario_type,
+            next_question_number=self.current_question_index + 2,
+            turns=tuple(RoleplayTurn(
+                question_number=attempt.question_index + 1,
+                question=self.questions[attempt.question_index], answer=attempt.answer,
+            ) for attempt in self.attempts),
+        )
+
+
+_CONTINUE_STATE_CHANGED = "Interview state changed. Recheck before continuing."
+
+
 class InterviewSessionService:
     """One authenticated owner; every operation closes its own transaction.
 
@@ -117,10 +164,18 @@ class InterviewSessionService:
         )
 
     def start(self, scenario_type: ScenarioType = "job_interview") -> InterviewSession:
+        return self._start(scenario_type, "deterministic-v1")
+
+    def start_adaptive(self, scenario_type: ScenarioType = "job_interview") -> InterviewSession:
+        return self._start(scenario_type, "live-ai-roleplay-v1")
+
+    def _start(self, scenario_type: ScenarioType, question_engine: QuestionEngine) -> InterviewSession:
         questions = questions_for_scenario(scenario_type)
+        if question_engine == "live-ai-roleplay-v1":
+            questions = questions[:1]
         with self._session_factory.begin() as database:
             stored = StoredInterviewSession(
-                questions=questions, scenario_type=scenario_type, user_id=self._principal.user_id,
+                questions=questions, question_engine=question_engine, scenario_type=scenario_type, user_id=self._principal.user_id,
             )
             database.add(stored)
             database.flush()
@@ -252,6 +307,8 @@ class InterviewSessionService:
     ) -> InterviewSession:
         with self._session_factory.begin() as database:
             stored = self._locked_session(database, session_id)
+            if stored.question_engine != "deterministic-v1":
+                raise SessionConflict("Adaptive sessions require a guarded Continue commit.")
             self._check_question(stored, question_index)
             latest = self._latest_attempt_number(database, session_id, question_index)
             if latest == 0:
@@ -263,6 +320,98 @@ class InterviewSessionService:
                 stored.completed_at = datetime.now(timezone.utc)
             database.flush()
             return self._read_response(database, session_id)
+
+    def prepare_continue(
+        self, session_id: UUID, question_index: int, request: ContinueRequest,
+    ) -> ContinueSnapshot:
+        """Read a consistent context, returning no live transaction or ORM object."""
+        with self._session_factory.begin() as database:
+            # Root state and all candidate attempts share this one SQL snapshot.
+            rows = database.execute(
+                select(StoredInterviewSession, QuestionAttempt)
+                .outerjoin(QuestionAttempt, QuestionAttempt.session_id == StoredInterviewSession.id)
+                .where(self._session_predicate(session_id))
+                .order_by(QuestionAttempt.question_index, QuestionAttempt.attempt_number)
+            ).all()
+            if not rows:
+                raise SessionNotFound("Session not found.")
+            return self._continue_snapshot(
+                rows[0][0], [attempt for _, attempt in rows if attempt is not None],
+                question_index, request.expected_last_attempt_number,
+            )
+
+    def commit_continue(
+        self, snapshot: ContinueSnapshot, next_question: RoleplayQuestion | None,
+        *, principal_guard: Callable[[Session], None] | None = None,
+    ) -> InterviewSession:
+        """Recheck initiating facts and atomically publish one advancement."""
+        if type(snapshot) is not ContinueSnapshot:
+            raise SessionConflict(_CONTINUE_STATE_CHANGED)
+        if snapshot.question_engine == "live-ai-roleplay-v1" and principal_guard is None:
+            raise TypeError("An authenticated commit guard is required.")
+        if snapshot.requires_generation:
+            if type(next_question) is not RoleplayQuestion:
+                raise ValueError("A validated next question is required.")
+            # Reject non-HTTP callers that bypass the frozen model's validation.
+            next_question = RoleplayQuestion.model_validate(next_question.model_dump())
+        elif next_question is not None:
+            raise ValueError("This Continue must not generate a question.")
+        with self._session_factory.begin() as database:
+            stored = self._locked_session(database, snapshot.session_id)
+            if snapshot.principal != self._principal:
+                raise SessionConflict(_CONTINUE_STATE_CHANGED)
+            if snapshot.question_engine == "live-ai-roleplay-v1":
+                assert principal_guard is not None
+                principal_guard(database)
+            attempts = list(database.scalars(
+                select(QuestionAttempt).where(QuestionAttempt.session_id == stored.id)
+                .order_by(QuestionAttempt.question_index, QuestionAttempt.attempt_number)
+            ))
+            try:
+                current = self._continue_snapshot(
+                    stored, attempts, snapshot.current_question_index, snapshot.expected_last_attempt_number,
+                )
+            except SessionConflict:
+                raise SessionConflict(_CONTINUE_STATE_CHANGED) from None
+            if current != snapshot:
+                raise SessionConflict(_CONTINUE_STATE_CHANGED)
+            if next_question is not None:
+                stored.questions = (*stored.questions, next_question.next_question)
+            stored.current_question_index += 1
+            if stored.current_question_index == 5:
+                stored.status = "completed"
+                stored.completed_at = datetime.now(timezone.utc)
+            # One flush emits prefix and index together; context manager commits
+            # before either a response or finalization becomes visible to callers.
+            database.flush()
+            return self._read_response(database, stored.id)
+
+    def _continue_snapshot(
+        self, stored: StoredInterviewSession, attempts: list[QuestionAttempt],
+        question_index: int, expected_last_attempt_number: int,
+    ) -> ContinueSnapshot:
+        self._check_question(stored, question_index)
+        latest: dict[int, QuestionAttempt] = {}
+        for attempt in attempts:
+            previous = latest.get(attempt.question_index)
+            if previous is None or attempt.attempt_number > previous.attempt_number:
+                latest[attempt.question_index] = attempt
+        target = latest.get(question_index)
+        if target is None:
+            raise SessionConflict("Current question has no submitted attempts.")
+        self._check_revision(target.attempt_number, expected_last_attempt_number)
+        if any(index not in latest for index in range(question_index + 1)):
+            raise SessionConflict(_CONTINUE_STATE_CHANGED)
+        return ContinueSnapshot(
+            session_id=stored.id, principal=self._principal,
+            question_engine=stored.question_engine, scenario_type=stored.scenario_type, questions=tuple(stored.questions),
+            current_question_index=stored.current_question_index,
+            expected_last_attempt_number=expected_last_attempt_number,
+            attempts=tuple(ContinueAttemptSnapshot(
+                question_index=index, attempt_id=latest[index].id,
+                attempt_number=latest[index].attempt_number, answer=latest[index].answer_text,
+            ) for index in range(question_index + 1)),
+        )
 
     def create_measurement(
         self, session_id: UUID, question_index: int, metrics: SpeakingMetrics,
@@ -427,7 +576,7 @@ class InterviewSessionService:
                 latest[attempt.question_index] = attempt
         current = latest.get(stored.current_question_index) if stored.status == "active" else None
         return InterviewSession(
-            id=stored.id, scenario_type=stored.scenario_type, status=stored.status,
+            id=stored.id, scenario_type=stored.scenario_type, question_engine=stored.question_engine, status=stored.status,
             current_question_index=stored.current_question_index,
             questions=list(stored.questions),
             answers=[latest[index].answer_text for index in range(stored.current_question_index) if index in latest],
