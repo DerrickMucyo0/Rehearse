@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, expect, test, vi } from 'vitest'
-import { ApiError, continueQuestion, getAttempts, getComparison, getSemanticDiagnosis, getSession, isConflictError, RoleplayUnavailableError, SemanticDiagnosisError, startInterview, submitAttempt, transcribeAudio, uploadAudio } from './interviewApi'
+import { ApiError, continueQuestion, getAttempts, getComparison, getSemanticDiagnosis, getSession, isConflictError, requestQuestionSpeech, RoleplayUnavailableError, SemanticDiagnosisError, startInterview, submitAttempt, transcribeAudio, uploadAudio, VoicePlaybackError } from './interviewApi'
 import type { Attempt, DeliveryComparison, DeliveryMetricChange, InterviewSession, MetricChange, SemanticDiagnosis } from './interviewApi'
 import { DELIVERY_TIMING_REASONS } from './deliveryMetrics'
 import type { DeliveryMetrics } from './deliveryMetrics'
@@ -11,6 +11,13 @@ import type { ScenarioType } from './scenarios'
 const session: InterviewSession = {
   id: 'session-1', scenario_type: 'job_interview', question_engine: 'deterministic-v1', total_questions: 5, status: 'active', current_question_index: 2, current_question: 'Third',
   current_question_latest_attempt_number: 3, questions: ['First', 'Second', 'Third', 'Fourth', 'Fifth'], answers: ['One', 'Two'],
+}
+const voiceUnavailable = 'Voice playback is unavailable right now.'
+function speech(signal = new AbortController().signal) {
+  return requestQuestionSpeech(session.id, session.current_question_index, signal)
+}
+function mp3(content: BodyInit = 'MP3 audio', mediaType = 'audio/mpeg') {
+  return new Response(content, { headers: { 'Content-Type': mediaType } })
 }
 const attempt: Attempt = {
   id: 'attempt-4', question_index: 2, attempt_number: 4, answer: 'New attempt',
@@ -45,6 +52,7 @@ test.each([
   ['audio upload', () => uploadAudio(session, new Blob(['audio']), new AbortController().signal)],
   ['transcription', () => transcribeAudio(session, new Blob(['audio']), new AbortController().signal)],
   ['diagnosis', () => getSemanticDiagnosis(session.id, 2, 4, new AbortController().signal)],
+  ['question speech', () => requestQuestionSpeech(session.id, 2, new AbortController().signal)],
 ] as const)('every %s Practice API uses the shared context-bearing same-origin boundary', async (_name, invoke) => {
   const fetchMock = mockResponse(json({}))
   await invoke().catch(() => undefined)
@@ -86,6 +94,190 @@ test('reads the authoritative session without submitting an answer', async () =>
   expect(await getSession(session.id)).toEqual(session)
   expect(fetchMock.mock.calls[0][0]).toBe('/api/sessions/session-1')
   expect(fetchMock.mock.calls[0][1].method).toBeUndefined()
+})
+
+test('speech posts only the selected persisted question identifiers and returns an owned MP3 Blob', async () => {
+  const before = getAuthState()
+  const timeout = vi.spyOn(AbortSignal, 'timeout')
+  const response = mp3('MP3 audio', 'Audio/MPEG; charset=binary')
+  const body = vi.spyOn(response, 'json')
+  const fetchMock = mockResponse(response)
+  const audio = await speech()
+  expect(audio.size).toBe(9)
+  expect(audio.type).toBe('audio/mpeg;charset=binary')
+  expect(timeout).toHaveBeenCalledExactlyOnceWith(75000)
+  expect(fetchMock).toHaveBeenCalledOnce()
+  const [path, options] = fetchMock.mock.calls[0]
+  expect(path).toBe('/api/sessions/session-1/questions/2/speech')
+  expect(options).toMatchObject({ method: 'POST', credentials: 'same-origin', cache: 'no-store' })
+  expect(options.body).toBeUndefined()
+  const headers = new Headers(options.headers)
+  expect([...headers.keys()]).toEqual(['x-rehearse-auth-context'])
+  expect(headers.get(AUTH_CONTEXT_HEADER)).toBe('context-A')
+  expect(body).not.toHaveBeenCalled()
+  expect(getAuthState()).toEqual(before)
+})
+
+test.each([404, 409, 422, 500, 502, 503, 504])('speech HTTP %s stays voice-specific and never becomes an uncertain write', async (status) => {
+  const before = getAuthState()
+  const response = json({ detail: 'PRIVATE_VOICE_DETAIL' }, status)
+  const jsonBody = vi.spyOn(response, 'json')
+  const binaryBody = vi.spyOn(response, 'blob')
+  const mock = mockResponse(response)
+  const error = await speech().catch((cause: unknown) => cause)
+  expect(error).toBeInstanceOf(VoicePlaybackError)
+  expect(error).not.toBeInstanceOf(ApiError)
+  expect(error).toMatchObject({ status, message: voiceUnavailable })
+  expect(error).not.toHaveProperty('ambiguousWrite')
+  expect(jsonBody).not.toHaveBeenCalled()
+  expect(binaryBody).not.toHaveBeenCalled()
+  expect(getAuthState()).toEqual(before)
+  expect(mock).toHaveBeenCalledOnce()
+})
+
+test('speech configuration 503 retains voice-specific UX with no authentication notice', async () => {
+  const before = getAuthState()
+  const mock = mockResponse(json({ detail: voiceUnavailable }, 503))
+  await expect(speech()).rejects.toMatchObject({ name: 'VoicePlaybackError', status: 503, message: voiceUnavailable })
+  expect(getAuthState()).toEqual(before)
+  expect(mock).toHaveBeenCalledOnce()
+})
+
+test('genuine authentication 503 on speech retains the shared authentication notice', async () => {
+  const before = getAuthState()
+  const mock = mockResponse(json({ detail: 'Authentication is temporarily unavailable.' }, 503))
+  await expect(speech()).rejects.toMatchObject({ name: 'VoicePlaybackError', status: 503, message: voiceUnavailable })
+  expect(getAuthState()).toEqual({ ...before, notice: AUTH_UNAVAILABLE_MESSAGE })
+  expect(mock).toHaveBeenCalledOnce()
+})
+
+test.each([[401, 'signed_out'], [403, 'stale']] as const)('speech %s preserves the shared %s auth boundary', async (status, expected) => {
+  const response = json({ detail: 'PRIVATE_VOICE_DETAIL' }, status)
+  const body = vi.spyOn(response, 'blob')
+  const mock = mockResponse(response)
+  await expect(speech()).rejects.toMatchObject({ name: 'AuthBoundaryError', status })
+  expect(getAuthState()).toEqual({ status: expected })
+  expect(body).not.toHaveBeenCalled()
+  expect(mock).toHaveBeenCalledOnce()
+})
+
+test.each([undefined, 'application/json', 'text/html', 'audio/wav', 'audio/mpeg-other'])('speech rejects non-MP3 Content-Type %s before reading bytes', async (mediaType) => {
+  const response = new Response('PRIVATE_VOICE_DETAIL', { headers: mediaType ? { 'Content-Type': mediaType } : {} })
+  const body = vi.spyOn(response, 'blob')
+  const mock = mockResponse(response)
+  await expect(speech()).rejects.toMatchObject({ name: 'VoicePlaybackError', status: 200, message: voiceUnavailable })
+  expect(body).not.toHaveBeenCalled()
+  expect(mock).toHaveBeenCalledOnce()
+})
+
+test('speech requires HTTP 200 even with valid audio MIME', async () => {
+  const mock = mockResponse(new Response('MP3 audio', { status: 201, headers: { 'Content-Type': 'audio/mpeg' } }))
+  await expect(speech()).rejects.toMatchObject({ name: 'VoicePlaybackError', status: 201, message: voiceUnavailable })
+  expect(mock).toHaveBeenCalledOnce()
+})
+
+test.each([0, 2 * 1024 * 1024 + 1])('speech rejects %s actual audio bytes regardless of declared length', async (size) => {
+  const response = mp3(new Uint8Array(size))
+  response.headers.set('Content-Length', '9')
+  const mock = mockResponse(response)
+  await expect(speech()).rejects.toMatchObject({ name: 'VoicePlaybackError', status: 200, message: voiceUnavailable })
+  expect(mock).toHaveBeenCalledOnce()
+})
+
+test('speech accepts the exact two MiB actual-byte boundary', async () => {
+  mockResponse(mp3(new Uint8Array(2 * 1024 * 1024)))
+  expect((await speech()).size).toBe(2 * 1024 * 1024)
+})
+
+test.each(['network', 'binary body'] as const)('speech %s failure discards exception text without retry or write recovery', async (phase) => {
+  const mock = mockResponse(mp3())
+  if (phase === 'network') mock.mockRejectedValue(new Error('PRIVATE_VOICE_EXCEPTION'))
+  if (phase === 'binary body') {
+    const response = mp3()
+    vi.spyOn(response, 'blob').mockRejectedValue(new Error('PRIVATE_VOICE_EXCEPTION'))
+    mock.mockResolvedValue(response)
+  }
+  const error = await speech().catch((cause: unknown) => cause)
+  expect(error).toMatchObject({ name: 'VoicePlaybackError', message: voiceUnavailable })
+  expect(error).not.toHaveProperty('ambiguousWrite')
+  expect((error as Error).message).not.toContain('PRIVATE')
+  expect(mock).toHaveBeenCalledOnce()
+})
+
+test('pre-aborted speech never enters fetch', async () => {
+  const controller = new AbortController()
+  controller.abort(new Error('PRIVATE_VOICE_EXCEPTION'))
+  const mock = mockResponse(mp3())
+  await expect(speech(controller.signal)).rejects.toMatchObject({ name: 'AbortError', message: 'Voice request cancelled.' })
+  expect(mock).not.toHaveBeenCalled()
+})
+
+test('speech caller cancellation reaches fetch without retry or uncertain-write error', async () => {
+  const controller = new AbortController()
+  let fetchSignal: AbortSignal | undefined
+  const mock = vi.fn((_url: string, options: RequestInit) => new Promise<Response>((_resolve, reject) => {
+    fetchSignal = options.signal as AbortSignal
+    fetchSignal.addEventListener('abort', () => reject(fetchSignal?.reason), { once: true })
+  }))
+  vi.stubGlobal('fetch', mock)
+  const pending = speech(controller.signal).catch((cause: unknown) => cause)
+  controller.abort(new Error('PRIVATE_VOICE_EXCEPTION'))
+  expect(await pending).toMatchObject({ name: 'AbortError', message: 'Voice request cancelled.' })
+  expect(fetchSignal?.aborted).toBe(true)
+  expect(mock).toHaveBeenCalledOnce()
+})
+
+test.each(['headers', 'binary body'] as const)('speech discards late %s after caller cancellation even if the reader ignores abort', async (phase) => {
+  const controller = new AbortController()
+  let resolveHeaders!: (value: Response) => void
+  let resolveBody!: (value: Blob) => void
+  const response = mp3()
+  const body = vi.spyOn(response, 'blob').mockReturnValue(new Promise((done) => { resolveBody = done }))
+  const mock = vi.fn().mockReturnValue(phase === 'headers'
+    ? new Promise<Response>((done) => { resolveHeaders = done }) : Promise.resolve(response))
+  vi.stubGlobal('fetch', mock)
+  const pending = speech(controller.signal).catch((cause: unknown) => cause)
+  if (phase === 'binary body') await vi.waitFor(() => expect(body).toHaveBeenCalledOnce())
+  controller.abort(new Error('PRIVATE_VOICE_EXCEPTION'))
+  if (phase === 'headers') resolveHeaders(response)
+  else resolveBody(new Blob(['private late audio']))
+  expect(await pending).toMatchObject({ name: 'AbortError', message: 'Voice request cancelled.' })
+  expect(mock).toHaveBeenCalledOnce()
+})
+
+test('speech rejects a late A binary body after account switch without affecting B', async () => {
+  let resolve!: (value: Blob) => void
+  const response = mp3()
+  const body = vi.spyOn(response, 'blob').mockReturnValue(new Promise((done) => { resolve = done }))
+  mockResponse(response)
+  const pending = speech().catch((cause: unknown) => cause)
+  await vi.waitFor(() => expect(body).toHaveBeenCalledOnce())
+  await authenticateTestWorkspace('context-B', '144b50e1-0183-428c-943f-1850df006b66')
+  resolve(new Blob(['private A audio']))
+  expect(await pending).toMatchObject({ name: 'AuthBoundaryError' })
+  expect(getAuthState()).toMatchObject({ status: 'authenticated', requestContext: 'context-B', notice: null })
+})
+
+test.each(['headers', 'binary body'] as const)('speech 75-second deadline rejects late %s with one request only', async (phase) => {
+  const timeout = new AbortController()
+  const timeoutSpy = vi.spyOn(AbortSignal, 'timeout').mockReturnValue(timeout.signal)
+  let resolveHeaders!: (value: Response) => void
+  let resolveBody!: (value: Blob) => void
+  const response = mp3()
+  const body = vi.spyOn(response, 'blob').mockReturnValue(new Promise((done) => { resolveBody = done }))
+  const mock = vi.fn().mockReturnValue(phase === 'headers'
+    ? new Promise<Response>((done) => { resolveHeaders = done }) : Promise.resolve(response))
+  vi.stubGlobal('fetch', mock)
+  const pending = speech().catch((cause: unknown) => cause)
+  if (phase === 'binary body') await vi.waitFor(() => expect(body).toHaveBeenCalledOnce())
+  timeout.abort(new DOMException('PRIVATE_VOICE_TIMEOUT', 'TimeoutError'))
+  if (phase === 'headers') resolveHeaders(response)
+  else resolveBody(new Blob(['late audio']))
+  const error = await pending
+  expect(error).toMatchObject({ name: 'VoicePlaybackError', status: null, message: voiceUnavailable })
+  expect(error).not.toHaveProperty('ambiguousWrite')
+  expect(timeoutSpy).toHaveBeenCalledExactlyOnceWith(75000)
+  expect(mock).toHaveBeenCalledOnce()
 })
 
 test('starts a session with the required current-question attempt revision', async () => {

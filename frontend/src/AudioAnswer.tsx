@@ -14,11 +14,12 @@ interface Props {
   onInvalidateMeasurement: () => void
   onTranscribing: (busy: boolean) => void
   onBusyChange?: (busy: boolean) => void
+  onBeforeRecording?: () => void
   onConflict?: () => void
   onUncertainTranscription?: () => void
 }
 
-export default function AudioAnswer({ session, disabled, hasAnswer, onTranscript, onInvalidateMeasurement, onTranscribing, onBusyChange, onConflict, onUncertainTranscription }: Props) {
+export default function AudioAnswer({ session, disabled, hasAnswer, onTranscript, onInvalidateMeasurement, onTranscribing, onBusyChange, onBeforeRecording, onConflict, onUncertainTranscription }: Props) {
   const [workspaceGeneration] = useState(() => {
     const auth = getAuthState()
     return auth.status === 'authenticated' ? auth.generation : null
@@ -105,7 +106,7 @@ export default function AudioAnswer({ session, disabled, hasAnswer, onTranscript
       <p>Record an answer (up to 5 minutes / 10 MiB). Transcribe Recording sends audio to ElevenLabs.
         Review and edit the transcript, then Submit Attempt to save it. Continue advances to the next question.</p>
       <button type="button" disabled={disabled || pendingRequest || ['requesting', 'recording', 'stopping'].includes(recording.state)}
-        onClick={() => { onInvalidateMeasurement(); setMeasurements(null); setUploadState('idle'); setError(''); void recording.start() }}>
+        onClick={() => { onBeforeRecording?.(); onInvalidateMeasurement(); setMeasurements(null); setUploadState('idle'); setError(''); void recording.start() }}>
         Record Answer
       </button>
       {recording.state === 'recording' && <button type="button" onClick={recording.stop}>Stop Recording</button>}

@@ -1727,3 +1727,164 @@ test('restoring an adaptive session reads its generated prefix without continuin
   expect(api.posts('/continue')).toHaveLength(0)
   expect(api.posts('/diagnosis')).toHaveLength(0)
 })
+
+class QuestionAudio {
+  static instances: QuestionAudio[] = []
+  src: string
+  currentTime = 0
+  onended: (() => void) | null = null
+  onerror: (() => void) | null = null
+  play = vi.fn().mockResolvedValue(undefined)
+  pause = vi.fn()
+  removeAttribute(name: string) { if (name === 'src') this.src = '' }
+  constructor(url: string) { this.src = url; QuestionAudio.instances.push(this) }
+}
+function stubQuestionAudio() {
+  QuestionAudio.instances = []
+  const createURL = vi.fn().mockReturnValue('blob:question')
+  const revokeURL = vi.fn()
+  const NativeURL = URL
+  vi.stubGlobal('URL', class extends NativeURL { static createObjectURL = createURL; static revokeObjectURL = revokeURL })
+  vi.stubGlobal('Audio', QuestionAudio)
+  return { createURL, revokeURL }
+}
+function speechResponse() { return new Response(new Uint8Array([0xff, 0xfb, 0x90, 0x64]), { headers: { 'Content-Type': 'audio/mpeg' } }) }
+async function playQuestion() {
+  fireEvent.click(screen.getByRole('button', { name: 'Play question' }))
+  await waitFor(() => expect(QuestionAudio.instances.at(-1)?.play).toHaveBeenCalledOnce())
+}
+
+test.each(['deterministic-v1', 'live-ai-roleplay-v1'] as const)(
+  '%s synthesis is explicit and Replay creates no attempt, diagnosis, advancement, or storage write', async (engine) => {
+    const api = mockSessionApi(engine === 'live-ai-roleplay-v1' ? adaptiveSession() : freshSession())
+    const { revokeURL } = stubQuestionAudio()
+    api.intercept((url, options) => {
+      if (!url.endsWith('/speech')) return
+      expect(url).toBe('/api/sessions/session-1/questions/0/speech')
+      expect(options?.body).toBeUndefined()
+      return speechResponse()
+    })
+    const { unmount } = render(<Interview />); await start()
+    expect(api.posts('/speech')).toHaveLength(0)
+    const writes = api.fetchMock.mock.calls.filter(([, options]) => options?.method === 'POST').length
+    const storage = vi.spyOn(Storage.prototype, 'setItem')
+    await playQuestion()
+    act(() => QuestionAudio.instances[0].onended?.())
+    fireEvent.click(screen.getByRole('button', { name: 'Replay question' }))
+    await waitFor(() => expect(QuestionAudio.instances[0].play).toHaveBeenCalledTimes(2))
+    expect(api.posts('/speech')).toHaveLength(1)
+    expect(api.fetchMock.mock.calls.filter(([, options]) => options?.method === 'POST')).toHaveLength(writes + 1)
+    expect(api.posts('/attempts')).toHaveLength(0)
+    expect(api.posts('/continue')).toHaveLength(0)
+    expect(api.posts('/diagnosis')).toHaveLength(0)
+    expect(storage).not.toHaveBeenCalled()
+    expect(api.session().current_question_index).toBe(0)
+    expect(api.session().current_question_latest_attempt_number).toBe(0)
+    unmount()
+    expect(revokeURL).toHaveBeenCalledExactlyOnceWith('blob:question')
+  },
+)
+
+test.each(['Submit Attempt', 'Retry', 'Cancel Retry', 'Continue'])(
+  '%s immediately disposes voice through its existing interview lifecycle without automatic synthesis', async (action) => {
+    const api = mockSessionApi()
+    const { revokeURL } = stubQuestionAudio()
+    api.intercept((url) => url.endsWith('/speech') ? speechResponse() : undefined)
+    render(<Interview />); await start()
+    if (action !== 'Submit Attempt') await submit('Original saved answer')
+    if (action === 'Cancel Retry') await retry()
+    if (action === 'Submit Attempt') fireEvent.change(screen.getByRole('textbox', { name: 'Your answer' }), { target: { value: 'Saved answer' } })
+    await playQuestion()
+    fireEvent.click(screen.getByRole('button', { name: action }))
+    // Disposal occurs in the click handler before persistence/reconciliation settles.
+    expect(QuestionAudio.instances[0].pause).toHaveBeenCalledOnce()
+    expect(revokeURL).toHaveBeenCalledExactlyOnceWith('blob:question')
+    if (action === 'Submit Attempt') await screen.findByRole('button', { name: 'Continue' })
+    if (action === 'Retry') await screen.findByRole('textbox', { name: 'Your answer' })
+    if (action === 'Cancel Retry') await screen.findByRole('button', { name: 'Continue' })
+    if (action === 'Continue') await screen.findByText('Question 2 of 5')
+    expect(api.posts('/speech')).toHaveLength(1)
+    expect(api.posts('/attempts')).toHaveLength(1)
+    expect(api.posts('/continue')).toHaveLength(action === 'Continue' ? 1 : 0)
+  },
+)
+
+test('Continue aborts pending speech immediately; an ignored-abort response cannot play the previous question', async () => {
+  const api = mockSessionApi(adaptiveSession())
+  const { createURL } = stubQuestionAudio()
+  const pending = deferredResponse()
+  api.intercept((url) => url.endsWith('/speech') ? pending.promise : undefined)
+  render(<Interview />); await start(); await submit('Saved answer')
+  fireEvent.click(screen.getByRole('button', { name: 'Play question' }))
+  const signal = api.posts('/speech')[0][1]?.signal
+  expect((screen.getByRole('button', { name: 'Continue' }) as HTMLButtonElement).disabled).toBe(false)
+  fireEvent.click(screen.getByRole('button', { name: 'Continue' }))
+  expect(signal?.aborted).toBe(true)
+  await screen.findByText('Question 2 of 5')
+  await act(async () => pending.resolve(speechResponse()))
+  expect(createURL).not.toHaveBeenCalled()
+  expect(QuestionAudio.instances).toHaveLength(0)
+  expect(api.posts('/speech')).toHaveLength(1)
+  expect(api.posts('/continue')).toHaveLength(1)
+})
+
+test('Cancel Retry never restores an old voice clip and does not synthesize a replacement', async () => {
+  const api = mockSessionApi()
+  const { revokeURL } = stubQuestionAudio()
+  api.intercept((url) => url.endsWith('/speech') ? speechResponse() : undefined)
+  render(<Interview />); await start(); await submit('Saved answer'); await playQuestion()
+  await retry()
+  fireEvent.click(screen.getByRole('button', { name: 'Cancel Retry' }))
+  expect(screen.getByRole('button', { name: 'Play question' })).toBeDefined()
+  expect(screen.queryByRole('button', { name: 'Replay question' })).toBeNull()
+  expect(revokeURL).toHaveBeenCalledOnce()
+  expect(api.posts('/speech')).toHaveLength(1)
+  expect(api.posts('/attempts')).toHaveLength(1)
+  expect(api.posts('/diagnosis')).toHaveLength(1)
+})
+
+test.each([502, 503, 504])('voice %i is a non-mutation failure; Retry and Continue remain usable', async (status) => {
+  const api = mockSessionApi()
+  api.intercept((url) => url.endsWith('/speech') ? response({ detail: 'Voice playback is unavailable right now.' }, status) : undefined)
+  render(<Interview />); await start(); await submit('Saved answer')
+  fireEvent.click(screen.getByRole('button', { name: 'Play question' }))
+  await screen.findByText('Voice playback is unavailable right now.')
+  expect(screen.queryByText('Authentication is temporarily unavailable. Please try again.')).toBeNull()
+  expect(screen.queryByRole('button', { name: 'Recheck saved state' })).toBeNull()
+  expect((screen.getByRole('button', { name: 'Retry' }) as HTMLButtonElement).disabled).toBe(false)
+  expect((screen.getByRole('button', { name: 'Continue' }) as HTMLButtonElement).disabled).toBe(false)
+  expect(api.posts('/speech')).toHaveLength(1)
+  expect(api.posts('/attempts')).toHaveLength(1)
+  expect(api.posts('/continue')).toHaveLength(0)
+})
+
+test('restored saved review exposes Play without synthesizing or requesting diagnosis', async () => {
+  const api = mockSessionApi()
+  api.append('Saved current answer')
+  await restore(api)
+  await screen.findByRole('button', { name: 'Play question' })
+  expect(api.posts('/speech')).toHaveLength(0)
+  expect(api.posts('/diagnosis')).toHaveLength(0)
+})
+
+test('session restart disposes old voice immediately without synthesizing for the new session', async () => {
+  const api = mockSessionApi()
+  const { revokeURL } = stubQuestionAudio()
+  api.intercept((url, options) => {
+    if (url.endsWith('/speech')) return speechResponse()
+    if (url.endsWith('/attempts') && options?.method === 'POST') return response({ detail: 'Cannot submit this answer.' }, 400)
+  })
+  render(<Interview />); await start()
+  fireEvent.change(screen.getByRole('textbox', { name: 'Your answer' }), { target: { value: 'Unaccepted answer' } })
+  fireEvent.click(screen.getByRole('button', { name: 'Submit Attempt' }))
+  const restart = await screen.findByRole('button', { name: 'Start New Interview' })
+  await playQuestion()
+  fireEvent.click(restart)
+  expect(QuestionAudio.instances[0].pause).toHaveBeenCalledOnce()
+  expect(revokeURL).toHaveBeenCalledOnce()
+  await waitFor(() => expect(api.creations()).toBe(2))
+  await screen.findByRole('textbox', { name: 'Your answer' })
+  expect(api.posts('/speech')).toHaveLength(1)
+  expect(api.session().id).toBe('session-2')
+  expect(screen.queryByRole('button', { name: 'Replay question' })).toBeNull()
+})

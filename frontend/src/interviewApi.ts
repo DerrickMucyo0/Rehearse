@@ -1,4 +1,4 @@
-import { assertProtectedResponseCurrent, isAuthBoundaryError, protectedFetch, readProtectedJson } from './auth'
+import { assertProtectedResponseCurrent, isAuthBoundaryError, protectedFetch, readProtectedBlob, readProtectedJson } from './auth'
 import { DELIVERY_TIMING_REASONS, validLiveDeliveryMetrics } from './deliveryMetrics'
 import type { DeliveryMetrics, DeliveryTimingReason } from './deliveryMetrics'
 import { isScenarioType } from './scenarios'
@@ -132,6 +132,16 @@ export class SemanticDiagnosisError extends Error {
   constructor(message: string, status: number | null = null) {
     super(message)
     this.name = 'SemanticDiagnosisError'
+    this.status = status
+  }
+}
+
+export class VoicePlaybackError extends Error {
+  readonly status: number | null
+
+  constructor(status: number | null = null) {
+    super('Voice playback is unavailable right now.')
+    this.name = 'VoicePlaybackError'
     this.status = status
   }
 }
@@ -280,6 +290,46 @@ function validSemanticDiagnosis(value: unknown): value is SemanticDiagnosis {
 }
 
 const SEMANTIC_DIAGNOSIS_TIMEOUT_MS = 135_000
+
+const QUESTION_SPEECH_TIMEOUT_MS = 75_000
+const MAX_QUESTION_SPEECH_BYTES = 2 * 1024 * 1024
+
+export async function requestQuestionSpeech(
+  sessionId: string,
+  questionIndex: number,
+  signal: AbortSignal,
+): Promise<Blob> {
+  const timeout = AbortSignal.timeout(QUESTION_SPEECH_TIMEOUT_MS)
+  const checkCancellation = () => {
+    if (signal.aborted) throw new DOMException('Voice request cancelled.', 'AbortError')
+    if (timeout.aborted) throw new VoicePlaybackError()
+  }
+  checkCancellation()
+  let response: Response
+  try {
+    // This POST reads synthesized speech; it is not a persisted interview write.
+    response = await protectedFetch(`/api/sessions/${sessionId}/questions/${questionIndex}/speech`, {
+      method: 'POST', signal: AbortSignal.any([signal, timeout]),
+    })
+  } catch (error) {
+    if (isAuthBoundaryError(error)) throw error
+    checkCancellation()
+    throw new VoicePlaybackError()
+  }
+  checkCancellation()
+  assertProtectedResponseCurrent(response)
+  const mediaType = response.headers.get('Content-Type')?.split(';')[0].trim().toLowerCase()
+  if (response.status !== 200 || mediaType !== 'audio/mpeg') throw new VoicePlaybackError(response.status)
+  let audio: Blob
+  try { audio = await readProtectedBlob(response) } catch (error) {
+    if (isAuthBoundaryError(error)) throw error
+    checkCancellation()
+    throw new VoicePlaybackError(response.status)
+  }
+  checkCancellation()
+  if (audio.size === 0 || audio.size > MAX_QUESTION_SPEECH_BYTES) throw new VoicePlaybackError(response.status)
+  return audio
+}
 
 export async function getSemanticDiagnosis(
   sessionId: string,

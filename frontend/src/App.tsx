@@ -62,7 +62,7 @@ function Workspace({ auth }: { auth: AuthenticatedState }) {
     {practiceBusy && <p role="status">Finish the current Practice operation before navigating.</p>}
     {/* Idle drafts remain mounted only within this authenticated workspace. */}
     <div id="practice-panel" hidden={section !== 'practice'}>
-      <Interview onNavigationBusyChange={updateNavigationLock} onHistoryFactsChange={invalidateHistory} />
+      <Interview active={section === 'practice'} onNavigationBusyChange={updateNavigationLock} onHistoryFactsChange={invalidateHistory} />
     </div>
     {section === 'history' && <div id="history-panel">
       <History hydration={hydration} onPractice={() => navigate('practice')} />

@@ -240,6 +240,138 @@ async function finishRecording() {
 }
 function rememberedKeys() { return Object.keys(localStorage).filter((key) => key.startsWith(HISTORY_PREFIX)).sort() }
 
+class VoiceAudio {
+  static instances: VoiceAudio[] = []
+  src: string
+  currentTime = 0
+  onended: (() => void) | null = null
+  onerror: (() => void) | null = null
+  play = vi.fn().mockResolvedValue(undefined)
+  pause = vi.fn()
+  removeAttribute(name: string) { if (name === 'src') this.src = '' }
+  constructor(url: string) { this.src = url; VoiceAudio.instances.push(this) }
+}
+function mockVoiceAudio() {
+  VoiceAudio.instances = []
+  const createURL = vi.fn().mockReturnValue('blob:voice')
+  const revokeURL = vi.fn()
+  const NativeURL = URL
+  vi.stubGlobal('URL', class extends NativeURL { static createObjectURL = createURL; static revokeObjectURL = revokeURL })
+  vi.stubGlobal('Audio', VoiceAudio)
+  return { createURL, revokeURL }
+}
+function voiceResponse() { return new Response(new Uint8Array([0xff, 0xfb, 0x90, 0x64]), { headers: { 'Content-Type': 'audio/mpeg' } }) }
+
+test.each(['History', 'Progress'] as const)('%s hides Practice, stops voice, revokes its clip and preserves the draft without synthesis', async (destination) => {
+  const api = mockAppApi()
+  const { revokeURL } = mockVoiceAudio()
+  api.intercept((url) => url.endsWith('/speech') ? voiceResponse() : undefined)
+  render(<App />); await start()
+  fireEvent.change(screen.getByRole('textbox', { name: 'Your answer' }), { target: { value: 'Preserved draft' } })
+  fireEvent.click(screen.getByRole('button', { name: 'Play question' }))
+  await waitFor(() => expect(VoiceAudio.instances[0]?.play).toHaveBeenCalledOnce())
+  expect((nav(destination) as HTMLButtonElement).disabled).toBe(false)
+  go(destination)
+  expect(VoiceAudio.instances[0].pause).toHaveBeenCalledOnce()
+  expect(revokeURL).toHaveBeenCalledExactlyOnceWith('blob:voice')
+  expect(document.getElementById('practice-panel')?.hidden).toBe(true)
+  go('Practice')
+  expect((screen.getByRole('textbox', { name: 'Your answer' }) as HTMLTextAreaElement).value).toBe('Preserved draft')
+  expect(screen.getByRole('button', { name: 'Play question' })).toBeDefined()
+  expect(screen.queryByRole('button', { name: 'Replay question' })).toBeNull()
+  expect(api.posts('/speech')).toHaveLength(1)
+  expect(api.posts('/attempts')).toHaveLength(0)
+  expect(api.posts('/continue')).toHaveLength(0)
+  expect(api.posts('/diagnosis')).toHaveLength(0)
+})
+
+test.each(['History', 'Progress'] as const)('%s aborts pending synthesis and ignores a late binary response', async (destination) => {
+  const api = mockAppApi()
+  const { createURL } = mockVoiceAudio()
+  const pending = deferred<Response>()
+  api.intercept((url) => url.endsWith('/speech') ? pending.promise : undefined)
+  render(<App />); await start()
+  fireEvent.click(screen.getByRole('button', { name: 'Play question' }))
+  const signal = api.posts('/speech')[0][1]?.signal
+  expect((nav(destination) as HTMLButtonElement).disabled).toBe(false)
+  go(destination)
+  expect(signal?.aborted).toBe(true)
+  await act(async () => pending.resolve(voiceResponse()))
+  go('Practice')
+  expect(createURL).not.toHaveBeenCalled()
+  expect(VoiceAudio.instances).toHaveLength(0)
+  expect(screen.getByRole('button', { name: 'Play question' })).toBeDefined()
+  expect(api.posts('/speech')).toHaveLength(1)
+})
+
+test('Record Answer stops voice synchronously before microphone access and disables Play through recording', async () => {
+  const api = mockAppApi()
+  const { revokeURL } = mockVoiceAudio()
+  api.intercept((url) => url.endsWith('/speech') ? voiceResponse() : undefined)
+  render(<App />); await start()
+  fireEvent.click(screen.getByRole('button', { name: 'Play question' }))
+  await waitFor(() => expect(VoiceAudio.instances[0]?.play).toHaveBeenCalledOnce())
+  const permission = deferred<MediaStream>()
+  getUserMedia.mockImplementation(() => {
+    expect(VoiceAudio.instances[0].pause).toHaveBeenCalledOnce()
+    expect(revokeURL).toHaveBeenCalledOnce()
+    return permission.promise
+  })
+  fireEvent.click(screen.getByRole('button', { name: 'Record Answer' }))
+  expect(VoiceAudio.instances[0].pause).toHaveBeenCalledOnce()
+  expect((screen.getByRole('button', { name: 'Play question' }) as HTMLButtonElement).disabled).toBe(true)
+  await act(async () => permission.resolve(media))
+  await screen.findByRole('button', { name: 'Stop Recording' })
+  expect((screen.getByRole('button', { name: 'Play question' }) as HTMLButtonElement).disabled).toBe(true)
+  await finishRecording()
+  expect((screen.getByRole('button', { name: 'Play question' }) as HTMLButtonElement).disabled).toBe(false)
+  expect(api.posts('/speech')).toHaveLength(1)
+  expect(api.posts('/attempts')).toHaveLength(0)
+})
+
+test('Record Answer aborts pending speech before microphone access; ignored-abort response cannot play', async () => {
+  const api = mockAppApi()
+  const { createURL } = mockVoiceAudio()
+  const pending = deferred<Response>()
+  api.intercept((url) => url.endsWith('/speech') ? pending.promise : undefined)
+  render(<App />); await start()
+  fireEvent.click(screen.getByRole('button', { name: 'Play question' }))
+  const signal = api.posts('/speech')[0][1]?.signal
+  getUserMedia.mockImplementation(() => {
+    expect(signal?.aborted).toBe(true)
+    return Promise.resolve(media)
+  })
+  await record()
+  await act(async () => pending.resolve(voiceResponse()))
+  expect(createURL).not.toHaveBeenCalled()
+  expect(api.posts('/speech')).toHaveLength(1)
+})
+
+test('Logout disposes active voice without adding a synthesis request', async () => {
+  const api = mockAppApi()
+  const { revokeURL } = mockVoiceAudio()
+  api.intercept((url) => url.endsWith('/speech') ? voiceResponse() : undefined)
+  render(<App />); await start()
+  fireEvent.click(screen.getByRole('button', { name: 'Play question' }))
+  await waitFor(() => expect(VoiceAudio.instances[0]?.play).toHaveBeenCalledOnce())
+  fireEvent.click(screen.getByRole('button', { name: 'Logout' }))
+  await screen.findByRole('button', { name: 'Sign in' })
+  expect(VoiceAudio.instances[0].pause).toHaveBeenCalledOnce()
+  expect(revokeURL).toHaveBeenCalledOnce()
+  expect(api.posts('/speech')).toHaveLength(1)
+})
+
+test('authentication-specific 503 on speech retains the existing authentication notice', async () => {
+  const api = mockAppApi()
+  api.intercept((url) => url.endsWith('/speech') ? response({ detail: 'Authentication is temporarily unavailable.' }, 503) : undefined)
+  render(<App />); await start()
+  fireEvent.click(screen.getByRole('button', { name: 'Play question' }))
+  await screen.findByText(AUTH_UNAVAILABLE_MESSAGE)
+  expect(getAuthState().status).toBe('authenticated')
+  expect(api.posts('/speech')).toHaveLength(1)
+  expect(api.posts('/attempts')).toHaveLength(0)
+})
+
 test('unconfigured diagnosis renders only feedback unavailability and preserves authenticated review', async () => {
   const api = mockAppApi()
   api.intercept((url) => url.endsWith('/diagnosis')

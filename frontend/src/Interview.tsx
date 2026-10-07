@@ -3,6 +3,8 @@ import type { FormEvent } from 'react'
 import AudioAnswer from './AudioAnswer'
 import Comparison from './AttemptComparison'
 import InterviewSummary from './InterviewSummary.tsx'
+import QuestionVoice from './QuestionVoice'
+import type { QuestionVoiceHandle } from './QuestionVoice'
 import {
   ApiError, continueQuestion, getAttempts, getComparison, getSession,
   getSemanticDiagnosis, isConflictError, preparesNextQuestion, RoleplayUnavailableError, SemanticDiagnosisError, startInterview, submitAttempt,
@@ -100,12 +102,13 @@ async function readSavedView(id: string): Promise<SavedView> {
 }
 
 interface Props {
+  active?: boolean
   onSessionAccess?: (sessionId: string) => void
   onNavigationBusyChange?: (busy: boolean) => void
   onHistoryFactsChange?: () => void
 }
 
-export default function Interview({ onSessionAccess, onNavigationBusyChange, onHistoryFactsChange }: Props = {}) {
+export default function Interview({ active = true, onSessionAccess, onNavigationBusyChange, onHistoryFactsChange }: Props = {}) {
   const [workspace] = useState(() => {
     const auth = getAuthState()
     return auth.status === 'authenticated' ? { generation: auth.generation, storageKey: `${SESSION_KEY}:${auth.userId}` } : null
@@ -122,6 +125,7 @@ export default function Interview({ onSessionAccess, onNavigationBusyChange, onH
   const [recovery, setRecovery] = useState<Recovery | null>(null)
   const [diagnosis, setDiagnosis] = useState<DiagnosisState>({ status: 'idle' })
   const currentView = useRef<SavedView | null>(null)
+  const voice = useRef<QuestionVoiceHandle | null>(null)
   const diagnosisController = useRef<AbortController | null>(null)
   const continueController = useRef<AbortController | null>(null)
   const diagnosisGeneration = useRef(0)
@@ -185,6 +189,9 @@ export default function Interview({ onSessionAccess, onNavigationBusyChange, onH
     if (mounted.current) setDiagnosis({ status: 'idle' })
   }
   function showView(saved: SavedView) {
+    const previous = currentView.current?.session
+    if (previous?.id !== saved.session.id || previous?.current_question_index !== saved.session.current_question_index ||
+        previous?.current_question !== saved.session.current_question || saved.session.status !== 'active') voice.current?.invalidate()
     currentView.current = saved
     if (diagnosisOwner.current && !ownsDiagnosis(saved, diagnosisOwner.current)) invalidateDiagnosis()
     setView(saved)
@@ -224,6 +231,7 @@ export default function Interview({ onSessionAccess, onNavigationBusyChange, onH
   }
   async function start() {
     if (locked.current || transcribing) return
+    voice.current?.invalidate()
     invalidateDiagnosis()
     locked.current = true
     setOperation('Starting…')
@@ -242,6 +250,7 @@ export default function Interview({ onSessionAccess, onNavigationBusyChange, onH
     }
   }
   async function reconcileConflict(context: Recovery) {
+    voice.current?.invalidate()
     invalidateDiagnosis()
     clearDraft()
     try {
@@ -261,6 +270,7 @@ export default function Interview({ onSessionAccess, onNavigationBusyChange, onH
     if (!view || locked.current || blocked || session?.status !== 'active') return
     if (kind === 'submit' && (view.mode !== 'composing' || !draft.text.trim())) return
     if (kind === 'continue' && (view.mode !== 'review' || !view.attempts.length)) return
+    voice.current?.invalidate()
     invalidateDiagnosis()
     const context = recoveryFor(view, kind)
     const controller = kind === 'continue' ? new AbortController() : null
@@ -321,6 +331,7 @@ export default function Interview({ onSessionAccess, onNavigationBusyChange, onH
   }
   function retry() {
     if (!view || locked.current || blocked) return
+    voice.current?.invalidate()
     invalidateDiagnosis()
     clearDraft()
     setError('')
@@ -328,12 +339,14 @@ export default function Interview({ onSessionAccess, onNavigationBusyChange, onH
   }
   function cancelRetry() {
     if (!view || locked.current || blocked) return
+    voice.current?.invalidate()
     clearDraft()
     setError('')
     showView({ ...view, mode: 'review' })
   }
   async function recheck() {
     if (!recovery || locked.current) return
+    voice.current?.invalidate()
     invalidateDiagnosis()
     locked.current = true
     setOperation('Rechecking saved state…')
@@ -393,11 +406,15 @@ export default function Interview({ onSessionAccess, onNavigationBusyChange, onH
         <>
           <p aria-live="polite">Question {session.current_question_index + 1} of {session.total_questions}</p>
           <h2 id="current-question" aria-live="polite">{session.current_question}</h2>
+          {workspace && <QuestionVoice ref={voice} authGeneration={workspace.generation} sessionId={session.id}
+            questionIndex={session.current_question_index} question={session.current_question!}
+            active={active} disabled={blocked || audioBusy} />}
           {view.mode === 'composing' && (
             <form onSubmit={submit}>
               <AudioAnswer key={`${session.id}:${session.current_question_index}:${draftGeneration}`}
                 session={session} disabled={blocked} hasAnswer={draft.text.length > 0}
                 onBusyChange={setAudioBusy}
+                onBeforeRecording={() => voice.current?.invalidate()}
                 onTranscribing={setTranscribing} onConflict={() => void audioConflict()}
                 onUncertainTranscription={uncertainTranscription}
                 onTranscript={(text, measurementId) => setDraft((current) => current.text === '' ? { text, measurementId } : current)}

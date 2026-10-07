@@ -93,6 +93,20 @@ function accepted() {
     filename: 'answer-1.webm', content_type: 'audio/webm;codecs=opus', size_bytes: 5 }))
 }
 
+test('recording invalidates voice synchronously before microphone acquisition', async () => {
+  const stopVoice = vi.fn()
+  getUserMedia.mockImplementation(() => {
+    expect(stopVoice).toHaveBeenCalledOnce()
+    return Promise.resolve(media)
+  })
+  render(<AudioAnswer session={session} disabled={false} hasAnswer={false} onTranscript={vi.fn()}
+    onInvalidateMeasurement={vi.fn()} onTranscribing={vi.fn()} onBeforeRecording={stopVoice} />)
+  fireEvent.click(screen.getByRole('button', { name: 'Record Answer' }))
+  expect(stopVoice).toHaveBeenCalledOnce()
+  await screen.findByRole('button', { name: 'Stop Recording' })
+  expect(getUserMedia).toHaveBeenCalledOnce()
+})
+
 // Deterministic mocked backend: saving appends, while Continue alone advances.
 function interviewFetch({ active = session, transcriptions = [], submissionError = null }: {
   active?: InterviewSession

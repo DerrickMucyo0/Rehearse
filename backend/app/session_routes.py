@@ -45,6 +45,8 @@ from app.transcription import (
     TranscriptionFailed, TranscriptionResult, TranscriptionService,
     TranscriptionTimeout, TranscriptionUnavailable, get_transcription_service,
 )
+from app.voice import SpeechFailed, SpeechService, SpeechTimeout, SpeechUnavailable
+from app.voice_composition import get_speech_service
 
 router = APIRouter(prefix="/api/sessions", tags=["sessions"])
 
@@ -63,6 +65,54 @@ SemanticDiagnosisService = Annotated[
 ]
 
 RoleplayService = Annotated[RoleplayAdapter, Depends(get_roleplay_adapter)]
+
+QuestionSpeechService = Annotated[SpeechService, Depends(get_speech_service)]
+
+
+async def _current_speech_question(
+    sessions: InterviewSessionService, session_id: UUID, question_index: int,
+) -> str:
+    try:
+        session = await run_in_threadpool(sessions.get, session_id)
+    except SessionNotFound:
+        raise HTTPException(404, "Session not found.") from None
+    if (
+        session.status != "active"
+        or question_index != session.current_question_index
+        or question_index >= len(session.questions)
+    ):
+        raise HTTPException(404, "Session not found.") from None
+    return session.questions[session.current_question_index]
+
+
+@router.post("/{session_id}/questions/{question_index}/speech", response_class=Response)
+async def speak_question(
+    session_id: UUID, question_index: Annotated[int, Path(ge=0)], request: Request,
+    sessions: SessionService, speaker: QuestionSpeechService,
+    principal: AuthenticatedPrincipalDependency, auth_store: AuthSessionStoreDependency,
+) -> Response:
+    # Reject on the first nonempty chunk, without buffering an arbitrary body.
+    # The browser supplies identifiers only; text always comes from owned storage.
+    async for chunk in request.stream():
+        if chunk:
+            raise HTTPException(422, "Speech requests do not accept a body.")
+    text = await _current_speech_question(sessions, session_id, question_index)
+    try:
+        speech = await speaker.synthesize(text)
+    except SpeechUnavailable:
+        raise HTTPException(503, "Voice playback is unavailable right now.") from None
+    except SpeechTimeout:
+        raise HTTPException(504, "Voice playback is unavailable right now.") from None
+    except SpeechFailed:
+        raise HTTPException(502, "Voice playback is unavailable right now.") from None
+    # Both database operations have completed before provider work. Recheck the
+    # initiating login and the current question in fresh, short reads afterwards.
+    await run_in_threadpool(revalidate_authenticated_principal, principal, auth_store)
+    if await _current_speech_question(sessions, session_id, question_index) != text:
+        raise HTTPException(404, "Session not found.") from None
+    return Response(speech.audio, media_type="audio/mpeg", headers={
+        "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff",
+    })
 
 
 @router.post("", response_model=InterviewSession, status_code=201)
