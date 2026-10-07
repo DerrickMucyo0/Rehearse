@@ -5,7 +5,7 @@ import { DELIVERY_TIMING_REASONS } from './deliveryMetrics'
 import type { DeliveryMetrics } from './deliveryMetrics'
 import semanticDiagnosisContract from './fixtures/semanticDiagnosis.v1.json?raw'
 import { authenticateTestWorkspace } from './authTestUtils'
-import { AUTH_CONTEXT_HEADER, getAuthState } from './auth'
+import { AUTH_CONTEXT_HEADER, AUTH_UNAVAILABLE_MESSAGE, getAuthState } from './auth'
 
 const session: InterviewSession = {
   id: 'session-1', status: 'active', current_question_index: 2, current_question: 'Third',
@@ -468,7 +468,8 @@ test.each([
   [503, 'Feedback is unavailable right now. You can still retry or continue.'],
   [504, 'Feedback took too long. You can still retry or continue.'],
   [422, malformedDiagnosisMessage], [500, malformedDiagnosisMessage],
-] as const)('semantic HTTP %s uses fixed feedback text without reading the private body', async (status, message) => {
+] as const)('semantic HTTP %s uses fixed feedback text without consuming or exposing the original error body', async (status, message) => {
+  const before = getAuthState()
   const response = json({ detail: privateDiagnosisMarker }, status)
   const jsonSpy = vi.spyOn(response, 'json')
   const fetchMock = mockResponse(response)
@@ -478,8 +479,41 @@ test.each([
   expect((error as Error).message).not.toContain(privateDiagnosisMarker)
   expect(error).not.toHaveProperty('ambiguousWrite')
   expect(jsonSpy).not.toHaveBeenCalled()
+  expect(getAuthState()).toEqual(before)
   expect(fetchMock).toHaveBeenCalledTimes(1)
 })
+
+test('unconfigured diagnosis 503 uses feedback-unavailable text without an authentication warning', async () => {
+  const before = getAuthState()
+  const fetchMock = mockResponse(json({ detail: 'Semantic diagnosis is not configured.' }, 503))
+  await expect(diagnose()).rejects.toMatchObject({ name: 'SemanticDiagnosisError', status: 503,
+    message: 'Feedback is unavailable right now. You can still retry or continue.' })
+  expect(getAuthState()).toEqual(before)
+  expect(fetchMock).toHaveBeenCalledTimes(1)
+})
+
+test('authentication 503 on a diagnosis request retains the genuine auth warning', async () => {
+  const before = getAuthState()
+  const fetchMock = mockResponse(json({ detail: 'Authentication is temporarily unavailable.' }, 503))
+  await expect(diagnose()).rejects.toMatchObject({ name: 'SemanticDiagnosisError', status: 503,
+    message: 'Feedback is unavailable right now. You can still retry or continue.' })
+  expect(getAuthState()).toEqual({ ...before, notice: AUTH_UNAVAILABLE_MESSAGE })
+  expect(fetchMock).toHaveBeenCalledTimes(1)
+})
+
+test.each([[401, 'signed_out'], [403, 'stale']] as const)(
+  'diagnosis %s preserves the %s auth transition without reading the body or replaying', async (status, expected) => {
+    const response = json({ detail: privateDiagnosisMarker }, status)
+    const clone = vi.spyOn(response, 'clone')
+    const body = vi.spyOn(response, 'json')
+    const fetchMock = mockResponse(response)
+    await expect(diagnose()).rejects.toMatchObject({ name: 'AuthBoundaryError', status })
+    expect(getAuthState()).toEqual({ status: expected })
+    expect(clone).not.toHaveBeenCalled()
+    expect(body).not.toHaveBeenCalled()
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+  },
+)
 
 test('semantic network failure discards private exception text without retrying or marking an uncertain write', async () => {
   const fetchMock = vi.fn().mockRejectedValue(new Error(privateDiagnosisMarker))

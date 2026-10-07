@@ -2,6 +2,7 @@
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { afterEach, beforeEach, expect, test, vi } from 'vitest'
 import App from './App'
+import { AUTH_UNAVAILABLE_MESSAGE, getAuthState } from './auth'
 import type { Attempt, InterviewSession, SemanticDiagnosis, SpeakingMetrics } from './interviewApi'
 import { personalizedDrillForFocus } from './personalizedDrills'
 
@@ -238,6 +239,24 @@ async function finishRecording() {
   await screen.findByText('Recording stopped. Ready to send.')
 }
 function rememberedKeys() { return Object.keys(localStorage).filter((key) => key.startsWith(HISTORY_PREFIX)).sort() }
+
+test('unconfigured diagnosis renders only feedback unavailability and preserves authenticated review', async () => {
+  const api = mockAppApi()
+  api.intercept((url) => url.endsWith('/diagnosis')
+    ? response({ detail: 'Semantic diagnosis is not configured.' }, 503) : undefined)
+  render(<App />); await start(); await submit('Saved first attempt')
+  const feedback = await screen.findByRole('region', { name: 'Answer feedback' })
+  await within(feedback).findByText('Feedback is unavailable right now. You can still retry or continue.')
+  expect(screen.queryByText(AUTH_UNAVAILABLE_MESSAGE)).toBeNull()
+  expect(document.body.textContent).not.toContain('Semantic diagnosis is not configured.')
+  expect(screen.getByRole('button', { name: 'Logout' })).toBeTruthy()
+  expect((screen.getByRole('button', { name: 'Retry' }) as HTMLButtonElement).disabled).toBe(false)
+  expect((screen.getByRole('button', { name: 'Continue' }) as HTMLButtonElement).disabled).toBe(false)
+  expect(getAuthState()).toMatchObject({ status: 'authenticated', notice: null })
+  expect(api.posts('/diagnosis')).toHaveLength(1)
+  expect(api.posts('/attempts')).toHaveLength(1)
+  expect(api.posts('/continue')).toHaveLength(0)
+})
 
 test('navigation preserves the same idle typed editor while displaying objective Progress', async () => {
   mockAppApi(); render(<App />); await start()

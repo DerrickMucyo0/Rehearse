@@ -151,13 +151,95 @@ test.each([[401, 'signed_out'], [403, 'stale']] as const)(
   },
 )
 
-test('protected 503 preserves exact auth generation and reports temporary unavailability without replay', async () => {
+test.each(['/api/sessions', '/api/sessions/A/questions/0/attempts/1/diagnosis', '/api/history/summaries'])(
+  'authentication 503 on %s preserves exact auth generation and reports unavailability without replay', async (path) => {
+    const mock = await authenticate()
+    const before = getAuthState()
+    const body = { detail: 'Authentication is temporarily unavailable.' }
+    mock.mockResolvedValue(json(body, 503))
+    const response = await protectedFetch(path, { method: 'POST' })
+    expect(response.status).toBe(503)
+    expect(getAuthState()).toEqual({ ...before, notice: AUTH_UNAVAILABLE_MESSAGE })
+    expect(await readProtectedJson(response)).toEqual(body)
+    expect(mock).toHaveBeenCalledTimes(1)
+  },
+)
+
+test.each([
+  { detail: 'Semantic diagnosis is not configured.' },
+  { detail: 'PRIVATE_PROVIDER_DETAIL' },
+  {}, null, [],
+  { detail: 'Authentication is temporarily unavailable.', extra: 'PRIVATE_PROVIDER_DETAIL' },
+  { detail: 'Authentication is temporarily unavailable. ' },
+])('non-authentication 503 keeps the workspace and original response unchanged (case %#)', async (body) => {
   const mock = await authenticate()
   const before = getAuthState()
-  mock.mockResolvedValue(json({ detail: 'private server detail' }, 503))
-  const response = await protectedFetch('/api/sessions', { method: 'POST' })
+  mock.mockResolvedValue(json(body, 503))
+  const response = await protectedFetch('/api/sessions/A/questions/0/attempts/1/diagnosis', { method: 'POST' })
   expect(response.status).toBe(503)
-  expect(getAuthState()).toEqual({ ...before, notice: AUTH_UNAVAILABLE_MESSAGE })
+  expect(getAuthState()).toEqual(before)
+  expect(await readProtectedJson(response)).toEqual(body)
+  expect(mock).toHaveBeenCalledTimes(1)
+})
+
+test('non-JSON 503 stays local and leaves the original response readable', async () => {
+  const mock = await authenticate()
+  const before = getAuthState()
+  mock.mockResolvedValue(new Response('PRIVATE_NON_JSON_ERROR', { status: 503 }))
+  const response = await protectedFetch('/api/sessions/A/questions/0/attempts/1/diagnosis')
+  expect(getAuthState()).toEqual(before)
+  expect(await response.text()).toBe('PRIVATE_NON_JSON_ERROR')
+  expect(mock).toHaveBeenCalledTimes(1)
+})
+
+test('a feature 503 does not clear an existing authentication-unavailable notice', async () => {
+  const mock = await authenticate()
+  mock.mockResolvedValueOnce(json({ detail: 'Authentication is temporarily unavailable.' }, 503))
+  await protectedFetch('/api/sessions')
+  const before = getAuthState()
+  mock.mockResolvedValueOnce(json({ detail: 'Semantic diagnosis is not configured.' }, 503))
+  await protectedFetch('/api/sessions/A/questions/0/attempts/1/diagnosis')
+  expect(getAuthState()).toEqual(before)
+  expect(mock).toHaveBeenCalledTimes(2)
+})
+
+test.each(['auth detail', 'parse failure'] as const)('late 503 %s classification cannot update authenticated B', async (outcome) => {
+  const mock = await authenticate()
+  const body = deferred<unknown>()
+  const response = json({}, 503)
+  const clone = json({}, 503)
+  const read = vi.spyOn(clone, 'json').mockReturnValue(body.promise)
+  vi.spyOn(response, 'clone').mockReturnValue(clone)
+  mock.mockResolvedValueOnce(response).mockResolvedValueOnce(json({ user_id: userB, request_context: 'context-B' }))
+  const pending = protectedFetch('/api/sessions/A/questions/0/attempts/1/diagnosis').catch((cause: unknown) => cause)
+  await vi.waitFor(() => expect(read).toHaveBeenCalledOnce())
+  await bootstrapAuth()
+  const newer = getAuthState()
+  if (outcome === 'auth detail') body.resolve({ detail: 'Authentication is temporarily unavailable.' })
+  else body.reject(new SyntaxError('PRIVATE_PARSER_DETAIL'))
+  expect(await pending).toBeInstanceOf(AuthBoundaryError)
+  expect(getAuthState()).toEqual(newer)
+  expect(mock).toHaveBeenCalledTimes(2)
+})
+
+test.each(['auth detail', 'parse failure'] as const)('caller cancellation during 503 %s classification propagates', async (outcome) => {
+  const mock = await authenticate()
+  const before = getAuthState()
+  const body = deferred<unknown>()
+  const response = json({}, 503)
+  const clone = json({}, 503)
+  const read = vi.spyOn(clone, 'json').mockReturnValue(body.promise)
+  vi.spyOn(response, 'clone').mockReturnValue(clone)
+  mock.mockResolvedValue(response)
+  const controller = new AbortController()
+  const pending = protectedFetch('/api/sessions/A/questions/0/attempts/1/diagnosis', { signal: controller.signal })
+    .catch((cause: unknown) => cause)
+  await vi.waitFor(() => expect(read).toHaveBeenCalledOnce())
+  controller.abort()
+  if (outcome === 'auth detail') body.resolve({ detail: 'Authentication is temporarily unavailable.' })
+  else body.reject(new SyntaxError('PRIVATE_PARSER_DETAIL'))
+  expect(await pending).toMatchObject({ name: 'AbortError' })
+  expect(getAuthState()).toEqual(before)
   expect(mock).toHaveBeenCalledTimes(1)
 })
 
