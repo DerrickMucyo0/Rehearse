@@ -21,7 +21,7 @@ from fastapi.routing import iter_route_contexts
 from fastapi.testclient import TestClient
 from sqlalchemy import event, insert, select, update
 
-from app import auth_http, history_routes, session_routes
+from app import auth_http, auth_routes, history_routes, session_routes
 from app.auth import AuthenticatedPrincipal, IssuedAuthSession, VerifiedExternalIdentity
 from app.auth_http import AUTH_REQUEST_CONTEXT_HEADER, AUTH_SESSION_COOKIE_NAME
 from app.auth_persistence import PostgreSQLAuthSessionStore
@@ -768,17 +768,56 @@ def test_all_persisted_routes_require_authentication_and_health_remains_public(m
             result.update(dependencies(dependency))
         return result
 
+    expected_data = {
+        ("/api/sessions", "POST"), ("/api/sessions/{session_id}", "GET"),
+        ("/api/sessions/{session_id}/questions/{question_index}/attempts", "POST"),
+        ("/api/sessions/{session_id}/questions/{question_index}/attempts", "GET"),
+        ("/api/sessions/{session_id}/questions/{question_index}/continue", "POST"),
+        ("/api/sessions/{session_id}/questions/{question_index}/comparison", "GET"),
+        ("/api/sessions/{session_id}/questions/{question_index}/attempts/{attempt_number}/diagnosis", "POST"),
+        ("/api/sessions/{session_id}/audio", "POST"),
+        ("/api/sessions/{session_id}/transcriptions", "POST"),
+        ("/api/history/summaries", "GET"), ("/api/history/summaries", "POST"),
+        ("/api/sessions/{session_id}/history-detail", "GET"),
+    }
+    public_lifecycle = {("/api/auth/login", "GET"), ("/api/auth/callback", "GET")}
+    bootstrap = ("/api/auth/me", "GET")
+    logout = ("/api/auth/logout", "POST")
+    expected = expected_data | public_lifecycle | {bootstrap, logout, ("/api/health", "GET")}
+    observed = set()
     data_routes = []
     health_routes = []
     for route in iter_route_contexts(app.routes):
-        if getattr(route, "path", None) == "/api/health":
+        if not getattr(route, "path", "").startswith("/api/"):
+            continue
+        endpoints = {(route.path, method) for method in route.methods}
+        observed.update(endpoints)
+        assert endpoints <= expected, route.path
+        calls = dependencies(route.dependant)
+        if endpoints == {("/api/health", "GET")}:
             health_routes.append(route)
-            assert auth_http.require_authenticated_principal not in dependencies(route.dependant)
-        elif getattr(route, "path", "").startswith("/api/"):
+            assert calls == set()
+        elif endpoints <= public_lifecycle:
+            assert auth_routes.get_auth_settings in calls
+            assert auth_routes.get_login_transaction_store in calls
+            assert auth_routes.get_oidc_login_client in calls
+            assert auth_http.require_authenticated_principal not in calls
+            assert auth_http.get_auth_session_store not in calls
+        elif endpoints == {bootstrap}:
+            assert auth_routes.get_bootstrap_principal in calls
+            assert auth_http.get_auth_session_store in calls
+            assert auth_http.require_authenticated_principal not in calls
+        elif endpoints == {logout}:
+            assert auth_http.require_authenticated_principal in calls
+            assert auth_http.get_auth_session_store in calls
+        else:
             data_routes.append(route)
-            assert auth_http.require_authenticated_principal in dependencies(route.dependant), route.path
+            assert endpoints <= expected_data
+            assert auth_http.require_authenticated_principal in calls, route.path
+            assert auth_http.get_auth_session_store in calls
+    assert observed == expected
     assert len(health_routes) == 1
-    assert data_routes
+    assert len(data_routes) == 12
     history = [route for route in data_routes if route.path == "/api/history/summaries" or route.path.endswith("/history-detail")]
     assert len(history) == 3
     assert {method for route in history if route.path == "/api/history/summaries" for method in route.methods} == {"GET", "POST"}

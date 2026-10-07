@@ -68,6 +68,8 @@ def test_every_backend_data_route_is_authenticated_and_only_health_is_public():
         ("/api/sessions/{session_id}/transcriptions", "POST"),
         ("/api/history/summaries", "GET"), ("/api/history/summaries", "POST"),
         ("/api/sessions/{session_id}/history-detail", "GET"),
+        ("/api/auth/login", "GET"), ("/api/auth/callback", "GET"),
+        ("/api/auth/me", "GET"), ("/api/auth/logout", "POST"),
     }
     observed = set()
     for route in iter_route_contexts(app.routes):
@@ -77,6 +79,18 @@ def test_every_backend_data_route_is_authenticated_and_only_health_is_public():
         calls = dependency_calls(route.dependant)
         if route.path == "/api/health":
             assert calls == set()
+        elif route.path in ("/api/auth/login", "/api/auth/callback"):
+            from app import auth_routes
+            assert auth_routes.get_auth_settings in calls
+            assert auth_routes.get_login_transaction_store in calls
+            assert auth_routes.get_oidc_login_client in calls
+            assert auth_http.require_authenticated_principal not in calls
+            assert auth_http.get_auth_session_store not in calls
+        elif route.path == "/api/auth/me":
+            from app import auth_routes
+            assert auth_routes.get_bootstrap_principal in calls
+            assert auth_http.get_auth_session_store in calls
+            assert auth_http.require_authenticated_principal not in calls
         else:
             assert auth_http.require_authenticated_principal in calls
             assert auth_http.get_auth_session_store in calls

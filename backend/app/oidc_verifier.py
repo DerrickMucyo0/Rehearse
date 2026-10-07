@@ -13,7 +13,7 @@ import secrets
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from urllib.parse import urlsplit
+from urllib.parse import parse_qsl, urlsplit
 
 from authlib.integrations.httpx_client import AsyncOAuth2Client
 from authlib.oidc.core import CodeIDToken
@@ -23,12 +23,17 @@ from joserfc.jwk import KeySet
 
 from app.auth import OIDCVerifier, VerifiedExternalIdentity
 from app.oidc_failure import OIDCFailure, OIDCFailureKind
+from app.oidc_login import IssuedLoginTransaction
 
 _ASYMMETRIC_ALGORITHMS = frozenset({
     "RS256", "RS384", "RS512", "PS256", "PS384", "PS512",
     "ES256", "ES384", "ES512", "EdDSA",
 })
 OIDC_HTTP_TIMEOUT_SECONDS = 10
+_AUTHORIZATION_PARAMETERS = frozenset({
+    "client_id", "redirect_uri", "response_type", "scope", "state", "nonce",
+    "code_challenge", "code_challenge_method", "response_mode",
+})
 
 
 def _valid_text(value: object) -> bool:
@@ -93,7 +98,7 @@ async def _check_provider_status(response: httpx2.Response) -> None:
 
 
 class AuthlibOIDCVerifier(OIDCVerifier):
-    """One code exchange; strict verified ID-token claims; no retry or issuance."""
+    """Trusted authorization URLs and one code exchange; no retry or issuance."""
 
     def __init__(
         self, configuration: OIDCConfiguration, *,
@@ -105,6 +110,56 @@ class AuthlibOIDCVerifier(OIDCVerifier):
         self._configuration = configuration
         self._transport = transport
         self._clock = clock
+
+    def _client(self) -> AsyncOAuth2Client:
+        config = self._configuration
+        return AsyncOAuth2Client(
+            client_id=config.client_id, client_secret=config.client_secret,
+            redirect_uri=config.redirect_uri, code_challenge_method="S256",
+            token_endpoint_auth_method="client_secret_basic" if config.client_secret is not None else "none",
+            transport=self._transport, timeout=OIDC_HTTP_TIMEOUT_SECONDS,
+            trust_env=False, follow_redirects=False,
+            event_hooks={"response": [_check_provider_status]},
+        )
+
+    async def _provider_metadata(self, client: AsyncOAuth2Client) -> dict:
+        config = self._configuration
+        response = await client.request(
+            "GET", config.issuer.rstrip("/") + "/.well-known/openid-configuration", withhold_token=True,
+        )
+        response.raise_for_status()
+        metadata = response.json()
+        if (type(metadata) is not dict or metadata.get("issuer") != config.issuer or
+                not _https_endpoint(metadata.get("authorization_endpoint")) or
+                not _https_endpoint(metadata.get("token_endpoint")) or
+                not _https_endpoint(metadata.get("jwks_uri"))):
+            raise OIDCFailure(OIDCFailureKind.UNAVAILABLE)
+        return metadata
+
+    async def authorization_url(self, *, transaction: IssuedLoginTransaction) -> str:
+        """One trusted discovery request; no token exchange or browser return URL."""
+        try:
+            if type(transaction) is not IssuedLoginTransaction:
+                raise OIDCFailure(OIDCFailureKind.UNAVAILABLE)
+            async with self._client() as client:
+                metadata = await self._provider_metadata(client)
+                endpoint = metadata["authorization_endpoint"]
+                # Authlib preserves endpoint query parameters. Reject any that
+                # would make the security parameters ambiguous or duplicated.
+                if any(name in _AUTHORIZATION_PARAMETERS for name, _ in
+                       parse_qsl(urlsplit(endpoint).query, keep_blank_values=True)):
+                    raise OIDCFailure(OIDCFailureKind.UNAVAILABLE)
+                url, _ = client.create_authorization_url(
+                    endpoint, response_type="code", scope="openid",
+                    state=transaction.state, nonce=transaction.nonce,
+                    code_challenge=transaction.code_challenge,
+                    code_challenge_method="S256",
+                )
+                return url
+        except Exception:
+            pass
+        # Discard provider/transport exceptions and secret-bearing chains.
+        raise OIDCFailure(OIDCFailureKind.UNAVAILABLE) from None
 
     def _now(self) -> float:
         now = self._clock()
@@ -158,24 +213,8 @@ class AuthlibOIDCVerifier(OIDCVerifier):
                 raise OIDCFailure(OIDCFailureKind.INVALID_TOKEN)
             self._now()
             config = self._configuration
-            async with AsyncOAuth2Client(
-                client_id=config.client_id, client_secret=config.client_secret,
-                redirect_uri=config.redirect_uri, code_challenge_method="S256",
-                token_endpoint_auth_method="client_secret_basic" if config.client_secret is not None else "none",
-                transport=self._transport, timeout=OIDC_HTTP_TIMEOUT_SECONDS,
-                trust_env=False, follow_redirects=False,
-                event_hooks={"response": [_check_provider_status]},
-            ) as client:
-                metadata_response = await client.request(
-                    "GET", config.issuer.rstrip("/") + "/.well-known/openid-configuration", withhold_token=True,
-                )
-                metadata_response.raise_for_status()
-                metadata = metadata_response.json()
-                if (type(metadata) is not dict or metadata.get("issuer") != config.issuer or
-                        not _https_endpoint(metadata.get("authorization_endpoint")) or
-                        not _https_endpoint(metadata.get("token_endpoint")) or
-                        not _https_endpoint(metadata.get("jwks_uri"))):
-                    raise OIDCFailure(OIDCFailureKind.UNAVAILABLE)
+            async with self._client() as client:
+                metadata = await self._provider_metadata(client)
                 phase = OIDCFailureKind.EXCHANGE_FAILED
                 token = await client.fetch_token(
                     metadata["token_endpoint"], grant_type="authorization_code",
