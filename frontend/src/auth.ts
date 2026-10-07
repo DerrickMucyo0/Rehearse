@@ -7,6 +7,7 @@ export type AuthState =
 
 export const AUTH_UNAVAILABLE_MESSAGE = 'Authentication is temporarily unavailable. Please try again.'
 export const AUTH_CONTEXT_HEADER = 'X-Rehearse-Auth-Context'
+const AUTH_UNAVAILABLE_DETAIL = 'Authentication is temporarily unavailable.'
 
 export class AuthBoundaryError extends Error {
   readonly status: number | null
@@ -130,6 +131,19 @@ function protectedApiPath(path: string): boolean {
     !['/api/auth/me', '/api/auth/login', '/api/auth/callback'].includes(url.pathname)
 }
 
+async function isAuthenticationUnavailable(path: string, response: Response): Promise<boolean> {
+  if (new URL(path, 'https://rehearse.invalid').pathname === '/api/auth/logout') return true
+  // Feature endpoints also use 503. Recognize only the backend's fixed auth
+  // failure contract, without consuming the caller's body or exposing its text.
+  try {
+    const value: unknown = await response.clone().json()
+    return typeof value === 'object' && value !== null && !Array.isArray(value) &&
+      Object.keys(value).length === 1 && 'detail' in value && value.detail === AUTH_UNAVAILABLE_DETAIL
+  } catch {
+    return false
+  }
+}
+
 export async function protectedFetch(path: string, options: RequestInit = {}): Promise<Response> {
   const current = workspace
   if (current === null || state.status !== 'authenticated') throw new AuthBoundaryError('Sign in to continue.')
@@ -157,8 +171,13 @@ export async function protectedFetch(path: string, options: RequestInit = {}): P
     replaceWorkspace({ status: status === 401 ? 'signed_out' : 'stale' })
     throw new AuthBoundaryError(status === 401 ? 'Sign in to continue.' : 'Your sign-in changed. Reload current sign-in.', status)
   }
-  if (response.status === 503 && state.status === 'authenticated') {
-    publish({ ...state, notice: AUTH_UNAVAILABLE_MESSAGE })
+  if (response.status === 503) {
+    const authUnavailable = await isAuthenticationUnavailable(path, response)
+    assertWorkspace(current)
+    if (signal.aborted) throw new DOMException('Request cancelled.', 'AbortError')
+    if (authUnavailable && state.status === 'authenticated') {
+      publish({ ...state, notice: AUTH_UNAVAILABLE_MESSAGE })
+    }
   }
   responseWorkspaces.set(response, { workspace: current, signal })
   return response

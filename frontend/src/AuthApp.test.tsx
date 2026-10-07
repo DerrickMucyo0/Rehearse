@@ -117,8 +117,8 @@ test('switching auth generation clears A draft and scoped restore ID without rea
   expect(calls(mock, `/api/sessions/${sessionId}`)).toHaveLength(0)
 })
 
-test('503 protected operation retains workspace and never automatically repeats the mutation', async () => {
-  const mock = api((path) => path === '/api/sessions' ? json({}, 503) : undefined)
+test('authentication 503 on a protected operation retains workspace and never automatically repeats the mutation', async () => {
+  const mock = api((path) => path === '/api/sessions' ? json({ detail: 'Authentication is temporarily unavailable.' }, 503) : undefined)
   render(<App />); await workspace()
   fireEvent.click(screen.getByRole('button', { name: 'Start Interview' }))
   await screen.findByText(auth.AUTH_UNAVAILABLE_MESSAGE)
