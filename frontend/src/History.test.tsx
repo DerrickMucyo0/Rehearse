@@ -29,7 +29,7 @@ const measurement = {
 function summary(id = FIRST, status: 'active' | 'completed' = 'active'): HistorySummary {
   const finalized = status === 'active' ? 2 : 5
   return {
-    session_id: id, status, created_at: '2026-10-05T10:00:00Z',
+    session_id: id, scenario_type: 'job_interview', status, created_at: '2026-10-05T10:00:00Z',
     completed_at: status === 'completed' ? '2026-10-05T13:00:00Z' : null,
     current_question_number: status === 'active' ? 3 : null, total_questions: 5,
     finalized_question_count: finalized, questions_practiced_count: status === 'active' ? 3 : 5,
@@ -89,6 +89,18 @@ test('server-discovered active and completed rows display facts without raw UUID
   expect(view.container.textContent).not.toContain(FIRST)
   expect(view.container.textContent).not.toContain(SECOND)
   expect(view.container.textContent).not.toMatch(/\b(improved|better|worse|score|readiness|confidence)\b/i)
+})
+test('History rows show the canonical saved label for all four scenarios', async () => {
+  const scenarioTypes = ['job_interview', 'public_speaking', 'thesis_defense', 'salary_negotiation'] as const
+  const labels = ['Job Interview', 'Public Speaking', 'Thesis Defense', 'Salary Negotiation']
+  hydrate.mockResolvedValue(state(scenarioTypes.map((scenario_type, index) => ({
+    ...summary(`00000000-0000-4000-8000-${String(index + 1).padStart(12, '0')}`), scenario_type,
+  }))))
+  const view = render(<History {...props()} />)
+  await screen.findByText('Salary Negotiation')
+  const rows = view.container.querySelectorAll('.history-summary')
+  expect([...rows].map((row) => within(row as HTMLElement).getByText('Scenario').nextElementSibling?.textContent)).toEqual(labels)
+  expect(fetch).not.toHaveBeenCalled()
 })
 test('legacy browser registry is ignored and server sessions alone appear', async () => {
   localStorage.setItem('rehearse.history.v1', JSON.stringify([THIRD]))

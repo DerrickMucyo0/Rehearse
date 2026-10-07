@@ -77,14 +77,15 @@ def test_retention_rejects_ambiguous_naive_timestamps():
         record.unlinked_deletion_eligible(linked=False, now=datetime(2026, 1, 2, tzinfo=timezone.utc))
 
 
-def test_alembic_has_login_transaction_head_after_ownership_and_emits_postgresql_ddl_offline(monkeypatch):
+def test_alembic_has_scenario_head_after_login_transactions_and_emits_postgresql_ddl_offline(monkeypatch):
     monkeypatch.setenv("DATABASE_URL", "postgresql+psycopg://offline@localhost/rehearse_dev")
     output = StringIO()
     config = Config(str(ROOT / "alembic.ini"), output_buffer=output)
     config.attributes["skip_logging"] = True
     scripts = ScriptDirectory.from_config(config)
-    assert scripts.get_heads() == ["0004_oidc_login_transactions"]
-    assert scripts.get_revision("head").down_revision == "0003_auth_user_ownership"
+    assert scripts.get_heads() == ["0005_session_scenarios"]
+    assert scripts.get_revision("head").down_revision == "0004_oidc_login_transactions"
+    assert scripts.get_revision("0004_oidc_login_transactions").down_revision == "0003_auth_user_ownership"
     assert scripts.get_revision("0003_auth_user_ownership").down_revision == "0002_pause_delivery_metrics"
     assert scripts.get_revision("0002_pause_delivery_metrics").down_revision == "0001_database_foundation"
     assert scripts.get_revision("0001_database_foundation").down_revision is None
@@ -96,6 +97,8 @@ def test_alembic_has_login_transaction_head_after_ownership_and_emits_postgresql
     assert "TIMESTAMP WITH TIME ZONE" in sql
     assert "FOREIGN KEY(measurement_id, session_id, question_index)" in sql
     assert "CREATE TRIGGER preserve_measurement" in sql
+    assert "ADD COLUMN scenario_type TEXT COLLATE \"C\" DEFAULT 'job_interview' NOT NULL" in sql
+    assert "ADD CONSTRAINT ck_sessions_scenario_type" in sql
     for column in DELIVERY_COLUMNS:
         assert f"ADD COLUMN {column}" in sql
     for constraint in DELIVERY_CONSTRAINTS:
@@ -104,6 +107,7 @@ def test_alembic_has_login_transaction_head_after_ownership_and_emits_postgresql
     output.truncate(0)
     command.downgrade(config, "head:base", sql=True)
     sql = output.getvalue()
+    assert sql.index("DROP COLUMN scenario_type") < sql.index("DROP TABLE oidc_login_transactions")
     for column in DELIVERY_COLUMNS:
         assert f"DROP COLUMN {column}" in sql
     assert sql.index("DROP COLUMN delivery_measurement_version") < sql.index("DROP TABLE question_attempts")

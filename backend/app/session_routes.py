@@ -33,6 +33,7 @@ from app.sessions import (
     InterviewSessionService,
     SessionConflict,
     SessionNotFound,
+    StartSessionRequest,
 )
 
 from app.transcription import (
@@ -58,8 +59,10 @@ SemanticDiagnosisService = Annotated[
 
 
 @router.post("", response_model=InterviewSession, status_code=201)
-def start_session(response: Response, sessions: SessionService) -> InterviewSession:
-    session = sessions.start()
+def start_session(
+    response: Response, sessions: SessionService, body: StartSessionRequest | None = None,
+) -> InterviewSession:
+    session = sessions.start(body.scenario_type if body is not None else "job_interview")
     response.headers["Location"] = f"/api/sessions/{session.id}"
     return session
 

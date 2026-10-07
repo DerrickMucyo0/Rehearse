@@ -194,11 +194,22 @@ def test_browser_owner_claims_cannot_change_application_creation_owner(harness):
     claimed = harness.logins[1].principal
     supplied = {**headers(harness.logins[0]), "X-User-ID": str(claimed.user_id),
                 "X-Auth-Session-ID": str(claimed.auth_session_id)}
+    before = persisted(harness.factory)
+    rejected = harness.client.post(f"/api/sessions?user_id={claimed.user_id}", headers=supplied,
+                                  json={"scenario_type": "public_speaking", "user_id": str(claimed.user_id)})
+    assert rejected.status_code == 422
+    assert any(error["type"] == "extra_forbidden" and error["loc"] == ["body", "user_id"]
+               for error in rejected.json()["detail"])
+    assert persisted(harness.factory) == before
+
     response = harness.client.post(f"/api/sessions?user_id={claimed.user_id}", headers=supplied,
-                                   json={"user_id": str(claimed.user_id)})
+                                   json={"scenario_type": "public_speaking"})
     assert response.status_code == 201
+    assert response.json()["scenario_type"] == "public_speaking"
     identifier = UUID(response.json()["id"])
-    assert persisted(harness.factory)["interview_sessions"][identifier]["user_id"] == harness.logins[0].principal.user_id
+    stored = persisted(harness.factory)["interview_sessions"][identifier]
+    assert stored["scenario_type"] == "public_speaking"
+    assert stored["user_id"] == harness.logins[0].principal.user_id
     assert_not_found(harness.request("get", identifier, 1))
 
 

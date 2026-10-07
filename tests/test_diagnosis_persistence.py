@@ -4,6 +4,7 @@ All measurement facts are synthetic persisted scalars. No provider, semantic
 adapter, environment configuration, or transcription calculation is used.
 """
 
+from types import MappingProxyType
 from uuid import uuid4
 
 import httpx
@@ -11,7 +12,7 @@ import pytest
 from sqlalchemy import event, insert, select
 from sqlalchemy.orm import Session, sessionmaker
 
-from app import delivery_metrics, semantic_diagnosis_adapter, semantic_diagnosis_eval
+from app import delivery_metrics, scenarios, semantic_diagnosis_adapter, semantic_diagnosis_eval
 from app import sessions as session_module
 from app import speaking_metrics
 from app.comparisons import (
@@ -134,13 +135,17 @@ def stored_rows(factory):
 def test_first_attempt_uses_exact_stored_question_answer_and_indices(
         sessions, postgres_session_factory, monkeypatch):
     question = " \tPourquoi café?\r\n決定 👩🏽‍💻 e\u0301 \u00a0"
-    original_questions = session_module.QUESTIONS
-    monkeypatch.setattr(session_module, "QUESTIONS", (question, *original_questions[1:]))
+    original_questions = scenarios.SCENARIO_QUESTIONS["job_interview"]
+    monkeypatch.setattr(scenarios, "SCENARIO_QUESTIONS", MappingProxyType({
+        **scenarios.SCENARIO_QUESTIONS, "job_interview": (question, *original_questions[1:]),
+    }))
     created = sessions.start()
     request_answer = " \n  Café / 咖啡 — e\u0301\tsecond line\r\n "
     first = submit(sessions, created.id, answer=request_answer)
     created.questions[0] = "Changed returned question"
-    monkeypatch.setattr(session_module, "QUESTIONS", ("Replacement question",))
+    monkeypatch.setattr(scenarios, "SCENARIO_QUESTIONS", MappingProxyType({
+        **scenarios.SCENARIO_QUESTIONS, "job_interview": ("Replacement question",),
+    }))
 
     context = sessions.get_diagnosis_context(created.id, 0, 1)
     with postgres_session_factory() as database:
@@ -196,7 +201,9 @@ def test_requested_first_middle_and_latest_contexts_survive_retry_continue_and_c
     assert contexts[3].previous_attempt.speaking == explicit.comparison
     assert contexts[3].previous_attempt.delivery == explicit.delivery_comparison
 
-    monkeypatch.setattr(session_module, "QUESTIONS", ())
+    monkeypatch.setattr(scenarios, "SCENARIO_QUESTIONS", MappingProxyType({
+        **scenarios.SCENARIO_QUESTIONS, "job_interview": (),
+    }))
     advanced = advance(sessions, created.id, revision=3)
     assert advanced.current_question_index == 1
     assert {number: sessions.get_diagnosis_context(created.id, 0, number) for number in (1, 2, 3)} == contexts

@@ -1,9 +1,12 @@
 import { assertProtectedResponseCurrent, isAuthBoundaryError, protectedFetch, readProtectedJson } from './auth'
 import { DELIVERY_TIMING_REASONS, validLiveDeliveryMetrics } from './deliveryMetrics'
 import type { DeliveryMetrics, DeliveryTimingReason } from './deliveryMetrics'
+import { isScenarioType } from './scenarios'
+import type { ScenarioType } from './scenarios'
 
 export interface InterviewSession {
   id: string
+  scenario_type: ScenarioType
   status: 'active' | 'completed'
   current_question_index: number
   current_question: string | null
@@ -137,6 +140,7 @@ function nullableString(value: unknown): value is string | null {
 }
 function validSession(value: unknown): value is InterviewSession {
   return object(value) && typeof value.id === 'string' &&
+    isScenarioType(value.scenario_type) &&
     (value.status === 'active' || value.status === 'completed') &&
     nonnegativeInteger(value.current_question_index) && nullableString(value.current_question) &&
     nonnegativeInteger(value.current_question_latest_attempt_number) &&
@@ -189,8 +193,9 @@ export function getSession(id: string): Promise<InterviewSession> {
   return request(`/api/sessions/${id}`, (value): value is InterviewSession => validSession(value) && value.id === id)
 }
 
-export function startInterview(): Promise<InterviewSession> {
-  return request('/api/sessions', validSession, { method: 'POST' })
+export function startInterview(scenarioType: ScenarioType = 'job_interview'): Promise<InterviewSession> {
+  if (!isScenarioType(scenarioType)) return Promise.reject(new ApiError('The request was not accepted. Choose a practice scenario.', 422))
+  return request('/api/sessions', validSession, jsonBody({ scenario_type: scenarioType }))
 }
 
 export function submitAttempt(session: InterviewSession, answer: string, measurementId: string | null = null): Promise<AttemptSubmission> {

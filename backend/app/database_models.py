@@ -17,6 +17,8 @@ from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, validates
 from sqlalchemy.types import TypeDecorator
 
+from app.scenarios import ScenarioType, questions_for_scenario
+
 MEASUREMENT_VERSION = "speaking-metrics-v1"
 UNLINKED_MEASUREMENT_RETENTION = timedelta(hours=24)
 
@@ -168,6 +170,10 @@ class StoredInterviewSession(Base):
     __tablename__ = "interview_sessions"
     __table_args__ = (
         CheckConstraint(
+            "scenario_type IN ('job_interview', 'public_speaking', 'thesis_defense', 'salary_negotiation')",
+            name="ck_sessions_scenario_type",
+        ),
+        CheckConstraint(
             "CASE WHEN jsonb_typeof(questions) = 'array' "
             "THEN jsonb_array_length(questions) = 5 ELSE false END",
             name="ck_sessions_question_snapshot",
@@ -197,6 +203,9 @@ class StoredInterviewSession(Base):
         nullable=True,
     )
     questions: Mapped[tuple[str, ...]] = mapped_column(QuestionSnapshot(), nullable=False)
+    scenario_type: Mapped[ScenarioType] = mapped_column(
+        Text(collation="C"), nullable=False, default="job_interview", server_default="job_interview",
+    )
     current_question_index: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
     status: Mapped[str] = mapped_column(Text, default="active", server_default="active")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
@@ -208,6 +217,11 @@ class StoredInterviewSession(Base):
                 any(not isinstance(item, str) or not item.strip() or "\x00" in item for item in value)):
             raise ValueError("Question snapshot must contain five nonempty text questions.")
         return tuple(value)
+
+    @validates("scenario_type")
+    def validate_scenario_type(self, key, value):
+        questions_for_scenario(value)
+        return value
 
 
 class TranscriptionMeasurement(Base):

@@ -7,6 +7,7 @@ import * as historyApi from './historyApi'
 import type { HistoryDetail } from './historyApi'
 import { personalizedDrillForFocus } from './personalizedDrills'
 import type { Attempt, AttemptComparison, DeliveryMetricChange, InterviewSession, MetricChange, SemanticDiagnosis } from './interviewApi'
+import type { ScenarioType } from './scenarios'
 
 const storageKey = 'rehearse.session_id:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
 const questions = ['Question one', 'Question two', 'Question three', 'Question four', 'Question five']
@@ -19,7 +20,7 @@ const summaryAttemptId = (questionIndex: number, number: number) =>
 function completedHistoryDetail(id = summarySessionId, counts = [1, 1, 1, 1, 1], numbers = counts): HistoryDetail {
   const totalAttempts = counts.reduce((total, count) => total + count, 0)
   return {
-    summary: { session_id: id, status: 'completed', created_at: '2026-10-04T11:00:00Z',
+    summary: { session_id: id, scenario_type: 'job_interview', status: 'completed', created_at: '2026-10-04T11:00:00Z',
       completed_at: '2026-10-04T12:00:01Z', current_question_number: null, total_questions: 5,
       finalized_question_count: 5, questions_practiced_count: 5, total_attempt_count: totalAttempts,
       total_retry_count: totalAttempts - 5, measured_final_answer_count: 0,
@@ -55,8 +56,8 @@ function metric(before: number, after: number): Metric {
   return { before, after, delta: after - before, before_unavailable_reason: null, after_unavailable_reason: null,
     comparable: true, comparison_unavailable_reason: null }
 }
-function freshSession(id = 'session-1'): InterviewSession {
-  return { id, status: 'active', current_question_index: 0, current_question: questions[0], questions,
+function freshSession(id = 'session-1', scenarioType: ScenarioType = 'job_interview'): InterviewSession {
+  return { id, scenario_type: scenarioType, status: 'active', current_question_index: 0, current_question: questions[0], questions,
     answers: [], current_question_latest_attempt_number: 0 }
 }
 function response(data: unknown, status = 200) { return new Response(JSON.stringify(data), { status }) }
@@ -101,10 +102,11 @@ function mockSessionApi(initial = freshSession()) {
     const override = intercept?.(url, options)
     if (override) return await override
     if (url === '/api/sessions' && options?.method === 'POST') {
+      const body = JSON.parse(options.body as string) as { scenario_type: ScenarioType }
       creations += 1
       attempts.clear()
       comparisons.clear()
-      session = freshSession(`session-${creations}`)
+      session = freshSession(`session-${creations}`, body.scenario_type)
       return response(session, 201)
     }
     const diagnosisMatch = url.match(/^\/api\/sessions\/([^/]+)\/questions\/(\d+)\/attempts\/(\d+)\/diagnosis$/)
@@ -228,6 +230,93 @@ function expectReviewActionsEnabled() {
   expect((screen.getByRole('button', { name: /^Retry(?: Again)?$/ }) as HTMLButtonElement).disabled).toBe(false)
   expect((screen.getByRole('button', { name: 'Continue' }) as HTMLButtonElement).disabled).toBe(false)
 }
+
+test('setup shows four described scenarios and changes selection without creating a session', () => {
+  const api = mockSessionApi()
+  render(<Interview />)
+  const choices = within(screen.getByRole('group', { name: 'Practice scenario' })).getAllByRole('radio')
+  expect(choices).toHaveLength(4)
+  expect((choices[0] as HTMLInputElement).checked).toBe(true)
+  for (const choice of choices) {
+    expect(choice.closest('label')?.querySelector('.scenario-description')?.textContent).toBeTruthy()
+    fireEvent.click(choice)
+  }
+  expect((choices[3] as HTMLInputElement).checked).toBe(true)
+  expect(api.fetchMock).not.toHaveBeenCalled()
+  expect(sessionStorage.getItem(storageKey)).toBeNull()
+})
+
+test.each([
+  ['job_interview', 'Job Interview'], ['public_speaking', 'Public Speaking'],
+  ['thesis_defense', 'Thesis Defense'], ['salary_negotiation', 'Salary Negotiation'],
+] as const)('explicit Start creates %s and displays its persisted scenario', async (scenarioType, label) => {
+  const api = mockSessionApi()
+  render(<Interview />)
+  fireEvent.click(screen.getByRole('radio', { name: new RegExp(`^${label}`) }))
+  expect(api.creations()).toBe(0)
+  await start()
+  expect(postedBody(api, '/api/sessions')).toEqual({ scenario_type: scenarioType })
+  expect(api.creations()).toBe(1)
+  expect(screen.getByText(`Scenario: ${label}`)).toBeTruthy()
+  expect(screen.queryByRole('group', { name: 'Practice scenario' })).toBeNull()
+})
+
+test('creation locks the scenario choices and repeated Start sends only the chosen scenario once', async () => {
+  const api = mockSessionApi()
+  const pending = deferredResponse()
+  api.intercept((url, options) => url === '/api/sessions' && options?.method === 'POST' ? pending.promise : undefined)
+  render(<Interview />)
+  fireEvent.click(screen.getByRole('radio', { name: /^Thesis Defense/ }))
+  const button = screen.getByRole('button', { name: 'Start Interview' })
+  fireEvent.click(button); fireEvent.click(button)
+  const choices = screen.getAllByRole('radio')
+  expect(choices.every((choice) => choice.matches(':disabled'))).toBe(true)
+  expect(api.posts('/api/sessions')).toHaveLength(1)
+  expect(postedBody(api, '/api/sessions')).toEqual({ scenario_type: 'thesis_defense' })
+  await act(async () => { pending.resolve(response(freshSession('session-1', 'thesis_defense'), 201)) })
+  await screen.findByText('Scenario: Thesis Defense')
+})
+
+test('restored Practice labels the canonical saved scenario without creating another session', async () => {
+  const api = mockSessionApi(freshSession('existing-session', 'salary_negotiation'))
+  await restore(api)
+  expect(screen.getByText('Scenario: Salary Negotiation')).toBeTruthy()
+  expect(api.creations()).toBe(0)
+  expect(screen.queryByRole('group', { name: 'Practice scenario' })).toBeNull()
+})
+
+test('choosing a new scenario on completion leaves the saved label and session unchanged until Start', async () => {
+  const api = mockSessionApi({ ...freshSession('session-1', 'thesis_defense'), status: 'completed',
+    current_question_index: 5, current_question: null, answers: questions.map(() => 'Saved answer') })
+  sessionStorage.setItem(storageKey, api.session().id)
+  render(<Interview />)
+  await screen.findByRole('heading', { name: 'Interview Complete' })
+  fireEvent.click(screen.getByRole('radio', { name: /^Public Speaking/ }))
+  expect(screen.getByText('Scenario: Thesis Defense')).toBeTruthy()
+  expect(api.creations()).toBe(0)
+  expect(sessionStorage.getItem(storageKey)).toBe('session-1')
+  fireEvent.click(screen.getByRole('button', { name: 'Start New Interview' }))
+  await screen.findByText('Scenario: Public Speaking')
+  expect(postedBody(api, '/api/sessions')).toEqual({ scenario_type: 'public_speaking' })
+})
+
+test('the existing recovery restart offers scenarios and creates only after explicit Start', async () => {
+  const api = mockSessionApi()
+  render(<Interview />); await start()
+  api.intercept((url, options) => url.endsWith('/attempts') && options?.method === 'POST'
+    ? Promise.reject(new TypeError('Response lost')) : undefined)
+  fireEvent.change(screen.getByRole('textbox'), { target: { value: 'Unsaved answer' } })
+  fireEvent.click(screen.getByRole('button', { name: 'Submit Attempt' }))
+  await screen.findByRole('alert')
+  fireEvent.click(screen.getByRole('radio', { name: 'Salary Negotiation' }))
+  expect(api.creations()).toBe(1)
+  expect(screen.getByText('Scenario: Job Interview')).toBeTruthy()
+  expect((screen.getByRole('textbox') as HTMLTextAreaElement).value).toBe('Unsaved answer')
+  fireEvent.click(screen.getByRole('button', { name: 'Start New Interview' }))
+  await screen.findByText('Scenario: Salary Negotiation')
+  expect(api.creations()).toBe(2)
+  expect(postedBody(api, '/api/sessions', 1)).toEqual({ scenario_type: 'salary_negotiation' })
+})
 
 test('a fresh question composes and stores only the session ID for reload', async () => {
   const api = mockSessionApi()

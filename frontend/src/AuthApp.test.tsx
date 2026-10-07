@@ -8,10 +8,10 @@ import { authenticateTestWorkspace } from './authTestUtils'
 const userA = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
 const userB = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'
 const sessionId = '11111111-1111-4111-8111-111111111111'
-const session = { id: sessionId, status: 'active', current_question_index: 0,
+const session = { id: sessionId, scenario_type: 'job_interview', status: 'active', current_question_index: 0,
   current_question: 'Immediate practice question', current_question_latest_attempt_number: 0,
   questions: ['Immediate practice question', 'Two', 'Three', 'Four', 'Five'], answers: [] }
-const summary = { session_id: sessionId, status: 'active', created_at: '2026-10-06T12:00:00Z',
+const summary = { session_id: sessionId, scenario_type: 'job_interview', status: 'active', created_at: '2026-10-06T12:00:00Z',
   completed_at: null, current_question_number: 1, total_questions: 5, finalized_question_count: 0,
   questions_practiced_count: 0, total_attempt_count: 0, total_retry_count: 0,
   measured_final_answer_count: 0, last_submitted_at: null, last_saved_activity_at: '2026-10-06T12:00:00Z', finalized_points: [] }

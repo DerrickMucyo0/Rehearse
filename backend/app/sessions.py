@@ -17,15 +17,16 @@ from app.database_models import (
 )
 from app.delivery_metrics import DeliveryMetrics
 from app.diagnosis import DiagnosisContext, build_diagnosis_context
+from app.scenarios import SCENARIO_QUESTIONS, ScenarioType, questions_for_scenario
 from app.speaking_metrics import SpeakingMetrics
 
-QUESTIONS = (
-    "Tell me about yourself.",
-    "Tell me about a challenging problem you solved.",
-    "Tell me about a time you worked with a team.",
-    "Why are you interested in this opportunity?",
-    "What is one project you are proud of and why?",
-)
+QUESTIONS = SCENARIO_QUESTIONS["job_interview"]
+
+
+class StartSessionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    scenario_type: ScenarioType = "job_interview"
 
 
 class AttemptRequest(BaseModel):
@@ -60,6 +61,7 @@ class Attempt(BaseModel):
 
 class InterviewSession(BaseModel):
     id: UUID
+    scenario_type: ScenarioType = "job_interview"
     status: Literal["active", "completed"] = "active"
     current_question_index: int = 0
     questions: list[str]
@@ -114,9 +116,12 @@ class InterviewSessionService:
             StoredInterviewSession.user_id == self._principal.user_id,
         )
 
-    def start(self) -> InterviewSession:
+    def start(self, scenario_type: ScenarioType = "job_interview") -> InterviewSession:
+        questions = questions_for_scenario(scenario_type)
         with self._session_factory.begin() as database:
-            stored = StoredInterviewSession(questions=QUESTIONS, user_id=self._principal.user_id)
+            stored = StoredInterviewSession(
+                questions=questions, scenario_type=scenario_type, user_id=self._principal.user_id,
+            )
             database.add(stored)
             database.flush()
             return self._response(stored, [])
@@ -422,7 +427,7 @@ class InterviewSessionService:
                 latest[attempt.question_index] = attempt
         current = latest.get(stored.current_question_index) if stored.status == "active" else None
         return InterviewSession(
-            id=stored.id, status=stored.status,
+            id=stored.id, scenario_type=stored.scenario_type, status=stored.status,
             current_question_index=stored.current_question_index,
             questions=list(stored.questions),
             answers=[latest[index].answer_text for index in range(stored.current_question_index) if index in latest],

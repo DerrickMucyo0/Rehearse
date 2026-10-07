@@ -16,7 +16,7 @@ function completedDetail(counts = [1, 1, 1, 1, 1], numbers = counts): HistoryDet
   const totalAttempts = counts.reduce((total, count) => total + count, 0)
   return {
     summary: {
-      session_id: sessionId, status: 'completed', created_at: createdAt, completed_at: completedAt,
+      session_id: sessionId, scenario_type: 'job_interview', status: 'completed', created_at: createdAt, completed_at: completedAt,
       current_question_number: null, total_questions: 5, finalized_question_count: 5, questions_practiced_count: 5,
       total_attempt_count: totalAttempts, total_retry_count: totalAttempts - 5, measured_final_answer_count: 0,
       last_submitted_at: submittedAt(4), last_saved_activity_at: completedAt,

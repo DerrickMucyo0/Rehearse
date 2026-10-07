@@ -21,6 +21,7 @@ from sqlalchemy.orm import Session
 from app.auth import AuthenticatedPrincipal
 from app.comparisons import MeasurementSnapshot, delivery_snapshot
 from app.database_models import QuestionAttempt, StoredInterviewSession, TranscriptionMeasurement
+from app.scenarios import ScenarioType, questions_for_scenario
 from app.sessions import SessionNotFound
 
 Nonnegative = Annotated[int, Field(strict=True, ge=0)]
@@ -105,6 +106,7 @@ class FinalizedPoint(ReadModel):
 
 class SessionSummary(ReadModel):
     session_id: UUID
+    scenario_type: ScenarioType = "job_interview"
     status: Literal["active", "completed"]
     created_at: AwareDatetime
     completed_at: AwareDatetime | None
@@ -373,6 +375,7 @@ class HistoryReadService:
         rows = database.execute(
             select(
                 StoredInterviewSession.id.label("session_id"), StoredInterviewSession.status,
+                StoredInterviewSession.scenario_type,
                 StoredInterviewSession.questions, StoredInterviewSession.current_question_index,
                 StoredInterviewSession.created_at, StoredInterviewSession.completed_at,
                 counts.c.question_index, counts.c.attempt_count,
@@ -403,6 +406,11 @@ class HistoryReadService:
     @staticmethod
     def _project_session(rows) -> _SessionRead:
         first = rows[0]
+        scenario_type = first["scenario_type"]
+        try:
+            questions_for_scenario(scenario_type)
+        except ValueError:
+            raise HistoryIntegrityError() from None
         questions = first["questions"]
         current = first["current_question_index"]
         status = first["status"]
@@ -457,7 +465,8 @@ class HistoryReadService:
         total_attempts = sum(row["attempt_count"] for row in per_question.values())
         return _SessionRead(
             summary=SessionSummary(
-                session_id=first["session_id"], status=status, created_at=first["created_at"],
+                session_id=first["session_id"], scenario_type=scenario_type,
+                status=status, created_at=first["created_at"],
                 completed_at=completed, current_question_number=current + 1 if status == "active" else None,
                 total_questions=len(questions), finalized_question_count=current,
                 questions_practiced_count=len(per_question), total_attempt_count=total_attempts,
