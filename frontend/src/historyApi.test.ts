@@ -11,7 +11,7 @@ const attemptId = '00000000-0000-0000-0000-000000000001'
 const created = '2026-10-01T10:00:00.000001Z'
 const submitted = '2026-10-01T10:00:01.000002Z'
 function summary(): HistorySummary {
-  return { session_id: id, status: 'active', created_at: created, completed_at: null, current_question_number: 1,
+  return { session_id: id, scenario_type: 'job_interview', status: 'active', created_at: created, completed_at: null, current_question_number: 1,
     total_questions: 5, finalized_question_count: 0, questions_practiced_count: 0, total_attempt_count: 0,
     total_retry_count: 0, measured_final_answer_count: 0, last_submitted_at: null, last_saved_activity_at: created, finalized_points: [] }
 }
@@ -62,6 +62,25 @@ test('GET discovery is a same-origin authenticated no-store read without browser
 test('empty server page is valid and exact', async () => {
   mock({ items: [], next_cursor: null })
   expect(await getHistorySummaries()).toEqual({ items: [], next_cursor: null })
+})
+test.each(['job_interview', 'public_speaking', 'thesis_defense', 'salary_negotiation'] as const)(
+  'discovery preserves canonical saved scenario %s', async (scenarioType) => {
+    const item = { ...summary(), scenario_type: scenarioType }
+    mock({ items: [item], next_cursor: null })
+    expect((await getHistorySummaries()).items[0].scenario_type).toBe(scenarioType)
+  },
+)
+test.each([undefined, null, 1, '', 'Job Interview', 'JOB_INTERVIEW', ' job_interview', 'unknown'])(
+  'discovery rejects missing or noncanonical saved scenario (case %#)', async (scenarioType) => {
+    mock({ items: [{ ...summary(), scenario_type: scenarioType }], next_cursor: null })
+    await expect(getHistorySummaries()).rejects.toMatchObject({ name: 'HistoryApiError', status: 200 })
+  },
+)
+test('detail rejects a noncanonical saved scenario before displaying history', async () => {
+  const value = detail()
+  Object.assign(value.summary, { scenario_type: 'unknown' })
+  mock(value)
+  await expect(getHistoryDetail(id)).rejects.toMatchObject({ name: 'HistoryApiError', status: 200 })
 })
 test('passes an opaque cursor only as a continuation and bounded limit', async () => {
   const calls = mock({ items: [summary()], next_cursor: 'next-page' })

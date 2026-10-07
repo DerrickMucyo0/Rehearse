@@ -19,7 +19,7 @@ test('provider-free delivery review, measured retry comparison and finalized his
     filler_unavailable_reason: null, timed_utterance_span_seconds: 2, estimated_words_per_minute: 90, timing_unavailable_reason: null }
   const saved: { id: string; question_index: number; attempt_number: number; answer: string;
     submitted_at: string; measurement_id: string | null }[] = []
-  const session = () => ({ id, status: 'active', current_question_index: current, current_question: questions[current],
+  const session = () => ({ id, scenario_type: 'job_interview', status: 'active', current_question_index: current, current_question: questions[current],
     current_question_latest_attempt_number: saved.filter((attempt) => attempt.question_index === current).length,
     questions, answers: current > 0 ? [saved.at(-1)!.answer] : [] })
   const measurement = (index: number) => ({ measurement_version: 'speaking-metrics-v1', measurement_source: metrics.source,
@@ -27,7 +27,7 @@ test('provider-free delivery review, measured retry comparison and finalized his
     filler_unavailable_reason: metrics.filler_unavailable_reason, timed_utterance_span_seconds: metrics.timed_utterance_span_seconds,
     estimated_words_per_minute: metrics.estimated_words_per_minute, timing_unavailable_reason: metrics.timing_unavailable_reason,
     delivery_metrics: deliveries[index] })
-  const summary = () => ({ session_id: id, status: 'active', created_at: date, completed_at: null,
+  const summary = () => ({ session_id: id, scenario_type: 'job_interview', status: 'active', created_at: date, completed_at: null,
     current_question_number: current + 1, total_questions: 5, finalized_question_count: current,
     questions_practiced_count: saved.length ? 1 : 0, total_attempt_count: saved.length,
     total_retry_count: Math.max(0, saved.length - 1), measured_final_answer_count: current,

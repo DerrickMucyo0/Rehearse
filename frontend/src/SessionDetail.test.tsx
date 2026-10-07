@@ -51,7 +51,7 @@ function overview(
   const attemptCount = questions.reduce((total, question) => total + question.attempt_count, 0)
   return {
     summary: {
-      session_id: sessionId, status: completed ? 'completed' : 'active', created_at: CREATED,
+      session_id: sessionId, scenario_type: 'job_interview', status: completed ? 'completed' : 'active', created_at: CREATED,
       completed_at: completed ? COMPLETED : null, current_question_number: completed ? null : 2,
       total_questions: 5, finalized_question_count: finalizedCount, questions_practiced_count: practiced,
       total_attempt_count: attemptCount, total_retry_count: attemptCount - practiced,
@@ -118,6 +118,20 @@ function signalAt(index: number): AbortSignal {
   expect(signal).toBeInstanceOf(AbortSignal)
   return signal!
 }
+
+test.each([
+  ['job_interview', 'Job Interview'], ['public_speaking', 'Public Speaking'],
+  ['thesis_defense', 'Thesis Defense'], ['salary_negotiation', 'Salary Negotiation'],
+] as const)('session detail shows saved scenario %s', async (scenarioType, label) => {
+  const detail = overview()
+  detail.summary.scenario_type = scenarioType
+  readDetail.mockResolvedValue(detail)
+  render(<SessionDetail {...props()} />)
+  await screen.findByText(label)
+  expect(screen.getByText('Scenario').nextElementSibling?.textContent).toBe(label)
+  expect(readDetail).toHaveBeenCalledOnce()
+  expect(forbiddenFetch).not.toHaveBeenCalled()
+})
 
 function savedHeadings(questionNumber: number): string[] {
   return within(screen.getByRole('region', { name: `Saved attempts for Question ${questionNumber}` }))

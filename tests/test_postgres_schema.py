@@ -115,7 +115,7 @@ def test_all_migrations_upgrade_empty_database_and_downgrade_deterministically(p
         assert initial_columns.isdisjoint(DELIVERY_FIELDS)
         command.upgrade(config, "head")
         assert set(inspect(connection).get_table_names()) == TABLES | {"alembic_version"}
-        assert connection.scalar(text("SELECT version_num FROM alembic_version")) == "0004_oidc_login_transactions"
+        assert connection.scalar(text("SELECT version_num FROM alembic_version")) == "0005_session_scenarios"
         assert {column["name"] for column in inspect(connection).get_columns("transcription_measurements")} == initial_columns | set(DELIVERY_FIELDS)
         command.downgrade(config, "0001_database_foundation")
         assert {column["name"] for column in inspect(connection).get_columns("transcription_measurements")} == initial_columns
@@ -130,7 +130,7 @@ def test_migrated_schema_matches_orm_metadata(connection):
                             if isinstance(constraint, CheckConstraint)}
     assert actual_constraints == expected_constraints
     assert DELIVERY_CONSTRAINTS <= actual_constraints
-    assert connection.scalar(text("SELECT version_num FROM alembic_version")) == "0004_oidc_login_transactions"
+    assert connection.scalar(text("SELECT version_num FROM alembic_version")) == "0005_session_scenarios"
 
 
 def test_populated_foundation_upgrade_preserves_legacy_rows_links_and_speaking_facts(connection):
@@ -140,7 +140,8 @@ def test_populated_foundation_upgrade_preserves_legacy_rows_links_and_speaking_f
     measurements = Table("transcription_measurements", baseline, autoload_with=connection)
     attempts = Table("question_attempts", baseline, autoload_with=connection)
     sessions = Table("interview_sessions", baseline, autoload_with=connection)
-    identifier = add_session(connection)
+    identifier = uuid4()
+    connection.execute(insert(sessions).values(id=identifier, questions=list(QUESTIONS)))
     available_id, unavailable_id = uuid4(), uuid4()
     connection.execute(insert(measurements), [
         {

@@ -26,7 +26,7 @@ const semanticDiagnosis: SemanticDiagnosis = {
 }
 function response(value: unknown, status = 200) { return new Response(JSON.stringify(value), { status }) }
 function initialSession(id = SESSION_ID): InterviewSession {
-  return { id, status: 'active', current_question_index: 0, current_question: questions[0],
+  return { id, scenario_type: 'job_interview', status: 'active', current_question_index: 0, current_question: questions[0],
     current_question_latest_attempt_number: 0, questions, answers: [] }
 }
 function deferred<T>() {
@@ -115,7 +115,7 @@ function mockAppApi(initial = initialSession()) {
       return { question_index: questionIndex, attempt_id: attempt?.id ?? '55555555-5555-4555-8555-555555555555',
         attempt_number: attempt?.attempt_number ?? 1, submitted_at: submittedAt, measurement: linkedMeasurement(attempt) }
     })
-    return { session_id: forSession.id, status: forSession.status, created_at: submittedAt,
+    return { session_id: forSession.id, scenario_type: forSession.scenario_type, status: forSession.status, created_at: submittedAt,
       completed_at: forSession.status === 'completed' ? submittedAt : null,
       current_question_number: forSession.status === 'active' ? forSession.current_question_index + 1 : null,
       total_questions: questions.length, finalized_question_count: forSession.current_question_index,
@@ -716,7 +716,7 @@ test('server pagination persists across navigation and manual retry resumes only
 test('a stale history response cannot overwrite a newer successful Practice invalidation', async () => {
   const api = mockAppApi(); render(<App />); await start()
   const pending = deferred<Response>()
-  const initialSummary = { session_id: SESSION_ID, status: 'active', created_at: submittedAt, completed_at: null,
+  const initialSummary = { session_id: SESSION_ID, scenario_type: 'job_interview', status: 'active', created_at: submittedAt, completed_at: null,
     current_question_number: 1, total_questions: 5, finalized_question_count: 0, questions_practiced_count: 0,
     total_attempt_count: 0, total_retry_count: 0, measured_final_answer_count: 0, last_submitted_at: null,
     last_saved_activity_at: submittedAt, finalized_points: [] }

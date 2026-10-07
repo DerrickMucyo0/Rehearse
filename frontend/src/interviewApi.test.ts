@@ -6,9 +6,10 @@ import type { DeliveryMetrics } from './deliveryMetrics'
 import semanticDiagnosisContract from './fixtures/semanticDiagnosis.v1.json?raw'
 import { authenticateTestWorkspace } from './authTestUtils'
 import { AUTH_CONTEXT_HEADER, AUTH_UNAVAILABLE_MESSAGE, getAuthState } from './auth'
+import type { ScenarioType } from './scenarios'
 
 const session: InterviewSession = {
-  id: 'session-1', status: 'active', current_question_index: 2, current_question: 'Third',
+  id: 'session-1', scenario_type: 'job_interview', status: 'active', current_question_index: 2, current_question: 'Third',
   current_question_latest_attempt_number: 3, questions: ['First', 'Second', 'Third', 'Fourth'], answers: ['One', 'Two'],
 }
 const attempt: Attempt = {
@@ -93,6 +94,38 @@ test('starts a session with the required current-question attempt revision', asy
   expect(await startInterview()).toEqual(fresh)
   expect(fetchMock.mock.calls[0][0]).toBe('/api/sessions')
   expect(fetchMock.mock.calls[0][1].method).toBe('POST')
+  expect(new Headers(fetchMock.mock.calls[0][1].headers).get('Content-Type')).toBe('application/json')
+  expect(JSON.parse(fetchMock.mock.calls[0][1].body)).toEqual({ scenario_type: 'job_interview' })
+})
+
+test.each(['job_interview', 'public_speaking', 'thesis_defense', 'salary_negotiation'] as const)(
+  'Start sends only the selected canonical scenario %s', async (scenarioType) => {
+    const created = { ...session, scenario_type: scenarioType, current_question_latest_attempt_number: 0 }
+    const fetchMock = mockResponse(json(created, 201))
+    expect(await startInterview(scenarioType)).toEqual(created)
+    expect(fetchMock).toHaveBeenCalledOnce()
+    expect(JSON.parse(fetchMock.mock.calls[0][1].body)).toEqual({ scenario_type: scenarioType })
+  },
+)
+
+test.each([null, 1, '', 'Job Interview', 'JOB_INTERVIEW', ' job_interview', 'unknown'])(
+  'invalid scenario input is rejected before creating a session (case %#)', async (scenarioType) => {
+    const fetchMock = mockResponse(json(session, 201))
+    await expect(startInterview(scenarioType as ScenarioType)).rejects.toMatchObject({ status: 422 })
+    expect(fetchMock).not.toHaveBeenCalled()
+  },
+)
+
+test.each([undefined, null, 1, '', 'Job Interview', 'JOB_INTERVIEW', ' job_interview', 'unknown'])(
+  'session reads reject missing or noncanonical scenario responses (case %#)', async (scenarioType) => {
+    mockResponse(json({ ...session, scenario_type: scenarioType }))
+    await expect(getSession(session.id)).rejects.toMatchObject({ name: 'ApiError', ambiguousWrite: false })
+  },
+)
+
+test('Start rejects a malformed scenario response as an uncertain creation', async () => {
+  mockResponse(json({ ...session, scenario_type: 'unknown' }, 201))
+  await expect(startInterview('thesis_defense')).rejects.toMatchObject({ name: 'ApiError', ambiguousWrite: true })
 })
 
 test.each([null, measurementId])('submits an append-only attempt with exact revision and measurement %s', async (id) => {

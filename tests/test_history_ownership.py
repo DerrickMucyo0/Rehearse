@@ -42,7 +42,7 @@ NOT_FOUND = {"detail": "Session or question not found."}
 INVALID = {"detail": "Invalid history request."}
 BASE_TIME = datetime(2026, 1, 1, tzinfo=timezone.utc)
 SUMMARY_FIELDS = {
-    "session_id", "status", "created_at", "completed_at", "current_question_number",
+    "session_id", "scenario_type", "status", "created_at", "completed_at", "current_question_number",
     "total_questions", "finalized_question_count", "questions_practiced_count",
     "total_attempt_count", "total_retry_count", "measured_final_answer_count",
     "last_submitted_at", "last_saved_activity_at", "finalized_points",
@@ -359,6 +359,7 @@ def test_discovery_and_batch_preserve_exact_owner_history_facts(rich_history, ac
     active = summaries[str(harness.identifiers[actor][0])]
     complete = summaries[str(harness.identifiers[actor][1])]
     assert all(set(item) == SUMMARY_FIELDS for item in page["items"])
+    assert all(item["scenario_type"] == "job_interview" for item in page["items"])
     assert (active["status"], active["current_question_number"], active["completed_at"]) == ("active", 2, None)
     assert (active["finalized_question_count"], active["questions_practiced_count"], active["total_attempt_count"],
             active["total_retry_count"], active["measured_final_answer_count"]) == (1, 2, 4, 2, 1)

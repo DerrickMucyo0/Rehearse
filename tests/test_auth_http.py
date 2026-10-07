@@ -666,7 +666,8 @@ def test_authenticated_session_routes_preserve_response_bytes_and_add_private_ca
         body = created.json()
         location = f"/api/sessions/{body['id']}"
         assert body == {
-            "id": body["id"], "status": "active", "current_question_index": 0,
+            "id": body["id"], "scenario_type": "job_interview",
+            "status": "active", "current_question_index": 0,
             "questions": list(QUESTIONS), "answers": [],
             "current_question_latest_attempt_number": 0, "current_question": QUESTIONS[0],
         }

@@ -54,11 +54,16 @@ def migration_config(connection):
 
 
 def auth_revision_metadata():
-    """Compare the frozen ownership revision without later login persistence."""
+    """Compare the frozen ownership revision without later schema extensions."""
     metadata = MetaData()
     for table in Base.metadata.sorted_tables:
         if table.name != "oidc_login_transactions":
             table.to_metadata(metadata)
+    sessions = metadata.tables[StoredInterviewSession.__tablename__]
+    sessions._columns.remove(sessions.c.scenario_type)
+    scenario_check = next(constraint for constraint in sessions.constraints
+                          if constraint.name == "ck_sessions_scenario_type")
+    sessions.constraints.remove(scenario_check)
     return metadata
 
 
@@ -86,9 +91,10 @@ def add_auth_session(connection, owner_id, **changes):
     return values["id"]
 
 
-def add_session(connection, **changes):
+def add_session(connection, *, session_table=None, **changes):
     values = {"id": uuid4(), "questions": list(QUESTIONS), **changes}
-    connection.execute(insert(StoredInterviewSession).values(**values))
+    table = StoredInterviewSession.__table__ if session_table is None else session_table
+    connection.execute(insert(table).values(**values))
     return values["id"]
 
 
@@ -422,9 +428,10 @@ def test_populated_0002_upgrade_downgrade_and_reupgrade_preserve_all_legacy_fact
     command.downgrade(config, PREVIOUS_REVISION)
     baseline = MetaData()
     tables = {name: Table(name, baseline, autoload_with=connection) for name in LEGACY_TABLES}
-    completed = add_session(connection, status="completed", current_question_index=5,
+    completed = add_session(connection, session_table=tables["interview_sessions"],
+                            status="completed", current_question_index=5,
                             created_at=NOW, completed_at=NOW + timedelta(minutes=3))
-    active = add_session(connection, created_at=NOW)
+    active = add_session(connection, session_table=tables["interview_sessions"], created_at=NOW)
     available = add_measurement(connection, completed, delivery_measurement_version="pause-metrics-v1",
                                 pause_count=1, total_pause_duration_seconds=0.987654321234,
                                 longest_pause_seconds=0.987654321234, pause_unavailable_reason=None)
@@ -482,7 +489,7 @@ def test_populated_0002_upgrade_downgrade_and_reupgrade_preserve_all_legacy_fact
 
     owner = add_user(connection)
     add_auth_session(connection, owner)
-    owned = add_session(connection, user_id=owner)
+    owned = add_session(connection, session_table=upgraded_sessions, user_id=owner)
     owned_measurement = add_measurement(connection, owned)
     add_attempt(connection, owned, measurement_id=owned_measurement)
     expected_legacy_rows = {name: rows(connection, table) for name, table in tables.items()}

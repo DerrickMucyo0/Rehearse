@@ -3,6 +3,7 @@ import { getHistoryDetail, HistoryApiError } from './historyApi'
 import type { HistoryAttempt, HistoryDetail, HistorySummary } from './historyApi'
 import DeliveryFacts from './DeliveryFacts'
 import { getAuthState, isAuthWorkspaceCurrent } from './auth'
+import { scenarioLabel } from './scenarios'
 
 interface Props {
   sessionId: string
@@ -27,6 +28,7 @@ function timestamp(value: string): string {
 
 export function SessionFacts({ summary }: { summary: HistorySummary }) {
   return <dl className="session-facts">
+    <dt>Scenario</dt><dd>{scenarioLabel(summary.scenario_type)}</dd>
     <dt>Created</dt><dd><time dateTime={summary.created_at}>{timestamp(summary.created_at)}</time></dd>
     {summary.completed_at !== null && <>
       <dt>Completed</dt><dd><time dateTime={summary.completed_at}>{timestamp(summary.completed_at)}</time></dd>

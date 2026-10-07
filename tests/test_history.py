@@ -34,7 +34,7 @@ CREATED_AT = datetime(2026, 10, 5, 11, tzinfo=timezone.utc)
 SUBMITTED_AT = datetime(2026, 10, 5, 12, tzinfo=timezone.utc)
 SELECTED_ANSWER = "An explicitly requested saved answer."
 SUMMARY_FIELDS = {
-    "session_id", "status", "created_at", "completed_at", "current_question_number",
+    "session_id", "scenario_type", "status", "created_at", "completed_at", "current_question_number",
     "total_questions", "finalized_question_count", "questions_practiced_count",
     "total_attempt_count", "total_retry_count", "measured_final_answer_count",
     "last_submitted_at", "last_saved_activity_at", "finalized_points",
@@ -88,7 +88,7 @@ def finalized_point():
 
 def session_summary():
     return SessionSummary(
-        session_id=FIRST_ID, status="active", created_at=CREATED_AT, completed_at=None,
+        session_id=FIRST_ID, scenario_type="job_interview", status="active", created_at=CREATED_AT, completed_at=None,
         current_question_number=2, total_questions=5, finalized_question_count=1,
         questions_practiced_count=1, total_attempt_count=2, total_retry_count=1,
         measured_final_answer_count=1, last_submitted_at=SUBMITTED_AT,
@@ -389,6 +389,7 @@ def test_overview_projection_contains_no_answers_or_measurement_identifiers():
     point = summary["finalized_points"][0]
     overview = question_overview().model_dump(mode="json")
     assert set(summary) == SUMMARY_FIELDS
+    assert summary["scenario_type"] == "job_interview"
     assert set(point) == POINT_FIELDS
     assert set(point["measurement"]) == MEASUREMENT_FIELDS
     assert set(overview) == OVERVIEW_FIELDS

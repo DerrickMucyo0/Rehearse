@@ -10,13 +10,13 @@ import type { Attempt, InterviewSession, SemanticDiagnosis, SpeakingMetrics } fr
 import type { DeliveryMetrics } from './deliveryMetrics'
 import { deliveryUnavailableText, TIMED_PAUSES_EXPLANATION, TIMED_PAUSES_LIMITATION } from './deliveryMetrics'
 
-const session: InterviewSession = { id: 'session-1', status: 'active', current_question_index: 0, current_question: 'Question', current_question_latest_attempt_number: 0, questions: ['Question'], answers: [] }
+const session: InterviewSession = { id: 'session-1', scenario_type: 'job_interview', status: 'active', current_question_index: 0, current_question: 'Question', current_question_latest_attempt_number: 0, questions: ['Question'], answers: [] }
 const readHistoryDetail = historyApi.getHistoryDetail
 
 function legacyCompletedHistoryDetail(id: string): HistoryDetail {
   const pointId = (index: number) => `00000000-0000-4000-8000-${String(index + 1).padStart(12, '0')}`
   return {
-    summary: { session_id: id, status: 'completed', created_at: '2026-10-04T11:00:00Z',
+    summary: { session_id: id, scenario_type: 'job_interview', status: 'completed', created_at: '2026-10-04T11:00:00Z',
       completed_at: '2026-10-04T12:00:01Z', current_question_number: null, total_questions: 5,
       finalized_question_count: 5, questions_practiced_count: 5, total_attempt_count: 5, total_retry_count: 0,
       measured_final_answer_count: 0, last_submitted_at: '2026-10-04T12:00:00Z', last_saved_activity_at: '2026-10-04T12:00:01Z',

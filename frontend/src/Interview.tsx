@@ -10,6 +10,8 @@ import {
 import type { Attempt, AttemptComparison, InterviewSession, SemanticDiagnosis } from './interviewApi'
 import { personalizedDrillForFocus } from './personalizedDrills'
 import { getAuthState, isAuthWorkspaceCurrent } from './auth'
+import { SCENARIOS, scenarioLabel } from './scenarios'
+import type { ScenarioType } from './scenarios'
 
 const SESSION_KEY = 'rehearse.session_id'
 type Mode = 'composing' | 'review'
@@ -110,6 +112,7 @@ export default function Interview({ onSessionAccess, onNavigationBusyChange, onH
   })
   const [restoreId] = useState(() => storedSessionId(workspace?.storageKey ?? null))
   const [view, setView] = useState<SavedView | null>(null)
+  const [selectedScenario, setSelectedScenario] = useState<ScenarioType>('job_interview')
   const [draft, setDraft] = useState<{ text: string; measurementId: string | null }>({ text: '', measurementId: null })
   const [draftGeneration, setDraftGeneration] = useState(0)
   const [operation, setOperation] = useState<string | null>(restoreId ? 'Restoring interview…' : null)
@@ -224,7 +227,7 @@ export default function Interview({ onSessionAccess, onNavigationBusyChange, onH
     setOperation('Starting…')
     setError('')
     try {
-      const created = await startInterview()
+      const created = await startInterview(selectedScenario)
       if (!currentWorkspace()) return
       install({ session: created, attempts: [], comparison: null, mode: 'composing' })
       accessCallback.current?.(created.id)
@@ -364,6 +367,18 @@ export default function Interview({ onSessionAccess, onNavigationBusyChange, onH
   return (
     <section className="interview" aria-label="Interview practice" aria-busy={operation !== null}>
       {operation && <p role="status">{operation}</p>}
+      {session && <p>Scenario: {scenarioLabel(session.scenario_type)}</p>}
+      {(!session || session.status === 'completed' || error) && <fieldset className="scenario-setup"
+        disabled={operation !== null || transcribing}>
+        <legend>Practice scenario</legend>
+        {SCENARIOS.map((scenario) => <label className="scenario-choice" key={scenario.type}>
+          <input type="radio" name="practice-scenario" value={scenario.type}
+            aria-labelledby={`scenario-label-${scenario.type}`} aria-describedby={`scenario-description-${scenario.type}`}
+            checked={selectedScenario === scenario.type} onChange={() => setSelectedScenario(scenario.type)} />
+          <span><strong id={`scenario-label-${scenario.type}`}>{scenario.label}</strong>
+            <span id={`scenario-description-${scenario.type}`} className="scenario-description">{scenario.description}</span></span>
+        </label>)}
+      </fieldset>}
       {!session && (
         <button type="button" onClick={() => void start()} disabled={operation !== null || transcribing}>Start Interview</button>
       )}

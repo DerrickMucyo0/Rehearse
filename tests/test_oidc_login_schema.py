@@ -10,7 +10,7 @@ from alembic.autogenerate import compare_metadata
 from alembic.config import Config
 from alembic.migration import MigrationContext
 from sqlalchemy import (
-    CheckConstraint, DateTime, LargeBinary, MetaData, Text, UniqueConstraint,
+    CheckConstraint, DateTime, LargeBinary, MetaData, Table, Text, UniqueConstraint,
     insert, inspect, select, text, update,
 )
 from sqlalchemy.exc import IntegrityError
@@ -44,6 +44,9 @@ def connection(postgres_engine):
     with postgres_engine.connect() as connection:
         transaction = connection.begin()
         try:
+            # These contracts cover 0003 -> 0004, independent of later revisions.
+            # The outer rollback restores the test engine's current schema.
+            command.downgrade(migration_config(connection), LOGIN_REVISION)
             yield connection
         finally:
             transaction.rollback()
@@ -73,12 +76,24 @@ def add_transaction(connection, **changes):
     return values["id"]
 
 
-def previous_metadata():
+def historical_metadata(*, include_login):
+    """Preserve exact 0003/0004 expectations as the current mapping advances."""
     metadata = MetaData()
     for table in Base.metadata.sorted_tables:
-        if table.name != TABLE_NAME:
+        if include_login or table.name != TABLE_NAME:
             table.to_metadata(metadata)
+    sessions = metadata.tables[StoredInterviewSession.__tablename__]
+    # Remove only the later Scenario Setup column and its matching check from
+    # our private metadata copy; all historical constraints stay comparable.
+    sessions._columns.remove(sessions.c.scenario_type)
+    scenario_check = next(constraint for constraint in sessions.constraints
+                          if constraint.name == "ck_sessions_scenario_type")
+    sessions.constraints.remove(scenario_check)
     return metadata
+
+
+def previous_metadata():
+    return historical_metadata(include_login=False)
 
 
 def test_login_mapping_contains_only_the_approved_server_side_fields_and_defaults():
@@ -207,7 +222,7 @@ def test_login_uuid_timestamp_defaults_and_exact_server_side_roundtrip(connectio
 
 def test_migrated_login_schema_matches_metadata_and_exact_constraints(connection):
     assert connection.scalar(text("SELECT version_num FROM alembic_version")) == LOGIN_REVISION
-    assert compare_metadata(MigrationContext.configure(connection), Base.metadata) == []
+    assert compare_metadata(MigrationContext.configure(connection), historical_metadata(include_login=True)) == []
     inspector = inspect(connection)
     columns = {column["name"]: column for column in inspector.get_columns(TABLE_NAME)}
     assert set(columns) == set(OIDCLoginTransaction.__table__.columns.keys())
@@ -335,7 +350,10 @@ def seed_prior_history(connection):
         id=local_auth, user_id=owner, token_hash=sha256(b"preserved-local-auth-credential").digest(),
         request_context="preserved-request-context", created_at=NOW, expires_at=NOW + timedelta(hours=8),
     ))
-    connection.execute(insert(StoredInterviewSession), [
+    # Reflection avoids the current ORM's scenario_type Python default when
+    # seeding a revision where that column did not exist.
+    sessions = Table(StoredInterviewSession.__tablename__, MetaData(), autoload_with=connection)
+    connection.execute(insert(sessions), [
         {"id": completed, "user_id": owner, "questions": list(QUESTIONS), "current_question_index": 5,
          "status": "completed", "created_at": NOW, "completed_at": NOW + timedelta(minutes=5)},
         {"id": legacy, "user_id": None, "questions": list(QUESTIONS), "current_question_index": 0,
@@ -381,7 +399,11 @@ def test_populated_0003_roundtrip_preserves_identity_auth_owners_history_and_all
     command.downgrade(config, PREVIOUS_REVISION)
     assert set(inspect(connection).get_table_names()) == PRIOR_TABLES | {"alembic_version"}
     owner, local_auth, completed, legacy, measurements = seed_prior_history(connection)
-    prior_rows = {model.__tablename__: rows(connection, model.__table__) for model in PRIOR_MODELS}
+    prior_tables = {
+        model.__tablename__: Table(model.__tablename__, MetaData(), autoload_with=connection)
+        for model in PRIOR_MODELS
+    }
+    prior_rows = {name: rows(connection, table) for name, table in prior_tables.items()}
     prior_facts = prior_schema_facts(connection)
     assert set(prior_facts["functions"]) == {"rehearse_preserve_measurement", "rehearse_preserve_questions"}
     assert len(prior_facts["triggers"]) == 2
@@ -400,11 +422,11 @@ def test_populated_0003_roundtrip_preserves_identity_auth_owners_history_and_all
             command.upgrade(config, revision)
             assert set(inspect(connection).get_table_names()) == PRIOR_TABLES | {TABLE_NAME, "alembic_version"}
             assert connection.scalar(select(OIDCLoginTransaction.id).limit(1)) is None
-            assert compare_metadata(MigrationContext.configure(connection), Base.metadata) == []
+            assert compare_metadata(MigrationContext.configure(connection), historical_metadata(include_login=True)) == []
             add_transaction(connection)
         assert connection.scalar(text("SELECT version_num FROM alembic_version")) == revision
         assert prior_schema_facts(connection) == prior_facts
-        assert {model.__tablename__: rows(connection, model.__table__) for model in PRIOR_MODELS} == prior_rows
+        assert {name: rows(connection, table) for name, table in prior_tables.items()} == prior_rows
         assert prior_rows["interview_sessions"][completed]["user_id"] == owner
         assert prior_rows["interview_sessions"][legacy]["user_id"] is None
         assert prior_rows["auth_sessions"][local_auth]["user_id"] == owner
@@ -413,5 +435,6 @@ def test_populated_0003_roundtrip_preserves_identity_auth_owners_history_and_all
         assert prior_rows["transcription_measurements"][measurements[2]]["delivery_measurement_version"] is None
         rejected(connection, lambda: connection.execute(update(TranscriptionMeasurement).where(
             TranscriptionMeasurement.id == measurements[0]).values(recognized_word_count=4)), "23514")
-        rejected(connection, lambda: connection.execute(update(StoredInterviewSession).where(
-            StoredInterviewSession.id == completed).values(questions=["Changed", *QUESTIONS[1:]])), "23514")
+        historical_sessions = prior_tables[StoredInterviewSession.__tablename__]
+        rejected(connection, lambda: connection.execute(update(historical_sessions).where(
+            historical_sessions.c.id == completed).values(questions=["Changed", *QUESTIONS[1:]])), "23514")
