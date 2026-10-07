@@ -21,7 +21,7 @@ function point(changes: Partial<HistoryFinalizedPoint> = {}): HistoryFinalizedPo
 }
 function summary(changes: Partial<HistorySummary> = {}): HistorySummary {
   return {
-    session_id: FIRST, scenario_type: 'job_interview', status: 'active', created_at: '2026-10-05T10:00:00Z', completed_at: null,
+    session_id: FIRST, scenario_type: 'job_interview', question_engine: 'deterministic-v1', status: 'active', created_at: '2026-10-05T10:00:00Z', completed_at: null,
     current_question_number: 2, total_questions: 5, finalized_question_count: 1,
     questions_practiced_count: 2, total_attempt_count: 4, total_retry_count: 2,
     measured_final_answer_count: 1, last_submitted_at: '2026-10-05T12:00:00Z',

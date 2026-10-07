@@ -8,10 +8,10 @@ import { authenticateTestWorkspace } from './authTestUtils'
 const userA = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
 const userB = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'
 const sessionId = '11111111-1111-4111-8111-111111111111'
-const session = { id: sessionId, scenario_type: 'job_interview', status: 'active', current_question_index: 0,
+const session = { id: sessionId, scenario_type: 'job_interview', question_engine: 'deterministic-v1', total_questions: 5, status: 'active', current_question_index: 0,
   current_question: 'Immediate practice question', current_question_latest_attempt_number: 0,
   questions: ['Immediate practice question', 'Two', 'Three', 'Four', 'Five'], answers: [] }
-const summary = { session_id: sessionId, scenario_type: 'job_interview', status: 'active', created_at: '2026-10-06T12:00:00Z',
+const summary = { session_id: sessionId, scenario_type: 'job_interview', question_engine: 'deterministic-v1', status: 'active', created_at: '2026-10-06T12:00:00Z',
   completed_at: null, current_question_number: 1, total_questions: 5, finalized_question_count: 0,
   questions_practiced_count: 0, total_attempt_count: 0, total_retry_count: 0,
   measured_final_answer_count: 0, last_submitted_at: null, last_saved_activity_at: '2026-10-06T12:00:00Z', finalized_points: [] }
@@ -194,4 +194,61 @@ test('browser history keys and storage events cannot choose server membership or
   expect(calls(mock, '/api/history/summaries')).toHaveLength(1)
   expect(screen.queryByRole('button', { name: 'Clear remembered history' })).toBeNull()
   expect(mock.mock.calls.some(([path]) => String(path).includes('99999999'))).toBe(false)
+})
+
+
+function adaptivePracticeApi(continueResponse: () => Response | Promise<Response>) {
+  let current = { ...session, question_engine: 'live-ai-roleplay-v1', questions: session.questions.slice(0, 1) }
+  const attempt = { id: '44444444-4444-4444-8444-444444444444', question_index: 0, attempt_number: 1,
+    answer: 'Saved adaptive answer', submitted_at: '2026-10-06T12:00:00Z', measurement_id: null }
+  return api((path, options) => {
+    if (path === '/api/sessions') return json(current, 201)
+    if (path === `/api/sessions/${sessionId}`) return json(current)
+    if (path.endsWith('/questions/0/attempts')) {
+      if (options?.method === 'POST') {
+        current = { ...current, current_question_latest_attempt_number: 1 }
+        return json({ attempt, session: current }, 201)
+      }
+      return json(current.current_question_latest_attempt_number === 1 ? [attempt] : [])
+    }
+    if (path.endsWith('/diagnosis')) return json({ detail: 'Semantic diagnosis is not configured.' }, 503)
+    if (path.endsWith('/questions/0/continue')) return continueResponse()
+  })
+}
+async function adaptiveReview() {
+  await start()
+  fireEvent.change(screen.getByRole('textbox'), { target: { value: 'Saved adaptive answer' } })
+  fireEvent.click(screen.getByRole('button', { name: 'Submit Attempt' }))
+  await screen.findByRole('button', { name: 'Continue' })
+  await waitFor(() => expect((screen.getByRole('button', { name: 'Continue' }) as HTMLButtonElement).disabled).toBe(false))
+}
+
+test.each([401, 403])('adaptive Continue %s clears the private workspace and never replays', async (status) => {
+  const mock = adaptivePracticeApi(() => json({ detail: 'PRIVATE' }, status))
+  render(<App />); await adaptiveReview()
+  fireEvent.click(screen.getByRole('button', { name: 'Continue' }))
+  await screen.findByRole('button', { name: status === 401 ? 'Sign in' : 'Reload current sign-in' })
+  expect(document.body.textContent).not.toContain('Saved adaptive answer')
+  expect(document.body.textContent).not.toContain('PRIVATE')
+  expect(calls(mock, `/api/sessions/${sessionId}/questions/0/continue`)).toHaveLength(1)
+  expect(calls(mock, '/api/auth/me')).toHaveLength(1)
+})
+
+test('auth generation change aborts adaptive Continue and its late success cannot refill the new account', async () => {
+  const pending = deferred<Response>()
+  const mock = adaptivePracticeApi(() => pending.promise)
+  render(<App />); await adaptiveReview()
+  fireEvent.click(screen.getByRole('button', { name: 'Continue' }))
+  const signal = calls(mock, `/api/sessions/${sessionId}/questions/0/continue`)[0][1]?.signal
+  expect(signal?.aborted).toBe(false)
+  await act(async () => { await authenticateTestWorkspace('context-B', userB) })
+  await workspace()
+  expect(signal?.aborted).toBe(true)
+  await act(async () => pending.resolve(json({ ...session, question_engine: 'live-ai-roleplay-v1',
+    current_question_index: 1, current_question: 'PRIVATE_LATE_QUESTION', questions: [session.questions[0], 'PRIVATE_LATE_QUESTION'],
+    answers: ['Saved adaptive answer'] })))
+  expect(document.body.textContent).not.toContain('PRIVATE_LATE_QUESTION')
+  expect(document.body.textContent).not.toContain('Saved adaptive answer')
+  expect(auth.getAuthState()).toMatchObject({ requestContext: 'context-B' })
+  expect(calls(mock, `/api/sessions/${sessionId}/questions/0/continue`)).toHaveLength(1)
 })

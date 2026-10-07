@@ -7,12 +7,23 @@ import type { ScenarioType } from './scenarios'
 export interface InterviewSession {
   id: string
   scenario_type: ScenarioType
+  question_engine: QuestionEngine
+  total_questions: 5
   status: 'active' | 'completed'
   current_question_index: number
   current_question: string | null
   current_question_latest_attempt_number: number
   questions: string[]
   answers: string[]
+}
+
+export type QuestionEngine = 'deterministic-v1' | 'live-ai-roleplay-v1'
+export function isQuestionEngine(value: unknown): value is QuestionEngine {
+  return value === 'deterministic-v1' || value === 'live-ai-roleplay-v1'
+}
+export function preparesNextQuestion(session: InterviewSession): boolean {
+  return session.question_engine === 'live-ai-roleplay-v1' && session.status === 'active' &&
+    session.current_question_index < session.total_questions - 1
 }
 
 export interface Attempt {
@@ -125,6 +136,13 @@ export class SemanticDiagnosisError extends Error {
   }
 }
 
+export class RoleplayUnavailableError extends ApiError {
+  constructor() {
+    super('Interviewer is unavailable right now. Try Continue again.', 503)
+    this.name = 'RoleplayUnavailableError'
+  }
+}
+
 export function isConflictError(error: unknown): boolean {
   return error instanceof ApiError && error.status === 409
 }
@@ -139,13 +157,18 @@ function nullableString(value: unknown): value is string | null {
   return value === null || typeof value === 'string'
 }
 function validSession(value: unknown): value is InterviewSession {
-  return object(value) && typeof value.id === 'string' &&
-    isScenarioType(value.scenario_type) &&
+  if (!(object(value) && typeof value.id === 'string' &&
+    isScenarioType(value.scenario_type) && isQuestionEngine(value.question_engine) && value.total_questions === 5 &&
     (value.status === 'active' || value.status === 'completed') &&
     nonnegativeInteger(value.current_question_index) && nullableString(value.current_question) &&
     nonnegativeInteger(value.current_question_latest_attempt_number) &&
-    Array.isArray(value.questions) && value.questions.every((question) => typeof question === 'string') &&
-    Array.isArray(value.answers) && value.answers.every((answer) => typeof answer === 'string')
+    Array.isArray(value.questions) && value.questions.every((question) => typeof question === 'string' && !!question.trim()) &&
+    Array.isArray(value.answers) && value.answers.every((answer) => typeof answer === 'string') &&
+    value.answers.length === value.current_question_index)) return false
+  if (value.status === 'completed') return value.current_question_index === 5 && value.current_question === null &&
+    value.current_question_latest_attempt_number === 0 && value.questions.length === 5
+  return value.current_question_index < 5 && value.current_question === value.questions[value.current_question_index] &&
+    value.questions.length === (value.question_engine === 'live-ai-roleplay-v1' ? value.current_question_index + 1 : 5)
 }
 function validAttempt(value: unknown): value is Attempt {
   return object(value) && typeof value.id === 'string' && nonnegativeInteger(value.question_index) &&
@@ -153,23 +176,39 @@ function validAttempt(value: unknown): value is Attempt {
     typeof value.answer === 'string' && typeof value.submitted_at === 'string' && nullableString(value.measurement_id)
 }
 
-async function request<T>(path: string, valid: (value: unknown) => value is T, options?: RequestInit): Promise<T> {
+async function request<T>(path: string, valid: (value: unknown) => value is T, options?: RequestInit,
+  behavior: { timeoutMs?: number; roleplayFailure?: boolean } = {}): Promise<T> {
   const write = options?.method === 'POST'
+  const timeout = AbortSignal.timeout(behavior.timeoutMs ?? 10_000)
+  const signal = options?.signal ? AbortSignal.any([options.signal, timeout]) : timeout
   let response: Response
   try {
-    response = await protectedFetch(path, { ...options, signal: AbortSignal.timeout(10000) })
+    response = await protectedFetch(path, { ...options, signal })
   } catch (error) {
     if (isAuthBoundaryError(error)) throw error
     throw new ApiError('Unable to reach the backend. Check your connection and recheck the interview.', null, write)
   }
   assertProtectedResponseCurrent(response)
   if (!response.ok) {
+    if (behavior.roleplayFailure && response.status === 503) {
+      let failure: unknown
+      try { failure = await readProtectedJson(response) } catch (error) {
+        if (isAuthBoundaryError(error)) throw error
+        throw new ApiError('The request result is unknown. Recheck saved state before trying again.', response.status, write)
+      }
+      if (object(failure) && Object.keys(failure).length === 3 &&
+          failure.detail === 'Interviewer is unavailable right now. Try Continue again.' &&
+          failure.code === 'roleplay_generation_unavailable' && failure.write_outcome === 'not_applied') {
+        throw new RoleplayUnavailableError()
+      }
+    }
     const messages: Record<number, string> = {
       404: 'Session or attempt not found. Recheck the interview or start a new one.',
       409: 'The interview changed. Recheck it before continuing.',
       422: 'The request was not accepted. Recheck the interview and try again.',
     }
-    throw new ApiError(messages[response.status] || 'Unable to update the interview. Please try again.', response.status)
+    throw new ApiError(messages[response.status] || 'Unable to update the interview. Please try again.', response.status,
+      write && response.status >= 500)
   }
   let result: unknown
   try { result = await readProtectedJson(response) } catch (error) {
@@ -202,6 +241,9 @@ export function submitAttempt(session: InterviewSession, answer: string, measure
   return request(`${questionPath(session)}/attempts`, (value): value is AttemptSubmission =>
     object(value) && validAttempt(value.attempt) && validSession(value.session) &&
     value.session.id === session.id && value.session.current_question_index === session.current_question_index &&
+    value.session.question_engine === session.question_engine && value.session.scenario_type === session.scenario_type &&
+    value.session.questions.length === session.questions.length && value.session.questions.every((text, index) => text === session.questions[index]) &&
+    value.session.answers.length === session.answers.length && value.session.answers.every((text, index) => text === session.answers[index]) &&
     value.attempt.question_index === session.current_question_index &&
     value.attempt.attempt_number === session.current_question_latest_attempt_number + 1 &&
     value.session.current_question_latest_attempt_number === value.attempt.attempt_number &&
@@ -209,10 +251,17 @@ export function submitAttempt(session: InterviewSession, answer: string, measure
   jsonBody({ answer, expected_last_attempt_number: session.current_question_latest_attempt_number, measurement_id: measurementId }))
 }
 
-export function continueQuestion(session: InterviewSession): Promise<InterviewSession> {
+export function continueQuestion(session: InterviewSession, signal?: AbortSignal): Promise<InterviewSession> {
+  const generates = preparesNextQuestion(session)
   return request(`${questionPath(session)}/continue`, (value): value is InterviewSession =>
-    validSession(value) && value.id === session.id && value.current_question_index === session.current_question_index + 1,
-  jsonBody({ expected_last_attempt_number: session.current_question_latest_attempt_number }))
+    validSession(value) && value.id === session.id && value.current_question_index === session.current_question_index + 1 &&
+    value.question_engine === session.question_engine && value.scenario_type === session.scenario_type &&
+    value.current_question_latest_attempt_number === 0 &&
+    value.questions.length === session.questions.length + Number(generates) &&
+    session.questions.every((text, index) => value.questions[index] === text) &&
+    value.answers.length === session.answers.length + 1 && session.answers.every((text, index) => value.answers[index] === text),
+  { ...jsonBody({ expected_last_attempt_number: session.current_question_latest_attempt_number }), signal },
+  { timeoutMs: generates ? 135_000 : 10_000, roleplayFailure: generates })
 }
 
 function validSemanticDiagnosis(value: unknown): value is SemanticDiagnosis {

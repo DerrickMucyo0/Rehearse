@@ -145,3 +145,22 @@ def revalidate_authenticated_principal(
         failure = AuthenticationFailureKind.UNAVAILABLE
     if failure is not None:
         raise _http_failure(failure) from None
+
+
+def revalidate_authenticated_principal_in_transaction(
+    principal: AuthenticatedPrincipal, store: AuthSessionStore, database,
+) -> None:
+    """Map the adaptive transaction guard through the existing auth contract."""
+    failure = None
+    try:
+        guard = getattr(store, "revalidate_in_transaction", None)
+        if type(principal) is not AuthenticatedPrincipal or not callable(guard):
+            failure = AuthenticationFailureKind.UNAVAILABLE
+        elif guard(database=database, principal=principal) is not None:
+            failure = AuthenticationFailureKind.UNAVAILABLE
+    except AuthenticationFailure as error:
+        failure = _failure_kind(error)
+    except Exception:
+        failure = AuthenticationFailureKind.UNAVAILABLE
+    if failure is not None:
+        raise _http_failure(failure) from None

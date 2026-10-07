@@ -13,7 +13,7 @@ from app.sessions import InterviewSessionService
 @pytest.fixture
 def client(
     postgres_session_factory, authenticated_principal,
-    authenticated_http_headers, authenticated_session_override,
+    authenticated_http_headers, authenticated_session_override, offline_roleplay,
 ) -> Iterator[TestClient]:
     service = InterviewSessionService(postgres_session_factory, authenticated_principal)
     app.dependency_overrides[get_session_service] = authenticated_session_override(service)

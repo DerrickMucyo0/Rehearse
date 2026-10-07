@@ -6,22 +6,33 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.main import app
+from app.roleplay import RoleplayContext, RoleplayQuestion
+from app.roleplay_composition import get_roleplay_adapter
+from app.scenarios import questions_for_scenario
 from app.session_routes import get_session_service
-from app.sessions import InterviewSessionService
+from app.sessions import QUESTIONS, InterviewSessionService
+
+
+class CatalogRoleplayAdapter:
+    """Returns catalog fixtures only to exercise the persisted HTTP lifecycle."""
+
+    async def generate(self, context: RoleplayContext) -> RoleplayQuestion:
+        return RoleplayQuestion(
+            roleplay_version="live-ai-roleplay-v1",
+            next_question=questions_for_scenario(context.scenario_type)[context.next_question_number - 1],
+        )
 
 
 @pytest.fixture
 def client(
     postgres_session_factory, authenticated_principal,
-    authenticated_http_headers, authenticated_session_override,
+    authenticated_http_headers, authenticated_session_override, monkeypatch,
 ) -> Iterator[TestClient]:
     service = InterviewSessionService(postgres_session_factory, authenticated_principal)
-    app.dependency_overrides[get_session_service] = authenticated_session_override(service)
-    try:
-        with TestClient(app, headers=authenticated_http_headers) as test_client:
-            yield test_client
-    finally:
-        app.dependency_overrides.pop(get_session_service)
+    monkeypatch.setitem(app.dependency_overrides, get_session_service, authenticated_session_override(service))
+    monkeypatch.setitem(app.dependency_overrides, get_roleplay_adapter, lambda: CatalogRoleplayAdapter())
+    with TestClient(app, headers=authenticated_http_headers) as test_client:
+        yield test_client
 
 
 def question_url(session_id: str, question_index: int) -> str:
@@ -53,7 +64,9 @@ def test_create_and_retrieve_session(client: TestClient) -> None:
     assert session["current_question_index"] == 0
     assert session["current_question"] == "Tell me about yourself."
     assert session["current_question_latest_attempt_number"] == 0
-    assert len(session["questions"]) == 5
+    assert session["question_engine"] == "live-ai-roleplay-v1"
+    assert session["total_questions"] == 5
+    assert session["questions"] == [QUESTIONS[0]]
     assert session["answers"] == []
     retrieved = client.get(response.headers["Location"])
     assert retrieved.status_code == 200
@@ -111,7 +124,7 @@ def test_retry_appends_ordered_attempts_and_preserves_first_attempt(client: Test
         assert client.get(f"{question_url(session['id'], 0)}/attempts").json() == attempts
     assert len({attempt["id"] for attempt in attempts}) == 3
     assert client.get(f"/api/sessions/{session['id']}").json()["answers"] == []
-    assert client.get(f"{question_url(session['id'], 1)}/attempts").json() == []
+    assert client.get(f"{question_url(session['id'], 1)}/attempts").status_code == 404
 
 
 def test_continue_finalizes_latest_attempt_and_advances_question(client: TestClient) -> None:
@@ -126,6 +139,9 @@ def test_continue_finalizes_latest_attempt_and_advances_question(client: TestCli
     assert updated["current_question"] == "Tell me about a challenging problem you solved."
     assert updated["current_question_latest_attempt_number"] == 0
     assert updated["status"] == "active"
+    assert updated["question_engine"] == "live-ai-roleplay-v1"
+    assert updated["total_questions"] == 5
+    assert updated["questions"] == list(QUESTIONS[:2])
     assert client.get(f"/api/sessions/{session['id']}").json() == updated
     assert client.get(f"{question_url(session['id'], 0)}/attempts").json() == [first, second]
     assert continue_question(client, session["id"], 0, 2).status_code == 409
@@ -136,7 +152,7 @@ def test_complete_session_only_after_final_continue_and_reject_extra_writes(clie
     session = client.post("/api/sessions").json()
     url = f"/api/sessions/{session['id']}"
     answers = []
-    for index, question in enumerate(session["questions"]):
+    for index, question in enumerate(QUESTIONS):
         answer = f"Answer {index}"
         response = submit(client, session["id"], index, answer)
         assert response.status_code == 201
@@ -146,6 +162,7 @@ def test_complete_session_only_after_final_continue_and_reject_extra_writes(clie
         assert pending["current_question"] == question
         assert pending["current_question_latest_attempt_number"] == 1
         assert pending["status"] == "active"
+        assert pending["questions"] == list(QUESTIONS[:index + 1])
         answers.append(answer)
         response = continue_question(client, session["id"], index)
         assert response.status_code == 200
@@ -153,9 +170,11 @@ def test_complete_session_only_after_final_continue_and_reject_extra_writes(clie
         assert updated["answers"] == answers
         assert updated["current_question_index"] == index + 1
         assert updated["current_question_latest_attempt_number"] == 0
-        if index + 1 < len(session["questions"]):
+        assert updated["total_questions"] == 5
+        assert updated["questions"] == list(QUESTIONS[:min(index + 2, 5)])
+        if index + 1 < session["total_questions"]:
             assert updated["status"] == "active"
-            assert updated["current_question"] == session["questions"][index + 1]
+            assert updated["current_question"] == QUESTIONS[index + 1]
     assert updated["status"] == "completed"
     assert updated["current_question"] is None
     assert client.get(url).json() == updated
@@ -289,7 +308,7 @@ def test_reject_invalid_question_path(client: TestClient, index: str) -> None:
     assert client.get(f"/api/sessions/{session['id']}").json() == session
 
 
-@pytest.mark.parametrize("index", [5, 100])
+@pytest.mark.parametrize("index", [1, 2, 4, 5, 100])
 def test_attempt_retrieval_rejects_question_outside_snapshot(client: TestClient, index: int) -> None:
     session = client.post("/api/sessions").json()
     assert client.get(f"{question_url(session['id'], index)}/attempts").status_code == 404

@@ -15,7 +15,7 @@ from alembic import command
 from alembic.autogenerate import compare_metadata
 from alembic.config import Config
 from alembic.migration import MigrationContext
-from sqlalchemy import DateTime, LargeBinary, MetaData, Table, Text, delete, insert, inspect, select, text, update
+from sqlalchemy import CheckConstraint, DateTime, LargeBinary, MetaData, Table, Text, delete, insert, inspect, select, text, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -60,10 +60,29 @@ def auth_revision_metadata():
         if table.name != "oidc_login_transactions":
             table.to_metadata(metadata)
     sessions = metadata.tables[StoredInterviewSession.__tablename__]
-    sessions._columns.remove(sessions.c.scenario_type)
-    scenario_check = next(constraint for constraint in sessions.constraints
-                          if constraint.name == "ck_sessions_scenario_type")
-    sessions.constraints.remove(scenario_check)
+    for name in ("scenario_type", "question_engine"):
+        sessions._columns.remove(sessions.c[name])
+    for name in (
+        "ck_sessions_scenario_type", "ck_sessions_question_engine",
+        "ck_sessions_question_snapshot", "ck_sessions_completion",
+    ):
+        constraint = next(item for item in sessions.constraints if item.name == name)
+        sessions.constraints.remove(constraint)
+    # Revisions 0001–0003 required a complete immutable five-question catalog.
+    # Restore those exact historical checks in the private metadata copy.
+    sessions.append_constraint(CheckConstraint(
+        "CASE WHEN jsonb_typeof(questions) = 'array' "
+        "THEN jsonb_array_length(questions) = 5 ELSE false END",
+        name="ck_sessions_question_snapshot",
+    ))
+    sessions.append_constraint(CheckConstraint(
+        "CASE WHEN jsonb_typeof(questions) = 'array' THEN "
+        "((status = 'active' AND current_question_index < jsonb_array_length(questions) "
+        "AND completed_at IS NULL) OR "
+        "(status = 'completed' AND current_question_index = jsonb_array_length(questions) "
+        "AND completed_at IS NOT NULL)) ELSE false END",
+        name="ck_sessions_completion",
+    ))
     return metadata
 
 

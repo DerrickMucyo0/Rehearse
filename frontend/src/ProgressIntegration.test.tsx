@@ -26,7 +26,7 @@ const semanticDiagnosis: SemanticDiagnosis = {
 }
 function response(value: unknown, status = 200) { return new Response(JSON.stringify(value), { status }) }
 function initialSession(id = SESSION_ID): InterviewSession {
-  return { id, scenario_type: 'job_interview', status: 'active', current_question_index: 0, current_question: questions[0],
+  return { id, scenario_type: 'job_interview', question_engine: 'deterministic-v1', total_questions: 5, status: 'active', current_question_index: 0, current_question: questions[0],
     current_question_latest_attempt_number: 0, questions, answers: [] }
 }
 function deferred<T>() {
@@ -97,7 +97,8 @@ function mockAppApi(initial = initialSession()) {
     const next = session.current_question_index + 1
     session = { ...session, current_question_index: next, current_question: questions[next] ?? null,
       current_question_latest_attempt_number: 0, answers: [...session.answers, answer],
-      status: next === questions.length ? 'completed' : 'active' }
+      status: next === questions.length ? 'completed' : 'active',
+      questions: session.question_engine === 'live-ai-roleplay-v1' ? questions.slice(0, Math.min(next + 1, 5)) : session.questions }
     known.set(session.id, session)
     return session
   }
@@ -115,7 +116,7 @@ function mockAppApi(initial = initialSession()) {
       return { question_index: questionIndex, attempt_id: attempt?.id ?? '55555555-5555-4555-8555-555555555555',
         attempt_number: attempt?.attempt_number ?? 1, submitted_at: submittedAt, measurement: linkedMeasurement(attempt) }
     })
-    return { session_id: forSession.id, scenario_type: forSession.scenario_type, status: forSession.status, created_at: submittedAt,
+    return { session_id: forSession.id, scenario_type: forSession.scenario_type, question_engine: forSession.question_engine, status: forSession.status, created_at: submittedAt,
       completed_at: forSession.status === 'completed' ? submittedAt : null,
       current_question_number: forSession.status === 'active' ? forSession.current_question_index + 1 : null,
       total_questions: questions.length, finalized_question_count: forSession.current_question_index,
@@ -125,7 +126,7 @@ function mockAppApi(initial = initialSession()) {
       last_saved_activity_at: submittedAt, finalized_points: points }
   }
   function detail(questionIndex: number | null) {
-    return { summary: summary(session), questions: questions.map((question_text, index) => {
+    return { summary: summary(session), questions: session.questions.map((question_text, index) => {
       const latest = saved(index).at(-1)
       const finalized = index < session.current_question_index
       return { question_index: index, question_text, finalized, attempt_count: saved(index).length,
@@ -150,6 +151,7 @@ function mockAppApi(initial = initialSession()) {
     if (url === '/api/sessions' && options?.method === 'POST') {
       creations += 1
       session = initialSession()
+      if (initial.question_engine === 'live-ai-roleplay-v1') session = { ...session, question_engine: initial.question_engine, questions: questions.slice(0, 1) }
       known.set(session.id, session)
       return response(session, 201)
     }
@@ -716,7 +718,7 @@ test('server pagination persists across navigation and manual retry resumes only
 test('a stale history response cannot overwrite a newer successful Practice invalidation', async () => {
   const api = mockAppApi(); render(<App />); await start()
   const pending = deferred<Response>()
-  const initialSummary = { session_id: SESSION_ID, scenario_type: 'job_interview', status: 'active', created_at: submittedAt, completed_at: null,
+  const initialSummary = { session_id: SESSION_ID, scenario_type: 'job_interview', question_engine: 'deterministic-v1', status: 'active', created_at: submittedAt, completed_at: null,
     current_question_number: 1, total_questions: 5, finalized_question_count: 0, questions_practiced_count: 0,
     total_attempt_count: 0, total_retry_count: 0, measured_final_answer_count: 0, last_submitted_at: null,
     last_saved_activity_at: submittedAt, finalized_points: [] }
@@ -911,4 +913,34 @@ test('authoritative recovery invalidates history after a successful write whose 
   expect(overviewValue('Saved attempts').textContent).toContain('1')
   expect(summariesReadCount(api)).toBe(2)
   expect(api.posts('/attempts')).toHaveLength(1)
+})
+
+
+test('adaptive generation blocks navigation and persisted prefix history feeds finalized Progress without more Continue calls', async () => {
+  const initial: InterviewSession = { ...initialSession(), question_engine: 'live-ai-roleplay-v1', questions: questions.slice(0, 1) }
+  const api = mockAppApi(initial)
+  render(<App />); await start(); await submit('Adaptive saved answer')
+  const pending = deferred<Response>()
+  api.intercept((url, options) => url.endsWith('/continue') && options?.method === 'POST' ? pending.promise : undefined)
+  fireEvent.click(screen.getByRole('button', { name: 'Continue' }))
+  expect(screen.getByText('Preparing next question…')).toBeTruthy()
+  assertNavigationBlocked()
+  api.intercept(() => undefined)
+  await act(async () => pending.resolve(response(api.advance())))
+  await screen.findByText('Question 2 of 5')
+  await waitFor(() => expect((nav('History') as HTMLButtonElement).disabled).toBe(false))
+  await openLoadedHistory()
+  fireEvent.click(screen.getByRole('button', { name: 'Open session' }))
+  const detail = await screen.findByRole('region', { name: 'Session detail' })
+  await within(detail).findByText(questions[1])
+  expect(within(detail).queryByText(questions[2])).toBeNull()
+  expect(within(detail).getByText('2 of 5')).toBeTruthy()
+  await openLoadedProgress()
+  expect(overviewValue('Finalized questions').textContent).toContain('1')
+  expect(overviewValue('Saved attempts').textContent).toContain('1')
+  expect(overviewValue('Measured final answers').textContent).toContain('0')
+  expect(api.posts('/continue')).toHaveLength(1)
+  expect(api.posts('/diagnosis')).toHaveLength(1)
+  go('Practice')
+  expect(screen.getByText('Question 2 of 5')).toBeTruthy()
 })

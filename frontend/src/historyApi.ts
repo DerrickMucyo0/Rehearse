@@ -1,4 +1,5 @@
-import type { TimingUnavailableReason } from './interviewApi'
+import { isQuestionEngine } from './interviewApi'
+import type { QuestionEngine, TimingUnavailableReason } from './interviewApi'
 import { validDeliveryMetrics } from './deliveryMetrics'
 import type { DeliveryMetrics } from './deliveryMetrics'
 import { assertProtectedResponseCurrent, isAuthBoundaryError, protectedFetch, readProtectedJson } from './auth'
@@ -32,6 +33,7 @@ export interface HistoryFinalizedPoint {
 export interface HistorySummary {
   session_id: string
   scenario_type: ScenarioType
+  question_engine: QuestionEngine
   status: 'active' | 'completed'
   created_at: string
   completed_at: string | null
@@ -90,7 +92,7 @@ export interface HistoryDetailOptions extends HistoryReadOptions { questionIndex
 const timingReasons: readonly unknown[] = ['missing_timings', 'timing_coverage_mismatch', 'invalid_timing', 'invalid_timing_order', 'unusable_span']
 const measurementKeys = ['measurement_version', 'measurement_source', 'recognized_word_count', 'um_count', 'uh_count', 'filler_unavailable_reason', 'timed_utterance_span_seconds', 'estimated_words_per_minute', 'timing_unavailable_reason', 'delivery_metrics']
 const pointKeys = ['question_index', 'attempt_id', 'attempt_number', 'submitted_at', 'measurement']
-const summaryKeys = ['session_id', 'scenario_type', 'status', 'created_at', 'completed_at', 'current_question_number', 'total_questions', 'finalized_question_count', 'questions_practiced_count', 'total_attempt_count', 'total_retry_count', 'measured_final_answer_count', 'last_submitted_at', 'last_saved_activity_at', 'finalized_points']
+const summaryKeys = ['session_id', 'scenario_type', 'question_engine', 'status', 'created_at', 'completed_at', 'current_question_number', 'total_questions', 'finalized_question_count', 'questions_practiced_count', 'total_attempt_count', 'total_retry_count', 'measured_final_answer_count', 'last_submitted_at', 'last_saved_activity_at', 'finalized_points']
 const questionKeys = ['question_index', 'question_text', 'finalized', 'attempt_count', 'latest_attempt_id', 'latest_attempt_number', 'final_attempt_id', 'final_attempt_number']
 const attemptKeys = ['attempt_id', 'attempt_number', 'answer_text', 'submitted_at', 'is_final', 'measurement']
 function object(value: unknown): value is Record<string, unknown> { return typeof value === 'object' && value !== null && !Array.isArray(value) }
@@ -123,7 +125,7 @@ function point(value: unknown): value is HistoryFinalizedPoint {
   return shape(value, pointKeys) && integer(value.question_index) && uuid(value.attempt_id) && positive(value.attempt_number) && timestamp(value.submitted_at) && measurement(value.measurement)
 }
 function summary(value: unknown): value is HistorySummary {
-  if (!shape(value, summaryKeys) || !uuid(value.session_id) || !isScenarioType(value.scenario_type) || !timestamp(value.created_at) || !timestamp(value.last_saved_activity_at) ||
+  if (!shape(value, summaryKeys) || !uuid(value.session_id) || !isScenarioType(value.scenario_type) || !isQuestionEngine(value.question_engine) || !timestamp(value.created_at) || !timestamp(value.last_saved_activity_at) ||
       !(value.completed_at === null || timestamp(value.completed_at)) || !(value.last_submitted_at === null || timestamp(value.last_submitted_at)) ||
       value.total_questions !== 5 || !integer(value.finalized_question_count) || value.finalized_question_count > 5 ||
       !integer(value.questions_practiced_count) || value.questions_practiced_count < value.finalized_question_count || value.questions_practiced_count > 5 ||
@@ -163,7 +165,7 @@ function attempt(value: unknown): value is HistoryAttempt {
 }
 function validDetail(value: unknown, id: string, options: HistoryDetailOptions): value is HistoryDetail {
   if (!shape(value, ['summary', 'questions', 'selected_question']) || !summary(value.summary) || value.summary.session_id !== id ||
-      !Array.isArray(value.questions) || !value.questions.every(question) || value.questions.length !== 5) return false
+      !Array.isArray(value.questions) || !value.questions.every(question) || value.questions.length !== (value.summary.question_engine === 'live-ai-roleplay-v1' && value.summary.status === 'active' ? value.summary.current_question_number : 5)) return false
   const questions = value.questions as HistoryQuestion[]
   const session = value.summary
   if (!questions.every((item, index) => item.question_index === index && item.finalized === (index < session.finalized_question_count) &&

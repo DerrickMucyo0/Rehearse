@@ -10,13 +10,13 @@ import type { Attempt, InterviewSession, SemanticDiagnosis, SpeakingMetrics } fr
 import type { DeliveryMetrics } from './deliveryMetrics'
 import { deliveryUnavailableText, TIMED_PAUSES_EXPLANATION, TIMED_PAUSES_LIMITATION } from './deliveryMetrics'
 
-const session: InterviewSession = { id: 'session-1', scenario_type: 'job_interview', status: 'active', current_question_index: 0, current_question: 'Question', current_question_latest_attempt_number: 0, questions: ['Question'], answers: [] }
+const session: InterviewSession = { id: 'session-1', scenario_type: 'job_interview', question_engine: 'deterministic-v1', total_questions: 5, status: 'active', current_question_index: 0, current_question: 'Question', current_question_latest_attempt_number: 0, questions: ['Question', 'Second', 'Third', 'Fourth', 'Fifth'], answers: [] }
 const readHistoryDetail = historyApi.getHistoryDetail
 
 function legacyCompletedHistoryDetail(id: string): HistoryDetail {
   const pointId = (index: number) => `00000000-0000-4000-8000-${String(index + 1).padStart(12, '0')}`
   return {
-    summary: { session_id: id, scenario_type: 'job_interview', status: 'completed', created_at: '2026-10-04T11:00:00Z',
+    summary: { session_id: id, scenario_type: 'job_interview', question_engine: 'deterministic-v1', status: 'completed', created_at: '2026-10-04T11:00:00Z',
       completed_at: '2026-10-04T12:00:01Z', current_question_number: null, total_questions: 5,
       finalized_question_count: 5, questions_practiced_count: 5, total_attempt_count: 5, total_retry_count: 0,
       measured_final_answer_count: 0, last_submitted_at: '2026-10-04T12:00:00Z', last_saved_activity_at: '2026-10-04T12:00:01Z',
@@ -362,7 +362,7 @@ test('automatically stops after five minutes', async () => {
 })
 
 test('saving a typed attempt releases the old recording and Continue alone advances', async () => {
-  const active = { ...session, questions: ['First', 'Second'] }
+  const active = { ...session, current_question: 'First', questions: ['First', 'Second', 'Third', 'Fourth', 'Fifth'] }
   interviewFetch({ active })
   render(<Interview />)
   fireEvent.click(screen.getByRole('button', { name: 'Start Interview' }))
@@ -374,7 +374,7 @@ test('saving a typed attempt releases the old recording and Continue alone advan
   fireEvent.change(screen.getByRole('textbox'), { target: { value: 'Typed' } })
   fireEvent.click(screen.getByRole('button', { name: 'Submit Attempt' }))
   await screen.findByRole('button', { name: 'Continue' })
-  expect(screen.getByText('Question 1 of 2')).toBeTruthy()
+  expect(screen.getByText('Question 1 of 5')).toBeTruthy()
   await waitFor(() => expect(stopTrack).toHaveBeenCalledTimes(1))
   expect(oldRecorder.state).toBe('inactive')
   expect(screen.queryByRole('button', { name: 'Stop Recording' })).toBeNull()
@@ -382,7 +382,7 @@ test('saving a typed attempt releases the old recording and Continue alone advan
   const button = screen.getByRole('button', { name: 'Continue' }) as HTMLButtonElement
   await waitFor(() => expect(button.disabled).toBe(false))
   fireEvent.click(button)
-  await screen.findByText('Question 2 of 2')
+  await screen.findByText('Question 2 of 5')
 })
 
 test('network failure is shown and allows retry', async () => {
@@ -456,7 +456,7 @@ test('transcribes once, preserves original measurements on edits, and advances o
   const answer = screen.getByRole('textbox') as HTMLTextAreaElement
   expect(answer.value).toBe('Hello from my recording')
   expect(answer.disabled).toBe(false)
-  expect(screen.getByText('Question 1 of 1')).toBeTruthy()
+  expect(screen.getByText('Question 1 of 5')).toBeTruthy()
   expect(fetchMock).toHaveBeenCalledTimes(2)
   expect(screen.getByText(/Transcript ready/)).toBeTruthy()
   expect(measurement('Words')).toBe('4')
@@ -471,7 +471,7 @@ test('transcribes once, preserves original measurements on edits, and advances o
   expect(measurement('Estimated WPM')).toBe('98 WPM')
   expect(screen.getByText(provenance)).toBeTruthy()
   await submitThenContinue()
-  await screen.findByRole('heading', { name: 'Interview Complete' })
+  await screen.findByText('Question 2 of 5')
   const [, write] = attemptWrites(fetchMock)[0]
   expect(JSON.parse(write.body)).toEqual({
     expected_last_attempt_number: 0, answer: 'Edited answer', measurement_id: measurementId,
@@ -629,7 +629,7 @@ test('replacement clears original metrics immediately, and its new transcription
   expect(measurement('Timed speech span')).toBe('2 sec')
   expect(measurement('Estimated WPM')).toBe('30 WPM')
   await submitThenContinue()
-  await screen.findByRole('heading', { name: 'Interview Complete' })
+  await screen.findByText('Question 2 of 5')
   expect(JSON.parse(attemptWrites(fetchMock)[0][1].body)).toEqual({
     expected_last_attempt_number: 0, answer: 'Replacement', measurement_id: replacementMeasurementId,
   })
@@ -665,24 +665,24 @@ test('replacement microphone failure cannot leave old metrics or measurement ID 
   expect(screen.queryByRole('region', { name: 'Speaking measurements' })).toBeNull()
   expect((screen.getByRole('textbox') as HTMLTextAreaElement).value).toBe('Hello from my recording')
   await submitThenContinue()
-  await screen.findByRole('heading', { name: 'Interview Complete' })
+  await screen.findByText('Question 2 of 5')
   expect(JSON.parse(attemptWrites(fetchMock)[0][1].body)).toEqual({
     expected_last_attempt_number: 0, answer: 'Hello from my recording', measurement_id: null,
   })
 })
 
 test('question advancement clears measurements rather than carrying them to the next question', async () => {
-  const active = { ...session, questions: ['First', 'Second'] }
+  const active = { ...session, current_question: 'First', questions: ['First', 'Second', 'Third', 'Fourth', 'Fifth'] }
   const fetchMock = interviewFetch({ active, transcriptions: [transcriptResponse()] })
   await interviewRecording()
   fireEvent.click(screen.getByRole('button', { name: 'Transcribe Recording' }))
   await screen.findByRole('region', { name: 'Speaking measurements' })
   await submitThenContinue()
-  await screen.findByText('Question 2 of 2')
+  await screen.findByText('Question 2 of 5')
   expect(screen.queryByRole('region', { name: 'Speaking measurements' })).toBeNull()
   fireEvent.change(screen.getByRole('textbox'), { target: { value: 'Second typed answer' } })
   await submitThenContinue()
-  await screen.findByRole('heading', { name: 'Interview Complete' })
+  await screen.findByText('Question 3 of 5')
   expect(attemptWrites(fetchMock).map(([, options]) => JSON.parse(options.body))).toEqual([
     { expected_last_attempt_number: 0, answer: 'Hello from my recording', measurement_id: measurementId },
     { expected_last_attempt_number: 0, answer: 'Second typed answer', measurement_id: null },
@@ -713,7 +713,7 @@ test('a typed-only attempt never creates speaking measurements or requests the m
   fireEvent.change(screen.getByRole('textbox'), { target: { value: 'Typed answer' } })
   expect(screen.queryByRole('region', { name: 'Speaking measurements' })).toBeNull()
   await submitThenContinue()
-  await screen.findByRole('heading', { name: 'Interview Complete' })
+  await screen.findByText('Question 2 of 5')
   expect(screen.queryByRole('region', { name: 'Speaking measurements' })).toBeNull()
   expect(getUserMedia).not.toHaveBeenCalled()
   expect(fetchMock.mock.calls.every(([url]) => !String(url).endsWith('/answers'))).toBe(true)
@@ -727,6 +727,12 @@ test('completed audio Practice loads its mocked persisted summary once without r
   await screen.findByRole('textbox')
   fireEvent.change(screen.getByRole('textbox'), { target: { value: 'Typed completion answer' } })
   await submitThenContinue()
+  await screen.findByText('Question 2 of 5')
+  for (let index = 1; index < 5; index += 1) {
+    fireEvent.change(screen.getByRole('textbox'), { target: { value: `Typed answer ${index + 1}` } })
+    await submitThenContinue()
+    if (index < 4) await screen.findByText(`Question ${index + 2} of 5`)
+  }
   await screen.findByRole('heading', { name: 'Interview Complete' })
   const summary = await screen.findByRole('region', { name: 'Interview summary' })
   await within(summary).findByText('5 / 5')
@@ -734,8 +740,8 @@ test('completed audio Practice loads its mocked persisted summary once without r
   view.rerender(<Interview />)
   expect(historyApi.getHistoryDetail).toHaveBeenCalledTimes(1)
   expect(historyApi.getHistoryDetail).toHaveBeenCalledWith(session.id, { signal: expect.any(AbortSignal) })
-  expect(attemptWrites(fetchMock)).toHaveLength(1)
-  expect(fetchMock.mock.calls.filter(([url, options]) => String(url).endsWith('/continue') && options?.method === 'POST')).toHaveLength(1)
+  expect(attemptWrites(fetchMock)).toHaveLength(5)
+  expect(fetchMock.mock.calls.filter(([url, options]) => String(url).endsWith('/continue') && options?.method === 'POST')).toHaveLength(5)
   expect(fetchMock.mock.calls.filter(([url]) => String(url).endsWith('/transcriptions'))).toHaveLength(0)
   expect(getUserMedia).not.toHaveBeenCalled()
   expect(screen.queryByRole('region', { name: 'Speaking measurements' })).toBeNull()
@@ -770,7 +776,7 @@ test.each(['', '   '])('deleting and retyping transcript text through %j preserv
   fireEvent.change(screen.getByRole('textbox'), { target: { value: empty } })
   fireEvent.change(screen.getByRole('textbox'), { target: { value: 'Typed replacement' } })
   await submitThenContinue()
-  await screen.findByRole('heading', { name: 'Interview Complete' })
+  await screen.findByText('Question 2 of 5')
   expect(JSON.parse(attemptWrites(fetchMock)[0][1].body)).toEqual({ expected_last_attempt_number: 0, answer: 'Typed replacement', measurement_id: measurementId })
 })
 
@@ -785,7 +791,7 @@ test('failed replacement transcription leaves no old measurement ID on a later t
   await screen.findByRole('alert')
   fireEvent.change(screen.getByRole('textbox'), { target: { value: 'Typed after failure' } })
   await submitThenContinue()
-  await screen.findByRole('heading', { name: 'Interview Complete' })
+  await screen.findByText('Question 2 of 5')
   expect(JSON.parse(attemptWrites(fetchMock)[0][1].body)).toEqual({ expected_last_attempt_number: 0, answer: 'Typed after failure', measurement_id: null })
 })
 
@@ -948,7 +954,7 @@ test('cancelling Retry stops its live microphone and discards the unsaved record
 })
 
 test('transcription 409 clears stale recording state and reloads the current server question without replay', async () => {
-  const active = { ...session, questions: ['First', 'Second'] }
+  const active = { ...session, current_question: 'First', questions: ['First', 'Second', 'Third', 'Fourth', 'Fifth'] }
   const changed: InterviewSession = { ...active, current_question_index: 1, current_question: 'Second', answers: ['Other tab answer'] }
   const fetchMock = vi.fn(async (url: string) => {
     if (url === '/api/sessions') return new Response(JSON.stringify(active))
@@ -960,7 +966,7 @@ test('transcription 409 clears stale recording state and reloads the current ser
   vi.stubGlobal('fetch', fetchMock)
   await interviewRecording()
   fireEvent.click(screen.getByRole('button', { name: 'Transcribe Recording' }))
-  await screen.findByText('Question 2 of 2')
+  await screen.findByText('Question 2 of 5')
   expect((screen.getByRole('textbox') as HTMLTextAreaElement).value).toBe('')
   expect(screen.queryByRole('button', { name: 'Send Recording' })).toBeNull()
   expect(screen.queryByRole('region', { name: 'Speaking measurements' })).toBeNull()

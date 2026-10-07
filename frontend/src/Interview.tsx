@@ -5,7 +5,7 @@ import Comparison from './AttemptComparison'
 import InterviewSummary from './InterviewSummary.tsx'
 import {
   ApiError, continueQuestion, getAttempts, getComparison, getSession,
-  getSemanticDiagnosis, isConflictError, SemanticDiagnosisError, startInterview, submitAttempt,
+  getSemanticDiagnosis, isConflictError, preparesNextQuestion, RoleplayUnavailableError, SemanticDiagnosisError, startInterview, submitAttempt,
 } from './interviewApi'
 import type { Attempt, AttemptComparison, InterviewSession, SemanticDiagnosis } from './interviewApi'
 import { personalizedDrillForFocus } from './personalizedDrills'
@@ -123,6 +123,7 @@ export default function Interview({ onSessionAccess, onNavigationBusyChange, onH
   const [diagnosis, setDiagnosis] = useState<DiagnosisState>({ status: 'idle' })
   const currentView = useRef<SavedView | null>(null)
   const diagnosisController = useRef<AbortController | null>(null)
+  const continueController = useRef<AbortController | null>(null)
   const diagnosisGeneration = useRef(0)
   const diagnosisOwner = useRef<DiagnosisTarget | null>(null)
   const locked = useRef(Boolean(restoreId))
@@ -147,6 +148,7 @@ export default function Interview({ onSessionAccess, onNavigationBusyChange, onH
     mounted.current = true
     return () => {
       mounted.current = false
+      continueController.current?.abort()
       invalidateDiagnosis()
       if (workspace && !isAuthWorkspaceCurrent(workspace.generation)) rememberSession(workspace.storageKey, null)
     }
@@ -261,8 +263,10 @@ export default function Interview({ onSessionAccess, onNavigationBusyChange, onH
     if (kind === 'continue' && (view.mode !== 'review' || !view.attempts.length)) return
     invalidateDiagnosis()
     const context = recoveryFor(view, kind)
+    const controller = kind === 'continue' ? new AbortController() : null
+    if (controller) continueController.current = controller
     locked.current = true
-    setOperation(kind === 'submit' ? 'Submitting…' : 'Continuing…')
+    setOperation(kind === 'submit' ? 'Submitting…' : preparesNextQuestion(view.session) ? 'Preparing next question…' : 'Continuing…')
     setError('')
     let acknowledged = false
     let submittedTarget: DiagnosisTarget | null = null
@@ -277,7 +281,7 @@ export default function Interview({ onSessionAccess, onNavigationBusyChange, onH
         install({ session: result.session, attempts: [...view.attempts, result.attempt], comparison: null, mode: 'review' })
         factsCallback.current?.()
       } else {
-        const updated = await continueQuestion(view.session)
+        const updated = await continueQuestion(view.session, controller?.signal)
         acknowledged = true
         if (!currentWorkspace()) return
         install({ session: updated, attempts: [], comparison: null, mode: 'composing' })
@@ -291,7 +295,9 @@ export default function Interview({ onSessionAccess, onNavigationBusyChange, onH
       }
     } catch (cause) {
       if (!currentWorkspace()) return
-      if (!acknowledged && isConflictError(cause)) {
+      if (!acknowledged && kind === 'continue' && cause instanceof RoleplayUnavailableError) {
+        setError(cause.message)
+      } else if (!acknowledged && isConflictError(cause)) {
         await reconcileConflict(context)
       } else if (acknowledged || !(cause instanceof ApiError) || cause.ambiguousWrite ||
                  (cause.status !== null && cause.status >= 500)) {
@@ -303,6 +309,7 @@ export default function Interview({ onSessionAccess, onNavigationBusyChange, onH
         setError(cause.message)
       }
     } finally {
+      if (continueController.current === controller) continueController.current = null
       if (currentWorkspace()) { locked.current = false; setOperation(null) }
     }
     // Feedback has its own lifecycle; its failures never classify a persisted write.
@@ -384,7 +391,7 @@ export default function Interview({ onSessionAccess, onNavigationBusyChange, onH
       )}
       {session?.status === 'active' && view && (
         <>
-          <p aria-live="polite">Question {session.current_question_index + 1} of {session.questions.length}</p>
+          <p aria-live="polite">Question {session.current_question_index + 1} of {session.total_questions}</p>
           <h2 id="current-question" aria-live="polite">{session.current_question}</h2>
           {view.mode === 'composing' && (
             <form onSubmit={submit}>
@@ -461,7 +468,7 @@ export default function Interview({ onSessionAccess, onNavigationBusyChange, onH
         <div>
           <div role="status">
             <h2>Interview Complete</h2>
-            <p>You completed all {session.questions.length} questions.</p>
+            <p>You completed all {session.total_questions} questions.</p>
           </div>
           {operation === null && recovery === null && <InterviewSummary key={session.id} sessionId={session.id} />}
           <button type="button" onClick={() => void start()} disabled={operation !== null || transcribing}>Start New Interview</button>

@@ -71,9 +71,9 @@ class PostgreSQLAuthSessionStore(AuthSessionStore):
     test injection may make them deterministic; production defaults use separate
     secure random draws. Normal object repr contains none of their values.
 
-    Revalidation is a point-in-time liveness check, not authorization for a later
-    protected write. Transaction-aware ownership enforcement belongs to a later
-    slice. Revocation of an absent session is an idempotent success.
+    Ordinary revalidation is a point-in-time liveness check. Adaptive Continue
+    additionally guards its own short persistence transaction with the existing
+    login row. Revocation of an absent session is an idempotent success.
     """
 
     def __init__(
@@ -191,6 +191,36 @@ class PostgreSQLAuthSessionStore(AuthSessionStore):
                     raise AuthenticationFailure(AuthenticationFailureKind.UNAUTHENTICATED)
                 if row.request_context != principal.request_context:
                     raise AuthenticationFailure(AuthenticationFailureKind.INVALID_REQUEST_CONTEXT)
+
+        _guarded(operation)
+
+    def revalidate_in_transaction(
+        self, *, database: Session, principal: AuthenticatedPrincipal,
+    ) -> None:
+        """Guard an adaptive write using its transaction, without opening another.
+
+        The caller first locks the owned interview root. A shared lock on the
+        exact local login then serializes this commit with revocation; concurrent
+        writes for different interviews can share that lock. Expiry is evaluated
+        after both lock waits. No credential or identity-provider data is needed.
+        """
+        def operation() -> None:
+            if type(principal) is not AuthenticatedPrincipal:
+                raise AuthenticationFailure(AuthenticationFailureKind.UNAUTHENTICATED)
+            if not isinstance(database, Session) or not database.in_transaction():
+                raise AuthenticationFailure(AuthenticationFailureKind.UNAVAILABLE)
+            row = database.execute(select(
+                AuthSession.request_context, AuthSession.expires_at,
+            ).join(User, User.id == AuthSession.user_id).where(
+                AuthSession.id == principal.auth_session_id,
+                AuthSession.user_id == principal.user_id,
+            ).with_for_update(read=True, of=AuthSession)).one_or_none()
+            if row is None or self._now() >= row.expires_at:
+                raise AuthenticationFailure(AuthenticationFailureKind.UNAUTHENTICATED)
+            if not secrets.compare_digest(
+                row.request_context.encode("utf-8"), principal.request_context.encode("utf-8"),
+            ):
+                raise AuthenticationFailure(AuthenticationFailureKind.INVALID_REQUEST_CONTEXT)
 
         _guarded(operation)
 

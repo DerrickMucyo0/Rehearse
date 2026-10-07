@@ -122,6 +122,10 @@ def authenticated_session_override(authenticated_principal, monkeypatch):
         def revalidate(self, *, principal):
             assert principal is authenticated_principal
 
+        def revalidate_in_transaction(self, *, database, principal):
+            assert database.in_transaction()
+            assert principal is authenticated_principal
+
     monkeypatch.setitem(app.dependency_overrides, get_auth_session_store, lambda: Store())
 
     def bind(service):
@@ -131,3 +135,27 @@ def authenticated_session_override(authenticated_principal, monkeypatch):
         return override
 
     return bind
+
+
+@pytest.fixture
+def offline_roleplay(monkeypatch):
+    """Existing HTTP lifecycle regressions use an explicit synthetic generator.
+
+    Questions follow the catalog only as deterministic fixture data. Actual
+    roleplay contracts and failure behavior have their own adapter/client tests.
+    """
+    from app.main import app
+    from app.roleplay import RoleplayQuestion
+    from app.roleplay_composition import get_roleplay_adapter
+    from app.scenarios import questions_for_scenario
+
+    class Adapter:
+        async def generate(self, context):
+            return RoleplayQuestion(
+                roleplay_version="live-ai-roleplay-v1",
+                next_question=questions_for_scenario(context.scenario_type)[context.next_question_number - 1],
+            )
+
+    adapter = Adapter()
+    monkeypatch.setitem(app.dependency_overrides, get_roleplay_adapter, lambda: adapter)
+    return adapter

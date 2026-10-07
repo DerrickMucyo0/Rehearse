@@ -20,7 +20,7 @@ const summaryAttemptId = (questionIndex: number, number: number) =>
 function completedHistoryDetail(id = summarySessionId, counts = [1, 1, 1, 1, 1], numbers = counts): HistoryDetail {
   const totalAttempts = counts.reduce((total, count) => total + count, 0)
   return {
-    summary: { session_id: id, scenario_type: 'job_interview', status: 'completed', created_at: '2026-10-04T11:00:00Z',
+    summary: { session_id: id, scenario_type: 'job_interview', question_engine: 'deterministic-v1', status: 'completed', created_at: '2026-10-04T11:00:00Z',
       completed_at: '2026-10-04T12:00:01Z', current_question_number: null, total_questions: 5,
       finalized_question_count: 5, questions_practiced_count: 5, total_attempt_count: totalAttempts,
       total_retry_count: totalAttempts - 5, measured_final_answer_count: 0,
@@ -57,7 +57,7 @@ function metric(before: number, after: number): Metric {
     comparable: true, comparison_unavailable_reason: null }
 }
 function freshSession(id = 'session-1', scenarioType: ScenarioType = 'job_interview'): InterviewSession {
-  return { id, scenario_type: scenarioType, status: 'active', current_question_index: 0, current_question: questions[0], questions,
+  return { id, scenario_type: scenarioType, question_engine: 'deterministic-v1', total_questions: 5, status: 'active', current_question_index: 0, current_question: questions[0], questions,
     answers: [], current_question_latest_attempt_number: 0 }
 }
 function response(data: unknown, status = 200) { return new Response(JSON.stringify(data), { status }) }
@@ -82,6 +82,7 @@ function mockSessionApi(initial = freshSession()) {
     const nextIndex = session.current_question_index + 1
     session = { ...session, current_question_index: nextIndex, current_question: questions[nextIndex] ?? null,
       status: nextIndex === questions.length ? 'completed' : 'active',
+      questions: session.question_engine === 'live-ai-roleplay-v1' ? questions.slice(0, Math.min(nextIndex + 1, 5)) : session.questions,
       answers: [...session.answers, latest?.answer ?? 'Saved answer'], current_question_latest_attempt_number: 0 }
     return session
   }
@@ -107,6 +108,7 @@ function mockSessionApi(initial = freshSession()) {
       attempts.clear()
       comparisons.clear()
       session = freshSession(`session-${creations}`, body.scenario_type)
+      if (initial.question_engine === 'live-ai-roleplay-v1') session = { ...session, question_engine: initial.question_engine, questions: questions.slice(0, 1) }
       return response(session, 201)
     }
     const diagnosisMatch = url.match(/^\/api\/sessions\/([^/]+)\/questions\/(\d+)\/attempts\/(\d+)\/diagnosis$/)
@@ -141,7 +143,9 @@ function mockSessionApi(initial = freshSession()) {
       expect(session.status).toBe('completed')
       const counts = questions.map((_, index) => Math.max(1, saved(index).length))
       const numbers = questions.map((_, index) => saved(index).at(-1)?.attempt_number ?? 1)
-      return response(completedHistoryDetail(session.id, counts, numbers))
+      const detail = completedHistoryDetail(session.id, counts, numbers)
+      detail.summary.question_engine = session.question_engine
+      return response(detail)
     }
     throw new Error(`Unexpected mocked endpoint: ${url}`)
   })
@@ -956,7 +960,7 @@ test('diagnosis waits for coherent saved review, then renders semantic feedback 
 })
 
 test('diagnosis targets the acknowledged sparse attempt number, question, session and persisted identity', async () => {
-  const api = mockSessionApi({ ...freshSession('existing-session'), current_question_index: 2, current_question: questions[2] })
+  const api = mockSessionApi({ ...freshSession('existing-session'), current_question_index: 2, current_question: questions[2], answers: ['First final', 'Second final'] })
   api.append('Earlier authoritative answer', null, 7)
   await restore(api)
   await screen.findByRole('button', { name: 'Continue' })
@@ -1618,4 +1622,108 @@ test.each(['success', 'error'] as const)('unmount aborts the summary and ignores
   expect(document.body.textContent).not.toContain('STALE_UNMOUNT_SUMMARY')
   expect(api.gets('/history-detail')).toHaveLength(1)
   expect(api.fetchMock.mock.calls.filter(([, options]) => options?.method === 'POST')).toHaveLength(0)
+})
+
+
+const roleplayUnavailable = {
+  detail: 'Interviewer is unavailable right now. Try Continue again.',
+  code: 'roleplay_generation_unavailable', write_outcome: 'not_applied',
+}
+function adaptiveSession(): InterviewSession {
+  return { ...freshSession(), question_engine: 'live-ai-roleplay-v1', questions: questions.slice(0, 1) }
+}
+
+test('adaptive questions are prepared only by Continue and remain a persisted prefix through completion', async () => {
+  const api = mockSessionApi(adaptiveSession())
+  render(<Interview />); await start()
+  expect(screen.getByText('Question 1 of 5')).toBeTruthy()
+  expect(api.session().questions).toEqual(questions.slice(0, 1))
+  await submit('First attempt'); await retry(); await submit('Selected final answer')
+  expect(api.posts('/continue')).toHaveLength(0)
+  const pending = deferredResponse()
+  api.intercept((url, options) => url.endsWith('/continue') && options?.method === 'POST' ? pending.promise : undefined)
+  const button = screen.getByRole('button', { name: 'Continue' })
+  fireEvent.click(button); fireEvent.click(button)
+  expect(screen.getByText('Preparing next question…')).toBeTruthy()
+  expect((screen.getByRole('button', { name: 'Retry Again' }) as HTMLButtonElement).disabled).toBe(true)
+  expect((button as HTMLButtonElement).disabled).toBe(true)
+  expect(api.posts('/continue')).toHaveLength(1)
+  expect(screen.getByText('Question 1 of 5')).toBeTruthy()
+  api.intercept(() => undefined)
+  await act(async () => pending.resolve(response(api.advance())))
+  await screen.findByText('Question 2 of 5')
+  expect(api.session().questions).toEqual(questions.slice(0, 2))
+  for (let index = 1; index < 5; index += 1) {
+    await submit(`Answer ${index + 1}`)
+    fireEvent.click(screen.getByRole('button', { name: 'Continue' }))
+    if (index < 4) await screen.findByText(`Question ${index + 2} of 5`)
+  }
+  await screen.findByRole('heading', { name: 'Interview Complete' })
+  expect(api.session().questions).toEqual(questions)
+  expect(api.posts('/continue')).toHaveLength(5)
+  expect(api.posts('/diagnosis')).toHaveLength(6)
+})
+
+test('known no-commit roleplay failure preserves saved review and allows an explicit Continue retry', async () => {
+  const api = mockSessionApi(adaptiveSession())
+  render(<Interview />); await start(); await submit('Saved answer')
+  api.intercept((url, options) => url.endsWith('/continue') && options?.method === 'POST' ? response(roleplayUnavailable, 503) : undefined)
+  fireEvent.click(screen.getByRole('button', { name: 'Continue' }))
+  await screen.findByText(roleplayUnavailable.detail)
+  expect(screen.getByText('Saved answer')).toBeTruthy()
+  expect(screen.getByText('Question 1 of 5')).toBeTruthy()
+  expect(api.session().questions).toHaveLength(1)
+  expect(screen.queryByRole('button', { name: 'Recheck saved state' })).toBeNull()
+  expect((screen.getByRole('button', { name: 'Continue' }) as HTMLButtonElement).disabled).toBe(false)
+  expect((screen.getByRole('button', { name: 'Retry' }) as HTMLButtonElement).disabled).toBe(false)
+  expect(api.posts('/continue')).toHaveLength(1)
+  await retry()
+  fireEvent.click(screen.getByRole('button', { name: 'Cancel Retry' }))
+  api.intercept(() => undefined)
+  fireEvent.click(screen.getByRole('button', { name: 'Continue' }))
+  await screen.findByText('Question 2 of 5')
+  expect(api.posts('/continue')).toHaveLength(2)
+})
+
+test.each([false, true])('adaptive lost Continue response reconciles without replay; committed=%s', async (committed) => {
+  const api = mockSessionApi(adaptiveSession())
+  render(<Interview />); await start(); await submit('Saved answer')
+  api.intercept((url, options) => {
+    if (url.endsWith('/continue') && options?.method === 'POST') {
+      if (committed) api.advance()
+      return Promise.reject(new TypeError('Response lost'))
+    }
+  })
+  fireEvent.click(screen.getByRole('button', { name: 'Continue' }))
+  await screen.findByRole('button', { name: 'Recheck saved state' })
+  expect((screen.getByRole('button', { name: 'Continue' }) as HTMLButtonElement).disabled).toBe(true)
+  fireEvent.click(screen.getByRole('button', { name: 'Recheck saved state' }))
+  await screen.findByText(committed ? 'Question 2 of 5' : 'Saved state rechecked. Choose your next action; no request was resubmitted.')
+  expect(api.posts('/continue')).toHaveLength(1)
+  expect(api.session().questions).toHaveLength(committed ? 2 : 1)
+})
+
+test('unmount cancels pending adaptive Continue and ignores its late result', async () => {
+  const api = mockSessionApi(adaptiveSession())
+  const mounted = render(<Interview />); await start(); await submit('Saved answer')
+  const pending = deferredResponse()
+  api.intercept((url, options) => url.endsWith('/continue') && options?.method === 'POST' ? pending.promise : undefined)
+  fireEvent.click(screen.getByRole('button', { name: 'Continue' }))
+  const signal = api.posts('/continue')[0][1]?.signal
+  expect(signal?.aborted).toBe(false)
+  mounted.unmount()
+  expect(signal?.aborted).toBe(true)
+  await act(async () => pending.resolve(response(api.advance())))
+  expect(screen.queryByText('Question 2 of 5')).toBeNull()
+})
+
+test('restoring an adaptive session reads its generated prefix without continuing or requesting diagnosis', async () => {
+  const api = mockSessionApi(adaptiveSession())
+  api.append('Finalized first'); api.advance(); api.append('Saved current')
+  await restore(api)
+  await screen.findByText('Question 2 of 5')
+  expect(screen.getByText('Saved current')).toBeTruthy()
+  expect(screen.queryByText(questions[2])).toBeNull()
+  expect(api.posts('/continue')).toHaveLength(0)
+  expect(api.posts('/diagnosis')).toHaveLength(0)
 })

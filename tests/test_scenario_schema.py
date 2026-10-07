@@ -7,13 +7,14 @@ from uuid import uuid4
 import pytest
 from alembic import command
 from alembic.config import Config
-from sqlalchemy import MetaData, Table, insert, inspect, select
+from sqlalchemy import MetaData, Table, insert, inspect, select, text
 from sqlalchemy.exc import IntegrityError
 
 from app.sessions import QUESTIONS
 
 ROOT = Path(__file__).resolve().parents[1]
 SCENARIOS = ("job_interview", "public_speaking", "thesis_defense", "salary_negotiation")
+SCENARIO_REVISION = "0005_session_scenarios"
 
 
 def migration_config(connection):
@@ -27,6 +28,9 @@ def connection(postgres_engine):
     with postgres_engine.connect() as connection:
         transaction = connection.begin()
         try:
+            # Preserve the historical 0004 -> 0005 contract independently of
+            # later engine extensions; rollback restores the current head.
+            command.downgrade(migration_config(connection), SCENARIO_REVISION)
             yield connection
         finally:
             transaction.rollback()
@@ -44,6 +48,7 @@ def test_populated_0004_upgrade_defaults_legacy_scenarios_and_preserves_all_prio
     tables = {name: table for name, table in metadata.tables.items() if name != "alembic_version"}
     sessions = tables["interview_sessions"]
     assert "scenario_type" not in sessions.c
+    assert "question_engine" not in sessions.c
     now = datetime(2026, 1, 1, tzinfo=timezone.utc)
     owner, owned, anonymous, measurement = (uuid4() for _ in range(4))
     connection.execute(insert(tables["users"]).values(
@@ -76,8 +81,10 @@ def test_populated_0004_upgrade_defaults_legacy_scenarios_and_preserves_all_prio
     ])
     prior = {name: rows(connection, table) for name, table in tables.items()}
 
-    command.upgrade(config, "head")
+    command.upgrade(config, SCENARIO_REVISION)
+    assert connection.scalar(text("SELECT version_num FROM alembic_version")) == SCENARIO_REVISION
     current = Table("interview_sessions", MetaData(), autoload_with=connection)
+    assert "question_engine" not in current.c
     migrated = rows(connection, current)
     assert set(migrated) == {owned, anonymous}
     assert all(row["scenario_type"] == "job_interview" for row in migrated.values())
@@ -88,7 +95,7 @@ def test_populated_0004_upgrade_defaults_legacy_scenarios_and_preserves_all_prio
     command.downgrade(config, "0004_oidc_login_transactions")
     assert "scenario_type" not in {column["name"] for column in inspect(connection).get_columns("interview_sessions")}
     assert {name: rows(connection, table) for name, table in tables.items()} == prior
-    command.upgrade(config, "head")
+    command.upgrade(config, SCENARIO_REVISION)
     assert all(row["scenario_type"] == "job_interview" for row in rows(connection, current).values())
 
 

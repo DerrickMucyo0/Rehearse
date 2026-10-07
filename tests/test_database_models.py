@@ -56,10 +56,36 @@ def test_question_snapshot_copies_input_and_returns_immutable_tuple():
         value[0] = "Changed"
 
 
-@pytest.mark.parametrize("questions", [[], ["q"], [1] * 5, [""] * 5, ["\x00"] * 5])
-def test_question_snapshot_validates_five_nonempty_text_questions(questions):
+@pytest.mark.parametrize("questions", [[], ["q"] * 6, [1] * 5, [""] * 5, [" "] * 5, ["\x00"] * 5])
+def test_question_snapshot_validates_one_to_five_nonblank_text_questions(questions):
     with pytest.raises(ValueError):
         StoredInterviewSession(questions=questions)
+
+
+@pytest.mark.parametrize("count", [1, 2, 3, 4, 5])
+def test_question_snapshot_copies_each_bounded_adaptive_prefix(count):
+    supplied = list(QUESTIONS[:count])
+    record = StoredInterviewSession(questions=supplied, question_engine="live-ai-roleplay-v1")
+    supplied[0] = "Changed elsewhere"
+    assert record.questions == QUESTIONS[:count]
+    assert type(record.questions) is tuple
+
+
+@pytest.mark.parametrize("engine", ["deterministic-v1", "live-ai-roleplay-v1"])
+def test_question_engine_mapping_accepts_only_canonical_engines_with_legacy_defaults(engine):
+    record = StoredInterviewSession(question_engine=engine)
+    assert record.question_engine == engine
+    column = StoredInterviewSession.__table__.c.question_engine
+    assert column.nullable is False
+    assert column.type.collation == "C"
+    assert column.default.arg == "deterministic-v1"
+    assert str(column.server_default.arg) == "deterministic-v1"
+
+
+@pytest.mark.parametrize("engine", ["", "other", "LIVE-AI-ROLEPLAY-V1", None, True, 1])
+def test_question_engine_mapping_rejects_unknown_values(engine):
+    with pytest.raises(ValueError, match="^Unsupported question engine\\.$"):
+        StoredInterviewSession(question_engine=engine)
 
 
 @pytest.mark.parametrize("hours,linked,expected", [
@@ -77,14 +103,15 @@ def test_retention_rejects_ambiguous_naive_timestamps():
         record.unlinked_deletion_eligible(linked=False, now=datetime(2026, 1, 2, tzinfo=timezone.utc))
 
 
-def test_alembic_has_scenario_head_after_login_transactions_and_emits_postgresql_ddl_offline(monkeypatch):
+def test_alembic_has_roleplay_head_after_scenarios_and_emits_postgresql_ddl_offline(monkeypatch):
     monkeypatch.setenv("DATABASE_URL", "postgresql+psycopg://offline@localhost/rehearse_dev")
     output = StringIO()
     config = Config(str(ROOT / "alembic.ini"), output_buffer=output)
     config.attributes["skip_logging"] = True
     scripts = ScriptDirectory.from_config(config)
-    assert scripts.get_heads() == ["0005_session_scenarios"]
-    assert scripts.get_revision("head").down_revision == "0004_oidc_login_transactions"
+    assert scripts.get_heads() == ["0006_live_ai_roleplay"]
+    assert scripts.get_revision("head").down_revision == "0005_session_scenarios"
+    assert scripts.get_revision("0005_session_scenarios").down_revision == "0004_oidc_login_transactions"
     assert scripts.get_revision("0004_oidc_login_transactions").down_revision == "0003_auth_user_ownership"
     assert scripts.get_revision("0003_auth_user_ownership").down_revision == "0002_pause_delivery_metrics"
     assert scripts.get_revision("0002_pause_delivery_metrics").down_revision == "0001_database_foundation"
@@ -99,6 +126,11 @@ def test_alembic_has_scenario_head_after_login_transactions_and_emits_postgresql
     assert "CREATE TRIGGER preserve_measurement" in sql
     assert "ADD COLUMN scenario_type TEXT COLLATE \"C\" DEFAULT 'job_interview' NOT NULL" in sql
     assert "ADD CONSTRAINT ck_sessions_scenario_type" in sql
+    assert "ADD COLUMN question_engine TEXT COLLATE \"C\" DEFAULT 'deterministic-v1' NOT NULL" in sql
+    assert "ADD CONSTRAINT ck_sessions_question_engine" in sql
+    assert "CREATE OR REPLACE FUNCTION rehearse_preserve_questions()" in sql
+    assert "Question engine is immutable." in sql
+    assert "Adaptive questions must append with one advancement." in sql
     for column in DELIVERY_COLUMNS:
         assert f"ADD COLUMN {column}" in sql
     for constraint in DELIVERY_CONSTRAINTS:
@@ -107,6 +139,8 @@ def test_alembic_has_scenario_head_after_login_transactions_and_emits_postgresql
     output.truncate(0)
     command.downgrade(config, "head:base", sql=True)
     sql = output.getvalue()
+    assert "Adaptive sessions prevent this downgrade." in sql
+    assert sql.index("DROP COLUMN question_engine") < sql.index("DROP COLUMN scenario_type")
     assert sql.index("DROP COLUMN scenario_type") < sql.index("DROP TABLE oidc_login_transactions")
     for column in DELIVERY_COLUMNS:
         assert f"DROP COLUMN {column}" in sql

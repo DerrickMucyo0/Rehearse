@@ -30,6 +30,9 @@ from app.database_models import (
     TranscriptionMeasurement,
 )
 from app.main import app
+from app.roleplay import RoleplayQuestion
+from app.roleplay_composition import get_roleplay_adapter
+from app.scenarios import questions_for_scenario
 from app.sessions import QUESTIONS, InterviewSessionService
 
 CORE_OPERATIONS = ("get", "submit", "list", "continue", "comparison")
@@ -74,6 +77,7 @@ class Harness:
     client: TestClient
     store: PostgreSQLAuthSessionStore
     logins: tuple[IssuedAuthSession, IssuedAuthSession]
+    roleplay_calls: list
 
     def create(self, actor=0):
         response = self.client.post("/api/sessions", headers=headers(self.logins[actor]))
@@ -123,8 +127,22 @@ def harness(postgres_session_factory, postgres_engine, monkeypatch):
         auth_http.require_authenticated_principal,
     ):
         monkeypatch.delitem(app.dependency_overrides, dependency, raising=False)
+    roleplay_calls = []
+
+    class SyntheticRoleplayer:
+        async def generate(self, context):
+            roleplay_calls.append(context)
+            # Exercise production preparation/authorization/commit with a local
+            # candidate while the transport guard forbids all real inference.
+            assert postgres_engine.pool.checkedout() == 0
+            return RoleplayQuestion(
+                roleplay_version="live-ai-roleplay-v1",
+                next_question=questions_for_scenario(context.scenario_type)[context.next_question_number - 1],
+            )
+
+    monkeypatch.setitem(app.dependency_overrides, get_roleplay_adapter, lambda: SyntheticRoleplayer())
     with TestClient(app, raise_server_exceptions=False) as client:
-        yield Harness(postgres_session_factory, postgres_engine, client, store, logins)
+        yield Harness(postgres_session_factory, postgres_engine, client, store, logins, roleplay_calls)
 
 
 def legacy_session(factory):
@@ -160,6 +178,8 @@ def test_owned_core_operations_preserve_retry_continue_and_comparison(harness, a
     identifier = harness.create(actor)
     created = harness.request("get", identifier, actor).json()
     assert created["current_question_index"] == 0
+    assert created["question_engine"] == "live-ai-roleplay-v1"
+    assert created["total_questions"] == 5
     assert created["answers"] == []
     assert created["current_question_latest_attempt_number"] == 0
     assert harness.request("list", identifier, actor).json() == []
@@ -184,6 +204,8 @@ def test_owned_core_operations_preserve_retry_continue_and_comparison(harness, a
     assert continued.status_code == 200
     assert continued.json()["current_question_index"] == 1
     assert continued.json()["answers"] == ["Second answer."]
+    assert len(harness.roleplay_calls) == 1
+    assert harness.roleplay_calls[0].turns[0].answer == "Second answer."
     assert harness.request("get", identifier, actor).json() == continued.json()
     rows = persisted(harness.factory)["interview_sessions"]
     assert rows[identifier]["user_id"] == harness.logins[actor].principal.user_id
@@ -201,6 +223,7 @@ def test_browser_owner_claims_cannot_change_application_creation_owner(harness):
     assert any(error["type"] == "extra_forbidden" and error["loc"] == ["body", "user_id"]
                for error in rejected.json()["detail"])
     assert persisted(harness.factory) == before
+    assert harness.roleplay_calls == []
 
     response = harness.client.post(f"/api/sessions?user_id={claimed.user_id}", headers=supplied,
                                    json={"scenario_type": "public_speaking"})
@@ -226,13 +249,16 @@ def test_foreign_nonexistent_and_null_owned_resources_have_identical_404s(harnes
         assert_not_found(response)
     assert len({(response.status_code, response.content) for response in responses}) == 1
     assert persisted(harness.factory) == before
+    assert harness.roleplay_calls == []
     assert before["interview_sessions"][legacy]["user_id"] is None
     assert StoredInterviewSession.__table__.c.user_id.nullable is True
 
 
 @pytest.mark.parametrize("operation", CORE_OPERATIONS)
 def test_foreign_root_precedes_children_revisions_measurements_and_completion(harness, operation):
-    foreign = harness.create(1)
+    # This historical completion fixture deliberately bypasses progression to
+    # test foreign-root precedence. Keep it in the preserved deterministic mode.
+    foreign = InterviewSessionService(harness.factory, harness.logins[1].principal).start().id
     foreign_measurement = measurement(harness.factory, foreign)
     with harness.factory.begin() as database:
         database.add(QuestionAttempt(
@@ -264,6 +290,7 @@ def test_foreign_root_precedes_children_revisions_measurements_and_completion(ha
     assert not any("from question_attempts" in statement or "from transcription_measurements" in statement
                    for statement in statements)
     assert persisted(harness.factory) == before
+    assert harness.roleplay_calls == []
 
 
 @pytest.mark.parametrize("operation", CORE_OPERATIONS)

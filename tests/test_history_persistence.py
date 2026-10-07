@@ -28,7 +28,7 @@ from app.speaking_metrics import SpeakingMetrics
 
 
 SUMMARY_FIELDS = {
-    "session_id", "scenario_type", "status", "created_at", "completed_at", "current_question_number",
+    "session_id", "scenario_type", "question_engine", "status", "created_at", "completed_at", "current_question_number",
     "total_questions", "finalized_question_count", "questions_practiced_count",
     "total_attempt_count", "total_retry_count", "measured_final_answer_count",
     "last_submitted_at", "last_saved_activity_at", "finalized_points",
@@ -238,6 +238,7 @@ def test_empty_summary_and_detail_have_exact_bounded_shapes(client, sessions):
     summary = batch(client, [created.id]).json()["summaries"][0]
     assert set(summary) == SUMMARY_FIELDS
     assert summary["scenario_type"] == "job_interview"
+    assert summary["question_engine"] == "deterministic-v1"
     assert summary["status"] == "active"
     assert summary["current_question_number"] == 1
     assert summary["total_questions"] == 5
