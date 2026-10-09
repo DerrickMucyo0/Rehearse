@@ -3,7 +3,6 @@
 from dataclasses import dataclass, field
 from typing import Protocol
 
-from app.interviewer_personas import InterviewerPersonaId
 
 @dataclass(frozen=True, slots=True)
 class SynthesizedSpeech:
@@ -17,9 +16,7 @@ class SynthesizedSpeech:
 
 
 class SpeechService(Protocol):
-    async def synthesize(
-        self, text: str, *, persona_id: InterviewerPersonaId | None = None,
-    ) -> SynthesizedSpeech:
+    async def synthesize(self, text: str) -> SynthesizedSpeech:
         ...
 
 

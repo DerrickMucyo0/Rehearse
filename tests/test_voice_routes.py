@@ -40,14 +40,12 @@ class Speaker:
     def __init__(self, engine):
         self.engine = engine
         self.texts = []
-        self.persona_ids = []
         self.during = None
         self.thread = None
 
-    async def synthesize(self, text, *, persona_id=None):
+    async def synthesize(self, text):
         self.thread = get_ident()
         self.texts.append(text)
-        self.persona_ids.append(persona_id)
         assert self.engine.pool.checkedout() == 0
         if self.during:
             self.during()
@@ -121,7 +119,6 @@ def test_current_persisted_question_only_and_no_storage_or_provider_side_effects
     assert response.headers["cache-control"] == "no-store"
     assert response.headers["x-content-type-options"] == "nosniff"
     assert harness.speaker.texts == [created.questions[0]]
-    assert harness.speaker.persona_ids == ["recruiter" if adaptive else None]
     assert len(reads) == 2
     assert all(thread != harness.speaker.thread for _, thread in reads)
     assert persisted(harness.factory) == before
@@ -142,15 +139,7 @@ def test_adaptive_generated_question_is_read_exactly_without_generation(harness)
     before = persisted(harness.factory)
     assert harness.speech(created.id, 1).status_code == 200
     assert harness.speaker.texts == [text]
-    assert harness.speaker.persona_ids == ["recruiter"]
     assert persisted(harness.factory) == before
-
-
-def test_speech_uses_the_persisted_selected_persona(harness):
-    created = harness.service.start_adaptive("job_interview", "manager")
-    response = harness.speech(created.id)
-    assert response.status_code == 200
-    assert harness.speaker.persona_ids == ["manager"]
 
 
 @pytest.mark.parametrize("body", [b'{}', b'{"text":"FORGED_QUESTION"}', b'x' * (3 * 1024 * 1024)],
