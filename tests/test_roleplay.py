@@ -77,9 +77,9 @@ def test_complete_history_and_prompt_preserve_all_authoritative_text(scenario, c
 
 
 @pytest.mark.parametrize("persona_id,tone,name", [
-    ("recruiter", "polite", "University Recruiter"),
-    ("manager", "formal", "Senior Manager"),
-    ("hr", "firm", "HR Lead"),
+    ("recruiter", "skeptical", "Skeptical Screener"),
+    ("manager", "demanding", "Demanding Director"),
+    ("hr", "unrelenting", "Stonewalling Negotiator"),
 ])
 def test_persona_changes_trusted_prompt_style(persona_id, tone, name):
     supplied = context()

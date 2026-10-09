@@ -9,7 +9,7 @@ import httpx
 import pytest
 
 from app import nvidia_roleplay as provider
-from app import gemini_roleplay as gemini_provider
+from app import nvidia_roleplay as nvidia_provider
 from app.roleplay import RoleplayContext, RoleplayQuestion, RoleplayTurn, RoleplayUnavailable
 from app.roleplay_client import JSONRoleplayAdapter
 from app.roleplay_composition import get_roleplay_adapter
@@ -66,10 +66,10 @@ def test_factory_does_not_read_key_or_start_http(monkeypatch):
         def get(self, *args):
             raise AssertionError("Composition cannot access credentials.")
 
-    monkeypatch.setattr(gemini_provider, "os", SimpleNamespace(environ=ForbiddenEnvironment()))
+    monkeypatch.setattr(nvidia_provider, "os", SimpleNamespace(environ=ForbiddenEnvironment()))
     adapter = get_roleplay_adapter()
     assert type(adapter) is JSONRoleplayAdapter
-    assert type(adapter._client) is gemini_provider.GeminiRoleplayClient
+    assert type(adapter._client) is nvidia_provider.NVIDIANemotronRoleplayClient
 
 
 @pytest.mark.parametrize("key", [None, "", " \t\n "])
