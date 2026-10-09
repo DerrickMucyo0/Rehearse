@@ -4,6 +4,7 @@ import json
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from app.interviewer_personas import persona_for
 from app.roleplay import RoleplayContext, RoleplayQuestion
 
 _SYSTEM = """Act as a practice conversation partner for the supplied scenario. Generate exactly one short, natural next question, using the preceding questions and answers to continue the conversation. Keep the question appropriate to the scenario and avoid repeating an earlier question.
@@ -27,8 +28,13 @@ class RoleplayPrompt(BaseModel):
 def build_roleplay_prompt(context: RoleplayContext) -> RoleplayPrompt:
     if type(context) is not RoleplayContext:
         raise TypeError("Roleplay prompt context must be a RoleplayContext instance.")
+    persona = persona_for(context.interviewer_persona_id)
     return RoleplayPrompt(
-        system=_SYSTEM,
+        system=(
+            f"{_SYSTEM}\n\n"
+            f"Interviewer persona: {persona.name} ({persona.role}), with a {persona.tone.lower()} tone. "
+            f"{persona.prompt_style}"
+        ),
         user=json.dumps(
             {
                 "context": context.model_dump(mode="json"),

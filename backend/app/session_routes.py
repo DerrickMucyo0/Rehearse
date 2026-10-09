@@ -1,3 +1,4 @@
+import logging
 from contextlib import asynccontextmanager
 from typing import Annotated, Literal
 from uuid import UUID
@@ -15,6 +16,7 @@ from app.auth_http import (
 from app.comparisons import AttemptComparison
 from app.database import get_database_session_factory
 from app.delivery_metrics import DeliveryMetrics, measure_delivery
+from app.interviewer_personas import InterviewerPersonaId
 from app.roleplay import RoleplayAdapter, RoleplayUnavailable
 from app.roleplay_application import continue_application_attempt
 from app.roleplay_composition import get_roleplay_adapter
@@ -49,6 +51,16 @@ from app.voice import SpeechFailed, SpeechService, SpeechTimeout, SpeechUnavaila
 from app.voice_composition import get_speech_service
 
 router = APIRouter(prefix="/api/sessions", tags=["sessions"])
+logger = logging.getLogger(__name__)
+
+
+def _log_semantic_diagnosis_failure(error: SemanticDiagnosisFailed) -> None:
+    """Log only the validated, content-free failure metadata."""
+    logger.warning(
+        "semantic_diagnosis_failure category=%s upstream_status=%s",
+        error.category,
+        error.upstream_status,
+    )
 
 
 def get_session_service(principal: AuthenticatedPrincipalDependency) -> InterviewSessionService:
@@ -71,7 +83,7 @@ QuestionSpeechService = Annotated[SpeechService, Depends(get_speech_service)]
 
 async def _current_speech_question(
     sessions: InterviewSessionService, session_id: UUID, question_index: int,
-) -> str:
+) -> tuple[str, InterviewerPersonaId | None]:
     try:
         session = await run_in_threadpool(sessions.get, session_id)
     except SessionNotFound:
@@ -82,7 +94,7 @@ async def _current_speech_question(
         or question_index >= len(session.questions)
     ):
         raise HTTPException(404, "Session not found.") from None
-    return session.questions[session.current_question_index]
+    return session.questions[session.current_question_index], session.interviewer_persona_id
 
 
 @router.post("/{session_id}/questions/{question_index}/speech", response_class=Response)
@@ -96,9 +108,9 @@ async def speak_question(
     async for chunk in request.stream():
         if chunk:
             raise HTTPException(422, "Speech requests do not accept a body.")
-    text = await _current_speech_question(sessions, session_id, question_index)
+    text, persona_id = await _current_speech_question(sessions, session_id, question_index)
     try:
-        speech = await speaker.synthesize(text)
+        speech = await speaker.synthesize(text, persona_id=persona_id)
     except SpeechUnavailable:
         raise HTTPException(503, "Voice playback is unavailable right now.") from None
     except SpeechTimeout:
@@ -108,7 +120,7 @@ async def speak_question(
     # Both database operations have completed before provider work. Recheck the
     # initiating login and the current question in fresh, short reads afterwards.
     await run_in_threadpool(revalidate_authenticated_principal, principal, auth_store)
-    if await _current_speech_question(sessions, session_id, question_index) != text:
+    if await _current_speech_question(sessions, session_id, question_index) != (text, persona_id):
         raise HTTPException(404, "Session not found.") from None
     return Response(speech.audio, media_type="audio/mpeg", headers={
         "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff",
@@ -119,7 +131,8 @@ async def speak_question(
 def start_session(
     response: Response, sessions: SessionService, body: StartSessionRequest | None = None,
 ) -> InterviewSession:
-    session = sessions.start_adaptive(body.scenario_type if body is not None else "job_interview")
+    request = body or StartSessionRequest()
+    session = sessions.start_adaptive(request.scenario_type, request.interviewer_persona_id)
     response.headers["Location"] = f"/api/sessions/{session.id}"
     return session
 
@@ -211,7 +224,8 @@ async def diagnose_attempt(
         raise HTTPException(status_code=503, detail="Semantic diagnosis is not configured.") from None
     except SemanticDiagnosisTimeout:
         raise HTTPException(status_code=504, detail="Semantic diagnosis timed out.") from None
-    except SemanticDiagnosisFailed:
+    except SemanticDiagnosisFailed as error:
+        _log_semantic_diagnosis_failure(error)
         raise HTTPException(status_code=502, detail="Unable to generate semantic diagnosis.") from None
     await run_in_threadpool(revalidate_authenticated_principal, principal, auth_store)
     try:

@@ -13,6 +13,7 @@ from app.database_models import (
     Base, QuestionAttempt, QuestionSnapshot, StoredInterviewSession,
     TranscriptionMeasurement, validate_submitted_answer_text,
 )
+from app.interviewer_personas import INTERVIEWER_PERSONAS
 from app.sessions import QUESTIONS
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -88,6 +89,27 @@ def test_question_engine_mapping_rejects_unknown_values(engine):
         StoredInterviewSession(question_engine=engine)
 
 
+@pytest.mark.parametrize("persona_id", ["recruiter", "manager", "hr"])
+def test_interviewer_persona_mapping_accepts_only_fixed_persisted_ids(persona_id):
+    record = StoredInterviewSession(questions=QUESTIONS, interviewer_persona_id=persona_id)
+    assert record.interviewer_persona_id == persona_id
+    column = StoredInterviewSession.__table__.c.interviewer_persona_id
+    assert column.nullable is True
+    assert column.default is None and column.server_default is None
+    assert column.type.collation == "C"
+    assert INTERVIEWER_PERSONAS[persona_id].id == persona_id
+
+
+@pytest.mark.parametrize("persona_id", ["", "University Recruiter", "manager ", True, 1, {}])
+def test_interviewer_persona_mapping_rejects_unknown_values(persona_id):
+    with pytest.raises(ValueError, match="^Unsupported interviewer persona\\.$"):
+        StoredInterviewSession(interviewer_persona_id=persona_id)
+
+
+def test_interviewer_persona_null_is_reserved_for_legacy_sessions():
+    assert StoredInterviewSession(interviewer_persona_id=None).interviewer_persona_id is None
+
+
 @pytest.mark.parametrize("hours,linked,expected", [
     (23.999, False, False), (24, False, True), (25, False, True), (24, True, False), (100, True, False),
 ])
@@ -109,8 +131,8 @@ def test_alembic_has_roleplay_head_after_scenarios_and_emits_postgresql_ddl_offl
     config = Config(str(ROOT / "alembic.ini"), output_buffer=output)
     config.attributes["skip_logging"] = True
     scripts = ScriptDirectory.from_config(config)
-    assert scripts.get_heads() == ["0006_live_ai_roleplay"]
-    assert scripts.get_revision("head").down_revision == "0005_session_scenarios"
+    assert scripts.get_heads() == ["0007_interviewer_personas"]
+    assert scripts.get_revision("head").down_revision == "0006_live_ai_roleplay"
     assert scripts.get_revision("0005_session_scenarios").down_revision == "0004_oidc_login_transactions"
     assert scripts.get_revision("0004_oidc_login_transactions").down_revision == "0003_auth_user_ownership"
     assert scripts.get_revision("0003_auth_user_ownership").down_revision == "0002_pause_delivery_metrics"
@@ -131,6 +153,10 @@ def test_alembic_has_roleplay_head_after_scenarios_and_emits_postgresql_ddl_offl
     assert "CREATE OR REPLACE FUNCTION rehearse_preserve_questions()" in sql
     assert "Question engine is immutable." in sql
     assert "Adaptive questions must append with one advancement." in sql
+    assert "ADD COLUMN interviewer_persona_id TEXT COLLATE \"C\"" in sql
+    assert "ADD CONSTRAINT ck_sessions_interviewer_persona" in sql
+    assert "CREATE TRIGGER preserve_interviewer_persona" in sql
+    assert "Interviewer persona is immutable." in sql
     for column in DELIVERY_COLUMNS:
         assert f"ADD COLUMN {column}" in sql
     for constraint in DELIVERY_CONSTRAINTS:

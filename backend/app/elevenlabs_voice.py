@@ -7,9 +7,10 @@ from urllib.parse import quote
 import httpx
 
 from app.voice import SpeechFailed, SpeechTimeout, SpeechUnavailable, SynthesizedSpeech
+from app.interviewer_personas import InterviewerPersonaId
 
 ELEVENLABS_VOICE_ENDPOINT = "https://api.elevenlabs.io/v1/text-to-speech"
-ELEVENLABS_VOICE_MODEL = "eleven_multilingual_v2"
+ELEVENLABS_VOICE_MODEL = "eleven_flash_v2_5"
 ELEVENLABS_VOICE_OUTPUT_FORMAT = "mp3_44100_128"
 ELEVENLABS_VOICE_CONNECT_TIMEOUT_SECONDS = 15
 ELEVENLABS_VOICE_READ_TIMEOUT_SECONDS = None
@@ -17,6 +18,11 @@ ELEVENLABS_VOICE_WRITE_TIMEOUT_SECONDS = 15
 ELEVENLABS_VOICE_POOL_TIMEOUT_SECONDS = 15
 ELEVENLABS_VOICE_TOTAL_TIMEOUT_SECONDS = 60
 ELEVENLABS_VOICE_MAX_BYTES = 2 * 1024 * 1024
+PERSONA_VOICE_ENV = {
+    "recruiter": "ELEVENLABS_RECRUITER_VOICE_ID",
+    "manager": "ELEVENLABS_MANAGER_VOICE_ID",
+    "hr": "ELEVENLABS_HR_VOICE_ID",
+}
 
 # MPEG audio bitrate tables, indexed by the four-bit bitrate index. A zero
 # bitrate (free format) cannot supply a deterministically bounded frame length.
@@ -95,9 +101,17 @@ class ElevenLabsSpeechService:
     def __init__(self, transport: httpx.AsyncBaseTransport | None = None) -> None:
         self._transport = transport
 
-    async def synthesize(self, text: str) -> SynthesizedSpeech:
+    async def synthesize(
+        self, text: str, *, persona_id: InterviewerPersonaId | None = None,
+    ) -> SynthesizedSpeech:
         key = os.environ.get("ELEVENLABS_API_KEY", "").strip()
-        voice_id = os.environ.get("ELEVENLABS_VOICE_ID", "").strip()
+        if persona_id is not None and persona_id not in PERSONA_VOICE_ENV:
+            raise SpeechUnavailable() from None
+        persona_voice_id = (
+            os.environ.get(PERSONA_VOICE_ENV[persona_id], "").strip()
+            if persona_id is not None else ""
+        )
+        voice_id = persona_voice_id or os.environ.get("ELEVENLABS_VOICE_ID", "").strip()
         if not key or not voice_id:
             raise SpeechUnavailable() from None
         audio = None
@@ -119,7 +133,11 @@ class ElevenLabsSpeechService:
                         headers={
                             "xi-api-key": key, "Accept": "audio/mpeg", "Accept-Encoding": "identity",
                         },
-                        json={"text": text, "model_id": ELEVENLABS_VOICE_MODEL},
+                        json={
+                            "text": text,
+                            "model_id": ELEVENLABS_VOICE_MODEL,
+                            "voice_settings": {"stability": 0.5, "similarity_boost": 0.75},
+                        },
                     ) as response:
                         audio = await _bounded_audio(response)
         except (httpx.TimeoutException, TimeoutError):

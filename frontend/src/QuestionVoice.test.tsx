@@ -167,6 +167,32 @@ test.each([502, 503, 504])('synthesis HTTP %i has fixed voice-specific UI and ex
   expect(request).toHaveBeenCalledTimes(2)
 })
 
+test('browser voice fallback reads the current question without retrying ElevenLabs', async () => {
+  class Utterance {
+    onend: (() => void) | null = null
+    onerror: (() => void) | null = null
+    readonly text: string
+    constructor(text: string) { this.text = text }
+  }
+  const speech = { cancel: vi.fn(), speak: vi.fn() }
+  vi.stubGlobal('SpeechSynthesisUtterance', Utterance)
+  vi.stubGlobal('speechSynthesis', speech)
+  request.mockRejectedValue(new VoicePlaybackError(502))
+  render(<QuestionVoice {...props()} />)
+  fireEvent.click(screen.getByRole('button', { name: 'Play question' }))
+  await screen.findByRole('alert')
+  fireEvent.click(screen.getByRole('button', { name: 'Use browser voice' }))
+  expect(speech.speak).toHaveBeenCalledOnce()
+  const utterance = speech.speak.mock.calls[0][0] as Utterance
+  expect(utterance.text).toBe('The exact current question?')
+  expect(screen.getByText('Reading the question with your browser voice…')).toBeDefined()
+  act(() => utterance.onend?.())
+  expect(request).toHaveBeenCalledOnce()
+  expect(screen.queryByRole('alert')).toBeNull()
+  expect(screen.queryByRole('button', { name: 'Use browser voice' })).toBeNull()
+  expect(screen.getByRole('button', { name: 'Play question' })).toBeDefined()
+})
+
 test('Audio.play rejection does not retry synthesis; an explicit Replay can use the same clip', async () => {
   render(<QuestionVoice {...props()} />)
   // Install the rejection at construction rather than depending on browser policy.

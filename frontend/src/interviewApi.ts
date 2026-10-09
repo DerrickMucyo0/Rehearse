@@ -3,10 +3,13 @@ import { DELIVERY_TIMING_REASONS, validLiveDeliveryMetrics } from './deliveryMet
 import type { DeliveryMetrics, DeliveryTimingReason } from './deliveryMetrics'
 import { isScenarioType } from './scenarios'
 import type { ScenarioType } from './scenarios'
+import { isInterviewerPersonaId } from './interviewerPersonas'
+import type { InterviewerPersonaId } from './interviewerPersonas'
 
 export interface InterviewSession {
   id: string
   scenario_type: ScenarioType
+  interviewer_persona_id?: InterviewerPersonaId | null
   question_engine: QuestionEngine
   total_questions: 5
   status: 'active' | 'completed'
@@ -169,6 +172,7 @@ function nullableString(value: unknown): value is string | null {
 function validSession(value: unknown): value is InterviewSession {
   if (!(object(value) && typeof value.id === 'string' &&
     isScenarioType(value.scenario_type) && isQuestionEngine(value.question_engine) && value.total_questions === 5 &&
+    (!Object.hasOwn(value, 'interviewer_persona_id') || value.interviewer_persona_id === null || isInterviewerPersonaId(value.interviewer_persona_id)) &&
     (value.status === 'active' || value.status === 'completed') &&
     nonnegativeInteger(value.current_question_index) && nullableString(value.current_question) &&
     nonnegativeInteger(value.current_question_latest_attempt_number) &&
@@ -242,9 +246,14 @@ export function getSession(id: string): Promise<InterviewSession> {
   return request(`/api/sessions/${id}`, (value): value is InterviewSession => validSession(value) && value.id === id)
 }
 
-export function startInterview(scenarioType: ScenarioType = 'job_interview'): Promise<InterviewSession> {
+export function startInterview(
+  scenarioType: ScenarioType = 'job_interview', interviewerPersonaId: InterviewerPersonaId = 'recruiter',
+): Promise<InterviewSession> {
   if (!isScenarioType(scenarioType)) return Promise.reject(new ApiError('The request was not accepted. Choose a practice scenario.', 422))
-  return request('/api/sessions', validSession, jsonBody({ scenario_type: scenarioType }))
+  if (!isInterviewerPersonaId(interviewerPersonaId)) return Promise.reject(new ApiError('Choose a valid interviewer.', 422))
+  return request('/api/sessions', (value): value is InterviewSession =>
+    validSession(value) && value.interviewer_persona_id === interviewerPersonaId,
+  jsonBody({ scenario_type: scenarioType, interviewer_persona_id: interviewerPersonaId }))
 }
 
 export function submitAttempt(session: InterviewSession, answer: string, measurementId: string | null = null): Promise<AttemptSubmission> {
@@ -252,6 +261,7 @@ export function submitAttempt(session: InterviewSession, answer: string, measure
     object(value) && validAttempt(value.attempt) && validSession(value.session) &&
     value.session.id === session.id && value.session.current_question_index === session.current_question_index &&
     value.session.question_engine === session.question_engine && value.session.scenario_type === session.scenario_type &&
+    value.session.interviewer_persona_id === session.interviewer_persona_id &&
     value.session.questions.length === session.questions.length && value.session.questions.every((text, index) => text === session.questions[index]) &&
     value.session.answers.length === session.answers.length && value.session.answers.every((text, index) => text === session.answers[index]) &&
     value.attempt.question_index === session.current_question_index &&
@@ -266,6 +276,7 @@ export function continueQuestion(session: InterviewSession, signal?: AbortSignal
   return request(`${questionPath(session)}/continue`, (value): value is InterviewSession =>
     validSession(value) && value.id === session.id && value.current_question_index === session.current_question_index + 1 &&
     value.question_engine === session.question_engine && value.scenario_type === session.scenario_type &&
+    value.interviewer_persona_id === session.interviewer_persona_id &&
     value.current_question_latest_attempt_number === 0 &&
     value.questions.length === session.questions.length + Number(generates) &&
     session.questions.every((text, index) => value.questions[index] === text) &&

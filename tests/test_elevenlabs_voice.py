@@ -57,8 +57,8 @@ def run_response(*, audio=FRAME, status=200, media_type="audio/mpeg", headers=No
     return service, requests, stream
 
 
-def synthesize(service, text=QUESTION):
-    return asyncio.run(service.synthesize(text))
+def synthesize(service, text=QUESTION, persona_id=None):
+    return asyncio.run(service.synthesize(text, persona_id=persona_id))
 
 
 def assert_sanitized(error, expected_type, capsys, caplog):
@@ -85,7 +85,11 @@ def test_exact_text_request_fixed_model_format_single_post_and_closed_stream():
     assert request.headers["accept"] == "audio/mpeg"
     assert request.headers["accept-encoding"] == "identity"
     assert "authorization" not in request.headers
-    assert json.loads(request.content) == {"text": QUESTION, "model_id": "eleven_multilingual_v2"}
+    assert json.loads(request.content) == {
+        "text": QUESTION,
+        "model_id": "eleven_flash_v2_5",
+        "voice_settings": {"stability": 0.5, "similarity_boost": 0.75},
+    }
     assert request.extensions["timeout"] == {"connect": 15, "read": None, "write": 15, "pool": 15}
     assert stream.closed
     assert not hasattr(service, "key") and not hasattr(service, "voice_id")
@@ -115,6 +119,33 @@ def test_configuration_is_read_at_request_time_and_voice_is_one_encoded_path(mon
     assert synthesize(service).audio == FRAME
     assert requests[0].headers["xi-api-key"] == KEY
     assert "/%2Fvoice%3Fpart%23fragment?output_format=" in str(requests[0].url)
+
+
+@pytest.mark.parametrize(("persona_id", "env_name"), [
+    ("recruiter", "ELEVENLABS_RECRUITER_VOICE_ID"),
+    ("manager", "ELEVENLABS_MANAGER_VOICE_ID"),
+    ("hr", "ELEVENLABS_HR_VOICE_ID"),
+])
+def test_persona_voice_overrides_global_voice_when_configured(persona_id, env_name):
+    persona_voice = f"synthetic-{persona_id}-voice"
+    provider.os.environ[env_name] = persona_voice
+    service, requests, _ = run_response()
+    assert synthesize(service, persona_id=persona_id).audio == FRAME
+    assert requests[0].url.path.endswith("/" + persona_voice)
+
+
+@pytest.mark.parametrize("persona_id", ["recruiter", "manager", "hr"])
+def test_missing_persona_voice_uses_existing_global_voice(persona_id):
+    service, requests, _ = run_response()
+    assert synthesize(service, persona_id=persona_id).audio == FRAME
+    assert requests[0].url.path.endswith("/" + VOICE)
+
+
+def test_unknown_persona_stops_before_http():
+    service, requests, _ = run_response()
+    with pytest.raises(SpeechUnavailable):
+        asyncio.run(service.synthesize(QUESTION, persona_id="unknown"))
+    assert requests == []
 
 
 @pytest.mark.parametrize("status", [201, 204, 301, 302, 307, 308, 400, 401, 403, 429, 500, 503])

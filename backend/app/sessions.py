@@ -19,6 +19,7 @@ from app.database_models import (
 )
 from app.delivery_metrics import DeliveryMetrics
 from app.diagnosis import DiagnosisContext, build_diagnosis_context
+from app.interviewer_personas import InterviewerPersonaId, persona_for
 from app.roleplay import QuestionEngine, RoleplayContext, RoleplayQuestion, RoleplayTurn
 from app.scenarios import SCENARIO_QUESTIONS, ScenarioType, questions_for_scenario
 from app.speaking_metrics import SpeakingMetrics
@@ -30,6 +31,7 @@ class StartSessionRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     scenario_type: ScenarioType = "job_interview"
+    interviewer_persona_id: InterviewerPersonaId = "recruiter"
 
 
 class AttemptRequest(BaseModel):
@@ -65,6 +67,7 @@ class Attempt(BaseModel):
 class InterviewSession(BaseModel):
     id: UUID
     scenario_type: ScenarioType = "job_interview"
+    interviewer_persona_id: InterviewerPersonaId | None = None
     question_engine: QuestionEngine = "deterministic-v1"
     total_questions: Literal[5] = 5
     status: Literal["active", "completed"] = "active"
@@ -114,6 +117,7 @@ class ContinueSnapshot:
     principal: AuthenticatedPrincipal = field(repr=False)
     question_engine: QuestionEngine
     scenario_type: ScenarioType
+    interviewer_persona_id: InterviewerPersonaId | None
     questions: tuple[str, ...] = field(repr=False)
     current_question_index: int
     expected_last_attempt_number: int
@@ -129,6 +133,7 @@ class ContinueSnapshot:
             return None
         return RoleplayContext(
             scenario_type=self.scenario_type,
+            interviewer_persona_id=self.interviewer_persona_id or "recruiter",
             next_question_number=self.current_question_index + 2,
             turns=tuple(RoleplayTurn(
                 question_number=attempt.question_index + 1,
@@ -164,18 +169,34 @@ class InterviewSessionService:
         )
 
     def start(self, scenario_type: ScenarioType = "job_interview") -> InterviewSession:
-        return self._start(scenario_type, "deterministic-v1")
+        return self._start(scenario_type, "deterministic-v1", None)
 
-    def start_adaptive(self, scenario_type: ScenarioType = "job_interview") -> InterviewSession:
-        return self._start(scenario_type, "live-ai-roleplay-v1")
+    def start_adaptive(
+        self, scenario_type: ScenarioType = "job_interview",
+        interviewer_persona_id: InterviewerPersonaId = "recruiter",
+    ) -> InterviewSession:
+        return self._start(scenario_type, "live-ai-roleplay-v1", interviewer_persona_id)
 
-    def _start(self, scenario_type: ScenarioType, question_engine: QuestionEngine) -> InterviewSession:
+    def _start(
+        self, scenario_type: ScenarioType, question_engine: QuestionEngine,
+        interviewer_persona_id: InterviewerPersonaId | None,
+    ) -> InterviewSession:
         questions = questions_for_scenario(scenario_type)
+        if question_engine == "live-ai-roleplay-v1":
+            if interviewer_persona_id is None:
+                raise ValueError("Unsupported interviewer persona.")
+            try:
+                persona_for(interviewer_persona_id)
+            except ValueError:
+                raise ValueError("Unsupported interviewer persona.") from None
+        elif interviewer_persona_id is not None:
+            raise ValueError("Deterministic sessions cannot select an interviewer persona.")
         if question_engine == "live-ai-roleplay-v1":
             questions = questions[:1]
         with self._session_factory.begin() as database:
             stored = StoredInterviewSession(
-                questions=questions, question_engine=question_engine, scenario_type=scenario_type, user_id=self._principal.user_id,
+                questions=questions, question_engine=question_engine, scenario_type=scenario_type,
+                interviewer_persona_id=interviewer_persona_id, user_id=self._principal.user_id,
             )
             database.add(stored)
             database.flush()
@@ -405,6 +426,7 @@ class InterviewSessionService:
         return ContinueSnapshot(
             session_id=stored.id, principal=self._principal,
             question_engine=stored.question_engine, scenario_type=stored.scenario_type, questions=tuple(stored.questions),
+            interviewer_persona_id=stored.interviewer_persona_id,
             current_question_index=stored.current_question_index,
             expected_last_attempt_number=expected_last_attempt_number,
             attempts=tuple(ContinueAttemptSnapshot(
@@ -577,6 +599,7 @@ class InterviewSessionService:
         current = latest.get(stored.current_question_index) if stored.status == "active" else None
         return InterviewSession(
             id=stored.id, scenario_type=stored.scenario_type, question_engine=stored.question_engine, status=stored.status,
+            interviewer_persona_id=stored.interviewer_persona_id,
             current_question_index=stored.current_question_index,
             questions=list(stored.questions),
             answers=[latest[index].answer_text for index in range(stored.current_question_index) if index in latest],

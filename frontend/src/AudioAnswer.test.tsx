@@ -10,7 +10,7 @@ import type { Attempt, InterviewSession, SemanticDiagnosis, SpeakingMetrics } fr
 import type { DeliveryMetrics } from './deliveryMetrics'
 import { deliveryUnavailableText, TIMED_PAUSES_EXPLANATION, TIMED_PAUSES_LIMITATION } from './deliveryMetrics'
 
-const session: InterviewSession = { id: 'session-1', scenario_type: 'job_interview', question_engine: 'deterministic-v1', total_questions: 5, status: 'active', current_question_index: 0, current_question: 'Question', current_question_latest_attempt_number: 0, questions: ['Question', 'Second', 'Third', 'Fourth', 'Fifth'], answers: [] }
+const session: InterviewSession = { id: 'session-1', scenario_type: 'job_interview', interviewer_persona_id: 'recruiter', question_engine: 'deterministic-v1', total_questions: 5, status: 'active', current_question_index: 0, current_question: 'Question', current_question_latest_attempt_number: 0, questions: ['Question', 'Second', 'Third', 'Fourth', 'Fifth'], answers: [] }
 const readHistoryDetail = historyApi.getHistoryDetail
 
 function legacyCompletedHistoryDetail(id: string): HistoryDetail {

@@ -11,7 +11,7 @@ interface Props {
   active: boolean
   disabled: boolean
 }
-type Phase = 'idle' | 'loading' | 'playing' | 'ready' | 'error'
+type Phase = 'idle' | 'loading' | 'playing' | 'fallback-playing' | 'ready' | 'error'
 const UNAVAILABLE = 'Voice playback is unavailable right now.'
 
 // The current question's clip is transient. It never participates in attempts,
@@ -26,6 +26,7 @@ const QuestionVoice = forwardRef<QuestionVoiceHandle, Props>(function QuestionVo
   const generation = useRef(0)
   const pending = useRef<AbortController | null>(null)
   const clip = useRef<{ url: string; audio: HTMLAudioElement } | null>(null)
+  const browserUtterance = useRef<SpeechSynthesisUtterance | null>(null)
   const locked = useRef(false)
   const mounted = useRef(false)
   const owner = useRef({ authGeneration, sessionId, questionIndex, question, active, disabled })
@@ -35,6 +36,12 @@ const QuestionVoice = forwardRef<QuestionVoiceHandle, Props>(function QuestionVo
     locked.current = false
     pending.current?.abort()
     pending.current = null
+    if (browserUtterance.current) {
+      window.speechSynthesis?.cancel()
+      browserUtterance.current.onend = null
+      browserUtterance.current.onerror = null
+      browserUtterance.current = null
+    }
     const previous = clip.current
     clip.current = null
     if (previous) {
@@ -91,27 +98,74 @@ const QuestionVoice = forwardRef<QuestionVoiceHandle, Props>(function QuestionVo
       if (current()) { pending.current = null; locked.current = false; setPhase('error') }
     }
   }
+  function playWithBrowserVoice() {
+    const target = owner.current
+    if (locked.current || !target.active || target.disabled || !isAuthWorkspaceCurrent(target.authGeneration)) return
+    if (typeof window === 'undefined' || !window.speechSynthesis || typeof SpeechSynthesisUtterance === 'undefined') return
+
+    locked.current = true
+    const revision = generation.current
+    const current = () => mounted.current && revision === generation.current &&
+      owner.current.authGeneration === target.authGeneration && owner.current.sessionId === target.sessionId &&
+      owner.current.questionIndex === target.questionIndex && owner.current.question === target.question &&
+      owner.current.active && !owner.current.disabled && isAuthWorkspaceCurrent(target.authGeneration)
+    try {
+      const utterance = new SpeechSynthesisUtterance(target.question)
+      browserUtterance.current = utterance
+      utterance.onend = () => {
+        if (current() && browserUtterance.current === utterance) {
+          browserUtterance.current = null
+          locked.current = false
+          setPhase('idle')
+        }
+      }
+      utterance.onerror = () => {
+        if (current() && browserUtterance.current === utterance) {
+          browserUtterance.current = null
+          locked.current = false
+          setPhase('error')
+        }
+      }
+      setPhase('fallback-playing')
+      window.speechSynthesis.speak(utterance)
+    } catch {
+      browserUtterance.current = null
+      locked.current = false
+      setPhase('error')
+    }
+  }
   function stop() {
     generation.current += 1
     pending.current?.abort()
     pending.current = null
+    const stoppedBrowserVoice = browserUtterance.current !== null
+    if (browserUtterance.current) {
+      window.speechSynthesis?.cancel()
+      browserUtterance.current.onend = null
+      browserUtterance.current.onerror = null
+      browserUtterance.current = null
+    }
     locked.current = false
     if (clip.current) {
       clip.current.audio.pause()
       clip.current.audio.onended = null
       clip.current.audio.onerror = null
     }
-    setPhase(clip.current ? 'ready' : 'idle')
+    setPhase(clip.current ? 'ready' : stoppedBrowserVoice ? 'error' : 'idle')
   }
   const unavailable = !active || disabled || !isAuthWorkspaceCurrent(authGeneration)
-  return <section aria-label="Question voice" aria-busy={phase === 'loading'}>
+  const canUseBrowserVoice = typeof window !== 'undefined' &&
+    'speechSynthesis' in window && typeof SpeechSynthesisUtterance !== 'undefined'
+  return <section aria-label="Question voice" aria-busy={phase === 'loading' || phase === 'fallback-playing'}>
     <button type="button" disabled={unavailable || phase === 'loading' || phase === 'playing'} onClick={() => void play()}>
       {hasClip ? 'Replay question' : 'Play question'}
     </button>
-    {(phase === 'loading' || phase === 'playing') && <button type="button" onClick={stop}>Stop</button>}
+    {(phase === 'loading' || phase === 'playing' || phase === 'fallback-playing') && <button type="button" onClick={stop}>Stop</button>}
     {phase === 'loading' && <p role="status">Preparing question audio…</p>}
     {phase === 'playing' && <p role="status">Playing question…</p>}
+    {phase === 'fallback-playing' && <p role="status">Reading the question with your browser voice…</p>}
     {phase === 'error' && <p role="alert">{UNAVAILABLE}</p>}
+    {phase === 'error' && canUseBrowserVoice && <button type="button" disabled={unavailable} onClick={playWithBrowserVoice}>Use browser voice</button>}
   </section>
 })
 export default QuestionVoice

@@ -5,6 +5,7 @@ from typing import get_type_hints
 
 import pytest
 
+from app.interviewer_personas import InterviewerPersonaId
 from app.voice import SpeechFailed, SpeechService, SpeechTimeout, SpeechUnavailable, SynthesizedSpeech
 
 
@@ -39,6 +40,10 @@ def test_failure_contracts_have_only_fixed_messages(error_type, message):
         error_type("SYNTHETIC_PRIVATE_DETAIL")
 
 
-def test_service_contract_is_text_only_and_returns_transient_speech():
-    assert get_type_hints(SpeechService.synthesize) == {"text": str, "return": SynthesizedSpeech}
+def test_service_contract_accepts_text_and_optional_persona_and_returns_transient_speech():
+    assert get_type_hints(SpeechService.synthesize) == {
+        "text": str,
+        "persona_id": InterviewerPersonaId | None,
+        "return": SynthesizedSpeech,
+    }
     assert get_type_hints(SynthesizedSpeech) == {"audio": bytes}

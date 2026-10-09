@@ -27,7 +27,7 @@ const semanticDiagnosis: SemanticDiagnosis = {
 }
 function response(value: unknown, status = 200) { return new Response(JSON.stringify(value), { status }) }
 function initialSession(id = SESSION_ID): InterviewSession {
-  return { id, scenario_type: 'job_interview', question_engine: 'deterministic-v1', total_questions: 5, status: 'active', current_question_index: 0, current_question: questions[0],
+  return { id, scenario_type: 'job_interview', interviewer_persona_id: 'recruiter', question_engine: 'deterministic-v1', total_questions: 5, status: 'active', current_question_index: 0, current_question: questions[0],
     current_question_latest_attempt_number: 0, questions, answers: [] }
 }
 function deferred<T>() {
@@ -354,7 +354,7 @@ test('Logout disposes active voice without adding a synthesis request', async ()
   render(<App />); await start()
   fireEvent.click(screen.getByRole('button', { name: 'Play question' }))
   await waitFor(() => expect(VoiceAudio.instances[0]?.play).toHaveBeenCalledOnce())
-  fireEvent.click(screen.getByRole('button', { name: 'Logout' }))
+  fireEvent.click(screen.getByRole('button', { name: 'Log out' }))
   await screen.findByRole('button', { name: 'Sign in' })
   expect(VoiceAudio.instances[0].pause).toHaveBeenCalledOnce()
   expect(revokeURL).toHaveBeenCalledOnce()
@@ -381,7 +381,7 @@ test('unconfigured diagnosis renders only feedback unavailability and preserves 
   await within(feedback).findByText('Feedback is unavailable right now. You can still retry or continue.')
   expect(screen.queryByText(AUTH_UNAVAILABLE_MESSAGE)).toBeNull()
   expect(document.body.textContent).not.toContain('Semantic diagnosis is not configured.')
-  expect(screen.getByRole('button', { name: 'Logout' })).toBeTruthy()
+  expect(screen.getByRole('button', { name: 'Log out' })).toBeTruthy()
   expect((screen.getByRole('button', { name: 'Retry' }) as HTMLButtonElement).disabled).toBe(false)
   expect((screen.getByRole('button', { name: 'Continue' }) as HTMLButtonElement).disabled).toBe(false)
   expect(getAuthState()).toMatchObject({ status: 'authenticated', notice: null })

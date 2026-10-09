@@ -109,7 +109,7 @@ def distinctive_scalars(value):
 
 
 def test_public_prompt_version_model_shape_and_builder_signature_are_exact():
-    assert SEMANTIC_DIAGNOSIS_PROMPT_VERSION == "semantic-diagnosis-prompt-v1"
+    assert SEMANTIC_DIAGNOSIS_PROMPT_VERSION == "semantic-diagnosis-prompt-v2"
     assert SEMANTIC_DIAGNOSIS_PROMPT_VERSION != SEMANTIC_DIAGNOSIS_VERSION
     assert SEMANTIC_DIAGNOSIS_PROMPT_VERSION != DIAGNOSIS_CONTEXT_VERSION
     assert tuple(SemanticDiagnosisPrompt.model_fields) == PROMPT_FIELDS
@@ -140,7 +140,7 @@ def test_public_prompt_version_model_shape_and_builder_signature_are_exact():
 
 
 @pytest.mark.parametrize("version", (
-    "semantic-diagnosis-prompt-v2", SEMANTIC_DIAGNOSIS_VERSION,
+    "semantic-diagnosis-prompt-v3", SEMANTIC_DIAGNOSIS_VERSION,
     "semantic-diagnosis-prompt-v1 ", "", None, True, 17, b"semantic-diagnosis-prompt-v1",
 ))
 def test_prompt_version_rejects_other_versions_and_wrong_types(version):
@@ -366,6 +366,15 @@ def test_system_instructions_express_semantic_tasks_schema_untrusted_data_and_pr
 
     text = " ".join(build_semantic_diagnosis_prompt(context()).system.lower().replace("-", " ").replace("/", " ").split())
     for alternatives in (
+        ("question coverage separately from answer quality",),
+        ("central request and its essential parts",),
+        ('choose "yes" when the answer directly responds',),
+        ('choose "partially" when the answer is relevant',),
+        ('reserve "no" for an unrelated answer',),
+        ("missing optional detail",),
+        ("do not describe information as missing when the answer already states it",),
+        ("keep the addressed question judgment",),
+        ("consider each essential part before choosing",),
         ("semantic meaning only", "only semantic meaning"),
         ("answer against", "answer in relation to"), ("interview question",),
         ("question was addressed", "question is addressed", "addresses the question"),

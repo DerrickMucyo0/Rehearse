@@ -9,7 +9,7 @@ import { AUTH_CONTEXT_HEADER, AUTH_UNAVAILABLE_MESSAGE, getAuthState } from './a
 import type { ScenarioType } from './scenarios'
 
 const session: InterviewSession = {
-  id: 'session-1', scenario_type: 'job_interview', question_engine: 'deterministic-v1', total_questions: 5, status: 'active', current_question_index: 2, current_question: 'Third',
+  id: 'session-1', scenario_type: 'job_interview', interviewer_persona_id: null, question_engine: 'deterministic-v1', total_questions: 5, status: 'active', current_question_index: 2, current_question: 'Third',
   current_question_latest_attempt_number: 3, questions: ['First', 'Second', 'Third', 'Fourth', 'Fifth'], answers: ['One', 'Two'],
 }
 const voiceUnavailable = 'Voice playback is unavailable right now.'
@@ -281,22 +281,22 @@ test.each(['headers', 'binary body'] as const)('speech 75-second deadline reject
 })
 
 test('starts a session with the required current-question attempt revision', async () => {
-  const fresh = { ...session, current_question_latest_attempt_number: 0 }
+  const fresh = { ...session, interviewer_persona_id: 'recruiter' as const, current_question_latest_attempt_number: 0 }
   const fetchMock = mockResponse(json(fresh, 201))
   expect(await startInterview()).toEqual(fresh)
   expect(fetchMock.mock.calls[0][0]).toBe('/api/sessions')
   expect(fetchMock.mock.calls[0][1].method).toBe('POST')
   expect(new Headers(fetchMock.mock.calls[0][1].headers).get('Content-Type')).toBe('application/json')
-  expect(JSON.parse(fetchMock.mock.calls[0][1].body)).toEqual({ scenario_type: 'job_interview' })
+  expect(JSON.parse(fetchMock.mock.calls[0][1].body)).toEqual({ scenario_type: 'job_interview', interviewer_persona_id: 'recruiter' })
 })
 
 test.each(['job_interview', 'public_speaking', 'thesis_defense', 'salary_negotiation'] as const)(
   'Start sends only the selected canonical scenario %s', async (scenarioType) => {
-    const created = { ...session, scenario_type: scenarioType, question_engine: 'deterministic-v1', current_question_latest_attempt_number: 0 }
+    const created = { ...session, scenario_type: scenarioType, interviewer_persona_id: 'recruiter' as const, question_engine: 'deterministic-v1', current_question_latest_attempt_number: 0 }
     const fetchMock = mockResponse(json(created, 201))
     expect(await startInterview(scenarioType)).toEqual(created)
     expect(fetchMock).toHaveBeenCalledOnce()
-    expect(JSON.parse(fetchMock.mock.calls[0][1].body)).toEqual({ scenario_type: scenarioType })
+    expect(JSON.parse(fetchMock.mock.calls[0][1].body)).toEqual({ scenario_type: scenarioType, interviewer_persona_id: 'recruiter' })
   },
 )
 
@@ -307,6 +307,21 @@ test.each([null, 1, '', 'Job Interview', 'JOB_INTERVIEW', ' job_interview', 'unk
     expect(fetchMock).not.toHaveBeenCalled()
   },
 )
+
+test.each(['recruiter', 'manager', 'hr'] as const)('Start sends and validates interviewer persona %s', async (personaId) => {
+  const created = { ...session, interviewer_persona_id: personaId, current_question_latest_attempt_number: 0 }
+  const fetchMock = mockResponse(json(created, 201))
+  expect(await startInterview('job_interview', personaId)).toEqual(created)
+  expect(JSON.parse(fetchMock.mock.calls[0][1].body)).toEqual({
+    scenario_type: 'job_interview', interviewer_persona_id: personaId,
+  })
+})
+
+test('invalid interviewer persona is rejected before session creation', async () => {
+  const fetchMock = mockResponse(json(session, 201))
+  await expect(startInterview('job_interview', 'unknown' as never)).rejects.toMatchObject({ status: 422 })
+  expect(fetchMock).not.toHaveBeenCalled()
+})
 
 test.each([undefined, null, 1, '', 'Job Interview', 'JOB_INTERVIEW', ' job_interview', 'unknown'])(
   'session reads reject missing or noncanonical scenario responses (case %#)', async (scenarioType) => {
@@ -888,7 +903,7 @@ test.each(['caller first', 'timeout first'] as const)(
 
 
 const adaptive: InterviewSession = {
-  ...session, question_engine: 'live-ai-roleplay-v1', questions: session.questions.slice(0, 3),
+  ...session, interviewer_persona_id: 'recruiter', question_engine: 'live-ai-roleplay-v1', questions: session.questions.slice(0, 3),
 }
 const adaptiveNext: InterviewSession = {
   ...adaptive, current_question_index: 3, current_question: 'Adaptive follow-up',
@@ -902,12 +917,12 @@ const roleplayFailure = {
 
 test.each(['job_interview', 'public_speaking', 'thesis_defense', 'salary_negotiation'] as const)(
   'new adaptive %s session preserves the scenario and fixed first question with a five-question plan', async (scenarioType) => {
-    const created: InterviewSession = { ...adaptive, scenario_type: scenarioType, current_question_index: 0,
+    const created: InterviewSession = { ...adaptive, scenario_type: scenarioType, interviewer_persona_id: 'recruiter', current_question_index: 0,
       current_question: 'Fixed first question', current_question_latest_attempt_number: 0,
       questions: ['Fixed first question'], answers: [] }
     const fetchMock = mockResponse(json(created, 201))
     expect(await startInterview(scenarioType)).toEqual(created)
-    expect(JSON.parse(fetchMock.mock.calls[0][1].body)).toEqual({ scenario_type: scenarioType })
+    expect(JSON.parse(fetchMock.mock.calls[0][1].body)).toEqual({ scenario_type: scenarioType, interviewer_persona_id: 'recruiter' })
     expect(fetchMock).toHaveBeenCalledOnce()
   },
 )

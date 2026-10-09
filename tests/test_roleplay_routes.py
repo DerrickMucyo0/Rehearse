@@ -167,7 +167,7 @@ def test_generation_uses_latest_persisted_retry_and_no_open_database_connection(
         assert harness.engine.pool.checkedout() == 0
         assert context.turns[0].answer == "Exact final retry answer."
         assert set(context.model_dump()) == {
-            "context_version", "scenario_type", "next_question_number", "turns",
+            "context_version", "scenario_type", "interviewer_persona_id", "next_question_number", "turns",
         }
         assert set(context.turns[0].model_dump()) == {"question_number", "question", "answer"}
 

@@ -1,8 +1,8 @@
 // @vitest-environment jsdom
-import { cleanup, render, screen, within } from '@testing-library/react'
-import { afterEach, expect, test } from 'vitest'
+import { cleanup, fireEvent, render, screen, within } from '@testing-library/react'
+import { afterEach, expect, test, vi } from 'vitest'
 import AttemptComparison from './AttemptComparison'
-import type { AttemptComparison as Comparison, ComparisonMetrics, DeliveryComparison, DeliveryMetricChange, MetricChange } from './interviewApi'
+import type { Attempt, AttemptComparison as Comparison, ComparisonMetrics, DeliveryComparison, DeliveryMetricChange, MetricChange } from './interviewApi'
 import { DELIVERY_TIMING_REASONS, deliveryUnavailableText } from './deliveryMetrics'
 
 afterEach(cleanup)
@@ -85,6 +85,31 @@ test('also honors an explicitly selected before attempt identity', () => {
   data.after_attempt = { ...data.after_attempt!, attempt_number: 3 }
   render(<AttemptComparison comparison={data} />)
   expect(screen.getByText('Before: Attempt 2. After: Attempt 3.')).toBeTruthy()
+})
+
+test('lets the user select an ordered pair of saved attempts and submit that pair for comparison', () => {
+  const data = comparison()
+  data.after_attempt = { ...data.after_attempt!, attempt_number: 3 }
+  const attempts: Attempt[] = [
+    { id: 'attempt-1', question_index: 0, attempt_number: 1, answer: 'Typed answer', submitted_at: '2026-10-04T12:00:00Z', measurement_id: null },
+    { id: 'attempt-2', question_index: 0, attempt_number: 2, answer: 'Recorded answer', submitted_at: '2026-10-04T12:01:00Z', measurement_id: null },
+    { id: 'attempt-3', question_index: 0, attempt_number: 3, answer: 'Recorded answer', submitted_at: '2026-10-04T12:02:00Z', measurement_id: 'measurement-3' },
+  ]
+  const onCompare = vi.fn()
+  render(<AttemptComparison comparison={data} attempts={attempts} onCompare={onCompare} />)
+
+  const before = screen.getByRole('combobox', { name: 'Before attempt' }) as HTMLSelectElement
+  const after = screen.getByRole('combobox', { name: 'After attempt' }) as HTMLSelectElement
+  expect(before.value).toBe('1')
+  expect(after.value).toBe('3')
+  expect(within(before).getByRole('option', { name: 'Attempt 1 (no speaking measurement)' })).toBeTruthy()
+  expect(within(after).getByRole('option', { name: 'Attempt 3 (speaking metrics available)' })).toBeTruthy()
+  expect((screen.getByRole('button', { name: 'Compare attempts' }) as HTMLButtonElement).disabled).toBe(true)
+
+  fireEvent.change(before, { target: { value: '2' } })
+  fireEvent.click(screen.getByRole('button', { name: 'Compare attempts' }))
+  expect(onCompare).toHaveBeenCalledTimes(1)
+  expect(onCompare).toHaveBeenCalledWith(2, 3)
 })
 
 test('formats counts as integers, positive and negative changes with signs, and measured zero as zero', () => {

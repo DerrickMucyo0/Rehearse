@@ -369,6 +369,10 @@ def test_neutral_errors_use_fixed_http_details_despite_private_exception_text(
     assert response.json() == {"detail": detail}
     for marker in PRIVATE.split():
         assert marker not in response.text + caplog.text
+    if status == 502:
+        assert "semantic_diagnosis_failure category=adapter_contract_error upstream_status=None" in caplog.text
+    else:
+        assert "semantic_diagnosis_failure" not in caplog.text
     assert "Traceback" not in response.text
     assert len(reader.calls) == len(adapter.calls) == 1
     assert reader.mutations == []
@@ -390,6 +394,15 @@ def test_existing_application_normalizes_low_level_failures_before_http_mapping(
     response = client.post(url())
     assert response.status_code == status and response.json() == {"detail": detail}
     assert PRIVATE not in response.text + caplog.text
+    if error_type is NVIDIASemanticDiagnosisUnavailable or error_type is NVIDIASemanticDiagnosisTimeout:
+        assert "semantic_diagnosis_failure" not in caplog.text
+    else:
+        expected_category = {
+            NVIDIASemanticDiagnosisFailed: "provider_transport_error",
+            SemanticDiagnosisJSONContractError: "semantic_json_contract_error",
+            SemanticDiagnosisAdapterContractError: "adapter_contract_error",
+        }[error_type]
+        assert f"semantic_diagnosis_failure category={expected_category} upstream_status=None" in caplog.text
     assert len(reader.calls) == len(adapter.calls) == 1
     assert reader.mutations == []
     assert capsys.readouterr() == ("", "")
@@ -442,9 +455,13 @@ def test_safe_in_process_observer_captures_only_normalized_metadata_without_http
         "provider_response_contract_error", "semantic_json_contract_error", "adapter_contract_error",
         "PRIVATE-PERSISTED", *PRIVATE.split(),
     ):
-        assert forbidden not in public_output + caplog.text
-    if upstream_status is not None:
-        assert str(upstream_status) not in public_output
+        assert forbidden not in public_output
+    for private_marker in ("PRIVATE-PERSISTED", *PRIVATE.split()):
+        assert private_marker not in caplog.text
+    assert (
+        f"semantic_diagnosis_failure category={category} upstream_status={upstream_status}"
+        in caplog.text
+    )
     assert reader.calls == [(SESSION_ID, 2, 3)]
     assert len(adapter.calls) == 1 and adapter.calls[0] is reader.context
     assert dependencies == ["sessions", "diagnoser"]
@@ -794,7 +811,8 @@ def test_route_source_is_provider_neutral_and_delegates_once_without_lower_level
     calls = [node for node in body_nodes if isinstance(node, ast.Call)]
     assert all(isinstance(node.func, ast.Name) for node in calls)
     assert {node.func.id for node in calls} == {
-        "run_in_threadpool", "diagnose_application_context", "HTTPException", "str",
+        "run_in_threadpool", "diagnose_application_context", "_log_semantic_diagnosis_failure",
+        "HTTPException", "str",
     }
     threadpool_calls = [node for node in calls if node.func.id == "run_in_threadpool"]
     assert len(threadpool_calls) == 3

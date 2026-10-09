@@ -40,7 +40,8 @@ and question checks discard stale audio before release. Success is bounded binar
 
 Set both `ELEVENLABS_API_KEY` and `ELEVENLABS_VOICE_ID` in the backend process
 environment only. Neither is sent to the browser. The model is fixed to
-`eleven_multilingual_v2` and the format to `mp3_44100_128`; missing configuration
+`eleven_flash_v2_5` (stability `0.5`, similarity boost `0.75`) and the format to
+`mp3_44100_128`; transcription uses ElevenLabs `scribe_v2`; missing configuration
 returns 503 without a provider request. The separate HTTPX TTS adapter sends only
 the exact saved question plus required voice/model/format settings, makes one
 request with no retries or redirects, and has a 60-second total deadline with
@@ -58,6 +59,14 @@ ElevenLabs processing/retention follows the configured provider account's policy
 no Rehearse persistence does not promise provider deletion. Browser cancellation
 does not guarantee that already-started provider work stops. Automated tests use
 synthetic audio and offline transports, with no live provider calls.
+
+New practice sessions save one interviewer persona: University Recruiter (Polite),
+Senior Manager (Formal), or HR Lead (Firm). Gemini applies the selected fixed
+server-side style to follow-up questions. Existing sessions remain unassigned and
+use `ELEVENLABS_VOICE_ID`. Optional backend-only settings
+`ELEVENLABS_RECRUITER_VOICE_ID`, `ELEVENLABS_MANAGER_VOICE_ID`, and
+`ELEVENLABS_HR_VOICE_ID` select different voices; blank values fall back to the
+existing voice ID. Apply the database migration before restarting Rehearse.
 
 React requests `GET /api/health` on page load. Vite's development proxy forwards
 `/api` requests to `http://127.0.0.1:8000`, keeping browser requests on the same
@@ -847,6 +856,30 @@ Install the updated requirements in the backend virtual environment:
 ```sh
 python -m pip install -r backend/requirements-dev.txt
 ```
+
+Adaptive interviewer follow-up questions use Gemini Interactions API. Set
+`GEMINI_API_KEY` in the backend process environment only. Rehearse sends the bounded
+question-and-answer history for each generated follow-up and sets `store=false`; it
+does not use Gemini's server-side conversation history. The default model is
+`gemini-3.5-flash`; `GEMINI_MODEL` can override it. The candidate's first question
+continues to come from Rehearse's existing scenario catalog. Gemini only proposes
+follow-up text; Rehearse validates it and commits it through the existing session
+transaction. Answer diagnosis remains a separate provider path.
+
+For the project's macOS zsh terminal, enter the Gemini API key without echoing it or
+putting its value into shell history, then restart Uvicorn:
+
+```zsh
+read -rs "GEMINI_API_KEY?Gemini API key: "
+echo
+export GEMINI_API_KEY
+python -m uvicorn app.main:app --app-dir backend --reload --host 127.0.0.1 --port 8000
+```
+
+Get the key in [Google AI Studio](https://aistudio.google.com/app/apikey). Never use a
+`VITE_` variable for this key, include it in frontend configuration, or commit a real
+value. Without it, session creation and deterministic opening questions still work;
+requesting an adaptive follow-up returns a controlled unavailable response.
 
 Set `ELEVENLABS_API_KEY` in the **backend process environment only**, then start/restart
 Uvicorn. For the project's macOS zsh terminal, enter the key without echoing it or putting
