@@ -667,6 +667,7 @@ def test_authenticated_session_routes_preserve_response_bytes_and_add_private_ca
         location = f"/api/sessions/{body['id']}"
         assert body == {
             "id": body["id"], "scenario_type": "job_interview",
+            "interviewer_persona_id": "recruiter",
             "question_engine": "live-ai-roleplay-v1", "total_questions": 5,
             "status": "active", "current_question_index": 0,
             "questions": list(QUESTIONS[:1]), "answers": [],
