@@ -85,10 +85,10 @@ def historical_metadata(*, include_login):
     sessions = metadata.tables[StoredInterviewSession.__tablename__]
     # Strip later scenario/engine extensions and restore the exact historical
     # five-question checks in this private copy, preserving 0003/0004 coverage.
-    for name in ("scenario_type", "question_engine"):
+    for name in ("scenario_type", "question_engine", "interviewer_persona_id"):
         sessions._columns.remove(sessions.c[name])
     for name in (
-        "ck_sessions_scenario_type", "ck_sessions_question_engine",
+        "ck_sessions_scenario_type", "ck_sessions_question_engine", "ck_sessions_interviewer_persona",
         "ck_sessions_question_snapshot", "ck_sessions_completion",
     ):
         constraint = next(item for item in sessions.constraints if item.name == name)

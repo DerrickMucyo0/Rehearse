@@ -3,6 +3,8 @@ import type { FormEvent } from 'react'
 import AudioAnswer from './AudioAnswer'
 import Comparison from './AttemptComparison'
 import InterviewSummary from './InterviewSummary.tsx'
+import QuestionVoice from './QuestionVoice'
+import type { QuestionVoiceHandle } from './QuestionVoice'
 import {
   ApiError, continueQuestion, getAttempts, getComparison, getSession,
   getSemanticDiagnosis, isConflictError, preparesNextQuestion, RoleplayUnavailableError, SemanticDiagnosisError, startInterview, submitAttempt,
@@ -12,6 +14,8 @@ import { personalizedDrillForFocus } from './personalizedDrills'
 import { getAuthState, isAuthWorkspaceCurrent } from './auth'
 import { SCENARIOS, scenarioLabel } from './scenarios'
 import type { ScenarioType } from './scenarios'
+import { INTERVIEWER_PERSONAS, interviewerPersonaName } from './interviewerPersonas'
+import type { InterviewerPersonaId } from './interviewerPersonas'
 
 const SESSION_KEY = 'rehearse.session_id'
 type Mode = 'composing' | 'review'
@@ -100,12 +104,13 @@ async function readSavedView(id: string): Promise<SavedView> {
 }
 
 interface Props {
+  active?: boolean
   onSessionAccess?: (sessionId: string) => void
   onNavigationBusyChange?: (busy: boolean) => void
   onHistoryFactsChange?: () => void
 }
 
-export default function Interview({ onSessionAccess, onNavigationBusyChange, onHistoryFactsChange }: Props = {}) {
+export default function Interview({ active = true, onSessionAccess, onNavigationBusyChange, onHistoryFactsChange }: Props = {}) {
   const [workspace] = useState(() => {
     const auth = getAuthState()
     return auth.status === 'authenticated' ? { generation: auth.generation, storageKey: `${SESSION_KEY}:${auth.userId}` } : null
@@ -113,17 +118,22 @@ export default function Interview({ onSessionAccess, onNavigationBusyChange, onH
   const [restoreId] = useState(() => storedSessionId(workspace?.storageKey ?? null))
   const [view, setView] = useState<SavedView | null>(null)
   const [selectedScenario, setSelectedScenario] = useState<ScenarioType>('job_interview')
+  const [selectedPersona, setSelectedPersona] = useState<InterviewerPersonaId>('recruiter')
   const [draft, setDraft] = useState<{ text: string; measurementId: string | null }>({ text: '', measurementId: null })
   const [draftGeneration, setDraftGeneration] = useState(0)
   const [operation, setOperation] = useState<string | null>(restoreId ? 'Restoring interview…' : null)
   const [transcribing, setTranscribing] = useState(false)
   const [audioBusy, setAudioBusy] = useState(false)
+  const [comparisonLoading, setComparisonLoading] = useState(false)
+  const [comparisonError, setComparisonError] = useState('')
   const [error, setError] = useState('')
   const [recovery, setRecovery] = useState<Recovery | null>(null)
   const [diagnosis, setDiagnosis] = useState<DiagnosisState>({ status: 'idle' })
   const currentView = useRef<SavedView | null>(null)
+  const voice = useRef<QuestionVoiceHandle | null>(null)
   const diagnosisController = useRef<AbortController | null>(null)
   const continueController = useRef<AbortController | null>(null)
+  const comparisonGeneration = useRef(0)
   const diagnosisGeneration = useRef(0)
   const diagnosisOwner = useRef<DiagnosisTarget | null>(null)
   const locked = useRef(Boolean(restoreId))
@@ -149,6 +159,7 @@ export default function Interview({ onSessionAccess, onNavigationBusyChange, onH
     return () => {
       mounted.current = false
       continueController.current?.abort()
+      comparisonGeneration.current += 1
       invalidateDiagnosis()
       if (workspace && !isAuthWorkspaceCurrent(workspace.generation)) rememberSession(workspace.storageKey, null)
     }
@@ -185,6 +196,18 @@ export default function Interview({ onSessionAccess, onNavigationBusyChange, onH
     if (mounted.current) setDiagnosis({ status: 'idle' })
   }
   function showView(saved: SavedView) {
+    const previousView = currentView.current
+    const previous = previousView?.session
+    if (previousView && (previousView.session.id !== saved.session.id ||
+        previousView.session.current_question_index !== saved.session.current_question_index ||
+        previousView.session.current_question_latest_attempt_number !== saved.session.current_question_latest_attempt_number ||
+        previousView.mode !== saved.mode)) {
+      comparisonGeneration.current += 1
+      setComparisonLoading(false)
+      setComparisonError('')
+    }
+    if (previous?.id !== saved.session.id || previous?.current_question_index !== saved.session.current_question_index ||
+        previous?.current_question !== saved.session.current_question || saved.session.status !== 'active') voice.current?.invalidate()
     currentView.current = saved
     if (diagnosisOwner.current && !ownsDiagnosis(saved, diagnosisOwner.current)) invalidateDiagnosis()
     setView(saved)
@@ -212,6 +235,31 @@ export default function Interview({ onSessionAccess, onNavigationBusyChange, onH
       })
   }
 
+  async function compareAttempts(before: number, after: number) {
+    const snapshot = currentView.current
+    if (!currentWorkspace() || !snapshot || snapshot.mode !== 'review' || snapshot.attempts.length < 2 ||
+        snapshot.session.status !== 'active') return
+    const generation = ++comparisonGeneration.current
+    setComparisonLoading(true)
+    setComparisonError('')
+    try {
+      const result = await getComparison(snapshot.session, before, after)
+      const current = currentView.current
+      if (!currentWorkspace() || generation !== comparisonGeneration.current || !current ||
+          current.session.id !== snapshot.session.id ||
+          current.session.current_question_index !== snapshot.session.current_question_index ||
+          current.session.current_question_latest_attempt_number !== snapshot.session.current_question_latest_attempt_number ||
+          current.mode !== 'review') return
+      showView({ ...current, comparison: result })
+    } catch (cause) {
+      if (currentWorkspace() && generation === comparisonGeneration.current) {
+        setComparisonError(cause instanceof ApiError ? cause.message : 'Unable to load this comparison. The previous results are still shown.')
+      }
+    } finally {
+      if (generation === comparisonGeneration.current && currentWorkspace()) setComparisonLoading(false)
+    }
+  }
+
   function clearDraft() {
     setDraft({ text: '', measurementId: null })
     setDraftGeneration((current) => current + 1)
@@ -224,12 +272,13 @@ export default function Interview({ onSessionAccess, onNavigationBusyChange, onH
   }
   async function start() {
     if (locked.current || transcribing) return
+    voice.current?.invalidate()
     invalidateDiagnosis()
     locked.current = true
     setOperation('Starting…')
     setError('')
     try {
-      const created = await startInterview(selectedScenario)
+      const created = await startInterview(selectedScenario, selectedPersona)
       if (!currentWorkspace()) return
       install({ session: created, attempts: [], comparison: null, mode: 'composing' })
       accessCallback.current?.(created.id)
@@ -242,6 +291,7 @@ export default function Interview({ onSessionAccess, onNavigationBusyChange, onH
     }
   }
   async function reconcileConflict(context: Recovery) {
+    voice.current?.invalidate()
     invalidateDiagnosis()
     clearDraft()
     try {
@@ -261,6 +311,7 @@ export default function Interview({ onSessionAccess, onNavigationBusyChange, onH
     if (!view || locked.current || blocked || session?.status !== 'active') return
     if (kind === 'submit' && (view.mode !== 'composing' || !draft.text.trim())) return
     if (kind === 'continue' && (view.mode !== 'review' || !view.attempts.length)) return
+    voice.current?.invalidate()
     invalidateDiagnosis()
     const context = recoveryFor(view, kind)
     const controller = kind === 'continue' ? new AbortController() : null
@@ -321,6 +372,7 @@ export default function Interview({ onSessionAccess, onNavigationBusyChange, onH
   }
   function retry() {
     if (!view || locked.current || blocked) return
+    voice.current?.invalidate()
     invalidateDiagnosis()
     clearDraft()
     setError('')
@@ -328,12 +380,14 @@ export default function Interview({ onSessionAccess, onNavigationBusyChange, onH
   }
   function cancelRetry() {
     if (!view || locked.current || blocked) return
+    voice.current?.invalidate()
     clearDraft()
     setError('')
     showView({ ...view, mode: 'review' })
   }
   async function recheck() {
     if (!recovery || locked.current) return
+    voice.current?.invalidate()
     invalidateDiagnosis()
     locked.current = true
     setOperation('Rechecking saved state…')
@@ -374,10 +428,16 @@ export default function Interview({ onSessionAccess, onNavigationBusyChange, onH
   return (
     <section className="interview" aria-label="Interview practice" aria-busy={operation !== null}>
       {operation && <p role="status">{operation}</p>}
-      {session && <p>Scenario: {scenarioLabel(session.scenario_type)}</p>}
+      {session && <p className="session-context-pill">{scenarioLabel(session.scenario_type)}
+        {interviewerPersonaName(session.interviewer_persona_id) && <>
+          <span aria-hidden="true"> · </span>
+          <span>{interviewerPersonaName(session.interviewer_persona_id)}</span>
+        </>}
+        <span aria-hidden="true"> · </span>Session in progress</p>}
       {(!session || session.status === 'completed' || error) && <fieldset className="scenario-setup"
         disabled={operation !== null || transcribing}>
-        <legend>Practice scenario</legend>
+        <legend>Choose your practice</legend>
+        <p className="setup-intro">Pick the situation you want to feel more prepared for. You can start with a typed answer or speak it aloud.</p>
         {SCENARIOS.map((scenario) => <label className="scenario-choice" key={scenario.type}>
           <input type="radio" name="practice-scenario" value={scenario.type}
             aria-labelledby={`scenario-label-${scenario.type}`} aria-describedby={`scenario-description-${scenario.type}`}
@@ -385,6 +445,20 @@ export default function Interview({ onSessionAccess, onNavigationBusyChange, onH
           <span><strong id={`scenario-label-${scenario.type}`}>{scenario.label}</strong>
             <span id={`scenario-description-${scenario.type}`} className="scenario-description">{scenario.description}</span></span>
         </label>)}
+        <fieldset className="persona-setup" disabled={operation !== null || transcribing}>
+          <legend>Choose your interviewer</legend>
+          <p className="setup-intro">The interviewer’s tone shapes how the follow-up questions are asked.</p>
+          {INTERVIEWER_PERSONAS.map((persona) => <label className="scenario-choice persona-choice" key={persona.id}>
+            <input type="radio" name="interviewer-persona" value={persona.id}
+              aria-labelledby={`persona-label-${persona.id}`} aria-describedby={`persona-description-${persona.id}`}
+              checked={selectedPersona === persona.id} onChange={() => setSelectedPersona(persona.id)} />
+            <span>
+              <strong id={`persona-label-${persona.id}`}>{persona.name}</strong>
+              <span className="persona-meta">{persona.role} <span aria-hidden="true">·</span> {persona.tone}</span>
+              <span id={`persona-description-${persona.id}`} className="scenario-description">{persona.description}</span>
+            </span>
+          </label>)}
+        </fieldset>
       </fieldset>}
       {!session && (
         <button type="button" onClick={() => void start()} disabled={operation !== null || transcribing}>Start Interview</button>
@@ -393,11 +467,15 @@ export default function Interview({ onSessionAccess, onNavigationBusyChange, onH
         <>
           <p aria-live="polite">Question {session.current_question_index + 1} of {session.total_questions}</p>
           <h2 id="current-question" aria-live="polite">{session.current_question}</h2>
+          {workspace && <QuestionVoice ref={voice} authGeneration={workspace.generation} sessionId={session.id}
+            questionIndex={session.current_question_index} question={session.current_question!}
+            active={active} disabled={blocked || audioBusy} />}
           {view.mode === 'composing' && (
             <form onSubmit={submit}>
               <AudioAnswer key={`${session.id}:${session.current_question_index}:${draftGeneration}`}
                 session={session} disabled={blocked} hasAnswer={draft.text.length > 0}
                 onBusyChange={setAudioBusy}
+                onBeforeRecording={() => voice.current?.invalidate()}
                 onTranscribing={setTranscribing} onConflict={() => void audioConflict()}
                 onUncertainTranscription={uncertainTranscription}
                 onTranscript={(text, measurementId) => setDraft((current) => current.text === '' ? { text, measurementId } : current)}
@@ -427,7 +505,9 @@ export default function Interview({ onSessionAccess, onNavigationBusyChange, onH
           )}
           {view.mode === 'review' && (
             <>
-              {view.comparison && <Comparison comparison={view.comparison} />}
+              {view.comparison && <Comparison comparison={view.comparison} attempts={view.attempts}
+                onCompare={(before, after) => void compareAttempts(before, after)}
+                isLoading={comparisonLoading} error={comparisonError} />}
               {feedback && <section aria-label="Answer feedback" aria-busy={feedback.status === 'loading'}>
                 <h3>Answer feedback</h3>
                 {feedback.status === 'loading' && <p role="status">Generating answer feedback…</p>}

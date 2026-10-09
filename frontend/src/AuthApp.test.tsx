@@ -8,7 +8,7 @@ import { authenticateTestWorkspace } from './authTestUtils'
 const userA = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
 const userB = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'
 const sessionId = '11111111-1111-4111-8111-111111111111'
-const session = { id: sessionId, scenario_type: 'job_interview', question_engine: 'deterministic-v1', total_questions: 5, status: 'active', current_question_index: 0,
+const session = { id: sessionId, scenario_type: 'job_interview', interviewer_persona_id: 'recruiter', question_engine: 'deterministic-v1', total_questions: 5, status: 'active', current_question_index: 0,
   current_question: 'Immediate practice question', current_question_latest_attempt_number: 0,
   questions: ['Immediate practice question', 'Two', 'Three', 'Four', 'Five'], answers: [] }
 const summary = { session_id: sessionId, scenario_type: 'job_interview', question_engine: 'deterministic-v1', status: 'active', created_at: '2026-10-06T12:00:00Z',
@@ -122,7 +122,7 @@ test('authentication 503 on a protected operation retains workspace and never au
   render(<App />); await workspace()
   fireEvent.click(screen.getByRole('button', { name: 'Start Interview' }))
   await screen.findByText(auth.AUTH_UNAVAILABLE_MESSAGE)
-  expect(screen.getByRole('button', { name: 'Logout' })).toBeTruthy()
+  expect(screen.getByRole('button', { name: 'Log out' })).toBeTruthy()
   expect(calls(mock, '/api/sessions')).toHaveLength(1)
   expect(calls(mock, '/api/auth/me')).toHaveLength(1)
 })
@@ -132,7 +132,7 @@ test('404 resource failure does not invalidate authentication', async () => {
   render(<App />); await workspace()
   fireEvent.click(screen.getByRole('button', { name: 'Start Interview' }))
   await waitFor(() => expect(auth.getAuthState().status).toBe('authenticated'))
-  expect(screen.getByRole('button', { name: 'Logout' })).toBeTruthy()
+  expect(screen.getByRole('button', { name: 'Log out' })).toBeTruthy()
 })
 
 test('logout clears Practice and History; a late request cannot refill either', async () => {
@@ -143,7 +143,7 @@ test('logout clears Practice and History; a late request cannot refill either', 
   await screen.findByRole('heading', { name: 'Active session' })
   fireEvent.click(screen.getByRole('button', { name: /^Practice$/ }))
   fireEvent.click(screen.getByRole('button', { name: 'Start Interview' }))
-  fireEvent.click(screen.getByRole('button', { name: 'Logout' }))
+  fireEvent.click(screen.getByRole('button', { name: 'Log out' }))
   await screen.findByRole('button', { name: 'Sign in' })
   await act(async () => { pending.resolve(json(session, 201)) })
   expect(screen.queryByText('Immediate practice question')).toBeNull()
@@ -156,7 +156,7 @@ test.each([401, 403, 503])('logout %s uses fixed state transition and does not r
   const mock = api((path) => path === '/api/auth/logout' ? json({ detail: 'PRIVATE_LOGOUT_SENTINEL' }, status) : undefined)
   render(<App />); await start()
   fireEvent.change(screen.getByRole('textbox'), { target: { value: 'Keep the current draft' } })
-  fireEvent.click(screen.getByRole('button', { name: 'Logout' }))
+  fireEvent.click(screen.getByRole('button', { name: 'Log out' }))
   if (status === 503) {
     await screen.findByText('Unable to sign out right now. Please try again.')
     expect((screen.getByRole('textbox') as HTMLTextAreaElement).value).toBe('Keep the current draft')

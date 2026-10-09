@@ -57,7 +57,7 @@ function metric(before: number, after: number): Metric {
     comparable: true, comparison_unavailable_reason: null }
 }
 function freshSession(id = 'session-1', scenarioType: ScenarioType = 'job_interview'): InterviewSession {
-  return { id, scenario_type: scenarioType, question_engine: 'deterministic-v1', total_questions: 5, status: 'active', current_question_index: 0, current_question: questions[0], questions,
+  return { id, scenario_type: scenarioType, interviewer_persona_id: null, question_engine: 'deterministic-v1', total_questions: 5, status: 'active', current_question_index: 0, current_question: questions[0], questions,
     answers: [], current_question_latest_attempt_number: 0 }
 }
 function response(data: unknown, status = 200) { return new Response(JSON.stringify(data), { status }) }
@@ -86,13 +86,16 @@ function mockSessionApi(initial = freshSession()) {
       answers: [...session.answers, latest?.answer ?? 'Saved answer'], current_question_latest_attempt_number: 0 }
     return session
   }
-  function comparison(questionIndex: number): Comparison {
+  function comparison(questionIndex: number, beforeNumber?: number, afterNumber?: number): Comparison {
     const list = saved(questionIndex)
     const identity = (attempt: SavedAttempt) => ({ id: attempt.id, attempt_number: attempt.attempt_number,
       measurement_id: attempt.measurement_id, measurement_version: attempt.measurement_id ? 'speaking-metrics-v1' : null,
       measurement_source: attempt.measurement_id ? 'original_transcription' : null })
-    return comparisons.get(questionIndex) ?? { session_id: session.id, question_index: questionIndex,
-      before_attempt: list[0] ? identity(list[0]) : null, after_attempt: list.length > 1 ? identity(list.at(-1)!) : null,
+    if (beforeNumber === undefined && afterNumber === undefined && comparisons.has(questionIndex)) return comparisons.get(questionIndex)!
+    const before = list.find((attempt) => attempt.attempt_number === (beforeNumber ?? list[0]?.attempt_number))
+    const after = list.find((attempt) => attempt.attempt_number === (afterNumber ?? list.at(-1)?.attempt_number))
+    return { session_id: session.id, question_index: questionIndex,
+      before_attempt: before ? identity(before) : null, after_attempt: after ? identity(after) : null,
       comparison: list.length > 1 ? { recognized_word_count: { ...unavailable }, um_count: { ...unavailable },
         uh_count: { ...unavailable }, timed_utterance_span_seconds: { ...unavailable }, estimated_words_per_minute: { ...unavailable } } : null,
       delivery_comparison: list.length > 1 ? { before_version: null, after_version: null, before_source: null, after_source: null,
@@ -103,11 +106,11 @@ function mockSessionApi(initial = freshSession()) {
     const override = intercept?.(url, options)
     if (override) return await override
     if (url === '/api/sessions' && options?.method === 'POST') {
-      const body = JSON.parse(options.body as string) as { scenario_type: ScenarioType }
+      const body = JSON.parse(options.body as string) as { scenario_type: ScenarioType; interviewer_persona_id: 'recruiter' | 'manager' | 'hr' }
       creations += 1
       attempts.clear()
       comparisons.clear()
-      session = freshSession(`session-${creations}`, body.scenario_type)
+      session = { ...freshSession(`session-${creations}`, body.scenario_type), interviewer_persona_id: body.interviewer_persona_id }
       if (initial.question_engine === 'live-ai-roleplay-v1') session = { ...session, question_engine: initial.question_engine, questions: questions.slice(0, 1) }
       return response(session, 201)
     }
@@ -118,7 +121,7 @@ function mockSessionApi(initial = freshSession()) {
       expect(options.body).toBeUndefined()
       return response(diagnosis)
     }
-    const match = url.match(/\/questions\/(\d+)\/(attempts|continue|comparison)$/)
+    const match = url.match(/\/questions\/(\d+)\/(attempts|continue|comparison)(?:\?(.*))?$/)
     if (match) {
       const questionIndex = Number(match[1])
       if (match[2] === 'attempts' && options?.method === 'POST') {
@@ -136,7 +139,12 @@ function mockSessionApi(initial = freshSession()) {
         return response(advance())
       }
       if (match[2] === 'attempts') return response(saved(questionIndex))
-      if (match[2] === 'comparison') return response(comparison(questionIndex))
+      if (match[2] === 'comparison') {
+        const selectors = new URLSearchParams(match[3] ?? '')
+        const before = selectors.has('before') ? Number(selectors.get('before')) : undefined
+        const after = selectors.has('after') ? Number(selectors.get('after')) : undefined
+        return response(comparison(questionIndex, before, after))
+      }
     }
     if (url === `/api/sessions/${session.id}` && (!options?.method || options.method === 'GET')) return response(session)
     if (url === `/api/sessions/${session.id}/history-detail` && (!options?.method || options.method === 'GET')) {
@@ -152,6 +160,9 @@ function mockSessionApi(initial = freshSession()) {
   vi.stubGlobal('fetch', fetchMock)
   return { fetchMock, append, advance, saved, comparison,
     session: () => session, creations: () => creations,
+    comparisonRequests: () => fetchMock.mock.calls
+      .filter(([url, options]) => String(url).includes('/comparison') && options?.method !== 'POST')
+      .map(([url]) => String(url)),
     setSession: (next: InterviewSession) => { session = next },
     setComparison: (next: Comparison) => { comparisons.set(next.question_index, next) },
     intercept: (next: typeof intercept) => { intercept = next },
@@ -171,6 +182,13 @@ afterEach(() => { cleanup(); sessionStorage.clear(); vi.unstubAllGlobals(); vi.r
 async function start() {
   fireEvent.click(screen.getByRole('button', { name: 'Start Interview' }))
   await screen.findByRole('textbox', { name: 'Your answer' })
+}
+async function expectScenarioContext(label: string) {
+  await waitFor(() => {
+    const context = document.querySelector('.session-context-pill')
+    expect(context?.textContent).toContain(label)
+    expect(context?.textContent).toContain('Session in progress')
+  })
 }
 async function submit(answer: string) {
   fireEvent.change(screen.getByRole('textbox', { name: 'Your answer' }), { target: { value: answer } })
@@ -238,7 +256,8 @@ function expectReviewActionsEnabled() {
 test('setup shows four described scenarios and changes selection without creating a session', () => {
   const api = mockSessionApi()
   render(<Interview />)
-  const choices = within(screen.getByRole('group', { name: 'Practice scenario' })).getAllByRole('radio')
+  const choices = within(screen.getByRole('group', { name: 'Choose your practice' })).getAllByRole('radio')
+    .filter((choice) => choice.getAttribute('name') === 'practice-scenario')
   expect(choices).toHaveLength(4)
   expect((choices[0] as HTMLInputElement).checked).toBe(true)
   for (const choice of choices) {
@@ -259,10 +278,10 @@ test.each([
   fireEvent.click(screen.getByRole('radio', { name: new RegExp(`^${label}`) }))
   expect(api.creations()).toBe(0)
   await start()
-  expect(postedBody(api, '/api/sessions')).toEqual({ scenario_type: scenarioType })
+  expect(postedBody(api, '/api/sessions')).toEqual({ scenario_type: scenarioType, interviewer_persona_id: 'recruiter' })
   expect(api.creations()).toBe(1)
-  expect(screen.getByText(`Scenario: ${label}`)).toBeTruthy()
-  expect(screen.queryByRole('group', { name: 'Practice scenario' })).toBeNull()
+  await expectScenarioContext(label)
+  expect(screen.queryByRole('group', { name: 'Choose your practice' })).toBeNull()
 })
 
 test('creation locks the scenario choices and repeated Start sends only the chosen scenario once', async () => {
@@ -276,17 +295,31 @@ test('creation locks the scenario choices and repeated Start sends only the chos
   const choices = screen.getAllByRole('radio')
   expect(choices.every((choice) => choice.matches(':disabled'))).toBe(true)
   expect(api.posts('/api/sessions')).toHaveLength(1)
-  expect(postedBody(api, '/api/sessions')).toEqual({ scenario_type: 'thesis_defense' })
-  await act(async () => { pending.resolve(response(freshSession('session-1', 'thesis_defense'), 201)) })
-  await screen.findByText('Scenario: Thesis Defense')
+  expect(postedBody(api, '/api/sessions')).toEqual({ scenario_type: 'thesis_defense', interviewer_persona_id: 'recruiter' })
+  await act(async () => { pending.resolve(response({ ...freshSession('session-1', 'thesis_defense'), interviewer_persona_id: 'recruiter' }, 201)) })
+  await expectScenarioContext('Thesis Defense')
+})
+
+test.each([
+  ['University Recruiter', 'recruiter', 'Polite'],
+  ['Senior Manager', 'manager', 'Formal'],
+  ['HR Lead', 'hr', 'Firm'],
+] as const)('starts with SpeakUp interviewer %s and shows its saved persona', async (name, personaId, tone) => {
+  const api = mockSessionApi()
+  render(<Interview />)
+  fireEvent.click(screen.getByRole('radio', { name }))
+  await start()
+  expect(postedBody(api, '/api/sessions')).toEqual({ scenario_type: 'job_interview', interviewer_persona_id: personaId })
+  expect(screen.getByText(name)).toBeTruthy()
+  expect(screen.queryByText(tone)).toBeNull()
 })
 
 test('restored Practice labels the canonical saved scenario without creating another session', async () => {
   const api = mockSessionApi(freshSession('existing-session', 'salary_negotiation'))
   await restore(api)
-  expect(screen.getByText('Scenario: Salary Negotiation')).toBeTruthy()
+  await expectScenarioContext('Salary Negotiation')
   expect(api.creations()).toBe(0)
-  expect(screen.queryByRole('group', { name: 'Practice scenario' })).toBeNull()
+  expect(screen.queryByRole('group', { name: 'Choose your practice' })).toBeNull()
 })
 
 test('choosing a new scenario on completion leaves the saved label and session unchanged until Start', async () => {
@@ -296,12 +329,12 @@ test('choosing a new scenario on completion leaves the saved label and session u
   render(<Interview />)
   await screen.findByRole('heading', { name: 'Interview Complete' })
   fireEvent.click(screen.getByRole('radio', { name: /^Public Speaking/ }))
-  expect(screen.getByText('Scenario: Thesis Defense')).toBeTruthy()
+  await expectScenarioContext('Thesis Defense')
   expect(api.creations()).toBe(0)
   expect(sessionStorage.getItem(storageKey)).toBe('session-1')
   fireEvent.click(screen.getByRole('button', { name: 'Start New Interview' }))
-  await screen.findByText('Scenario: Public Speaking')
-  expect(postedBody(api, '/api/sessions')).toEqual({ scenario_type: 'public_speaking' })
+  await expectScenarioContext('Public Speaking')
+  expect(postedBody(api, '/api/sessions')).toEqual({ scenario_type: 'public_speaking', interviewer_persona_id: 'recruiter' })
 })
 
 test('the existing recovery restart offers scenarios and creates only after explicit Start', async () => {
@@ -314,12 +347,12 @@ test('the existing recovery restart offers scenarios and creates only after expl
   await screen.findByRole('alert')
   fireEvent.click(screen.getByRole('radio', { name: 'Salary Negotiation' }))
   expect(api.creations()).toBe(1)
-  expect(screen.getByText('Scenario: Job Interview')).toBeTruthy()
+  await expectScenarioContext('Job Interview')
   expect((screen.getByRole('textbox') as HTMLTextAreaElement).value).toBe('Unsaved answer')
   fireEvent.click(screen.getByRole('button', { name: 'Start New Interview' }))
-  await screen.findByText('Scenario: Salary Negotiation')
+  await expectScenarioContext('Salary Negotiation')
   expect(api.creations()).toBe(2)
-  expect(postedBody(api, '/api/sessions', 1)).toEqual({ scenario_type: 'salary_negotiation' })
+  expect(postedBody(api, '/api/sessions', 1)).toEqual({ scenario_type: 'salary_negotiation', interviewer_persona_id: 'recruiter' })
 })
 
 test('a fresh question composes and stores only the session ID for reload', async () => {
@@ -385,6 +418,26 @@ test('Attempt 2 and Attempt 3 use authoritative revisions, preserve history, and
   expect(screen.getByRole('heading', { name: 'Attempt 3' })).toBeTruthy()
   await waitFor(() => expect(api.gets('/comparison')).toHaveLength(2))
   expect(screen.getByText(/Attempt 1.*Attempt 3/)).toBeTruthy()
+})
+
+test('selects a different saved attempt pair without creating another attempt', async () => {
+  const api = mockSessionApi()
+  render(<Interview />)
+  await start()
+  await submit('Attempt one text')
+  await retry()
+  await submit('Attempt two text')
+  await retry()
+  await submit('Attempt three text')
+  await screen.findByRole('table', { name: 'Speaking duration is shown in seconds.' })
+  expect(screen.getByText(/Before: Attempt 1.*After: Attempt 3/)).toBeTruthy()
+
+  fireEvent.change(screen.getByRole('combobox', { name: 'Before attempt' }), { target: { value: '2' } })
+  fireEvent.click(screen.getByRole('button', { name: 'Compare attempts' }))
+  await screen.findByText(/Before: Attempt 2.*After: Attempt 3/)
+
+  expect(api.comparisonRequests()).toContain('/api/sessions/session-1/questions/0/comparison?before=2&after=3')
+  expect(api.posts('/attempts')).toHaveLength(3)
 })
 
 test('Continue sends authoritative revision and advances only after its response', async () => {
@@ -1584,7 +1637,7 @@ test.each(['success', 'error'] as const)('restart immediately aborts and ignores
   expect(document.body.textContent).not.toContain('STALE_SUMMARY')
   expect(screen.queryByText('Interview summary is unavailable.')).toBeNull()
   expect((screen.getByRole('button', { name: 'Start New Interview' }) as HTMLButtonElement).disabled).toBe(true)
-  const next = freshSession(nextSummarySessionId)
+  const next = { ...freshSession(nextSummarySessionId), interviewer_persona_id: 'recruiter' as const }
   api.setSession(next)
   await act(async () => creation.resolve(response(next, 201)))
   await screen.findByText('Question 1 of 5')
@@ -1726,4 +1779,165 @@ test('restoring an adaptive session reads its generated prefix without continuin
   expect(screen.queryByText(questions[2])).toBeNull()
   expect(api.posts('/continue')).toHaveLength(0)
   expect(api.posts('/diagnosis')).toHaveLength(0)
+})
+
+class QuestionAudio {
+  static instances: QuestionAudio[] = []
+  src: string
+  currentTime = 0
+  onended: (() => void) | null = null
+  onerror: (() => void) | null = null
+  play = vi.fn().mockResolvedValue(undefined)
+  pause = vi.fn()
+  removeAttribute(name: string) { if (name === 'src') this.src = '' }
+  constructor(url: string) { this.src = url; QuestionAudio.instances.push(this) }
+}
+function stubQuestionAudio() {
+  QuestionAudio.instances = []
+  const createURL = vi.fn().mockReturnValue('blob:question')
+  const revokeURL = vi.fn()
+  const NativeURL = URL
+  vi.stubGlobal('URL', class extends NativeURL { static createObjectURL = createURL; static revokeObjectURL = revokeURL })
+  vi.stubGlobal('Audio', QuestionAudio)
+  return { createURL, revokeURL }
+}
+function speechResponse() { return new Response(new Uint8Array([0xff, 0xfb, 0x90, 0x64]), { headers: { 'Content-Type': 'audio/mpeg' } }) }
+async function playQuestion() {
+  fireEvent.click(screen.getByRole('button', { name: 'Play question' }))
+  await waitFor(() => expect(QuestionAudio.instances.at(-1)?.play).toHaveBeenCalledOnce())
+}
+
+test.each(['deterministic-v1', 'live-ai-roleplay-v1'] as const)(
+  '%s synthesis is explicit and Replay creates no attempt, diagnosis, advancement, or storage write', async (engine) => {
+    const api = mockSessionApi(engine === 'live-ai-roleplay-v1' ? adaptiveSession() : freshSession())
+    const { revokeURL } = stubQuestionAudio()
+    api.intercept((url, options) => {
+      if (!url.endsWith('/speech')) return
+      expect(url).toBe('/api/sessions/session-1/questions/0/speech')
+      expect(options?.body).toBeUndefined()
+      return speechResponse()
+    })
+    const { unmount } = render(<Interview />); await start()
+    expect(api.posts('/speech')).toHaveLength(0)
+    const writes = api.fetchMock.mock.calls.filter(([, options]) => options?.method === 'POST').length
+    const storage = vi.spyOn(Storage.prototype, 'setItem')
+    await playQuestion()
+    act(() => QuestionAudio.instances[0].onended?.())
+    fireEvent.click(screen.getByRole('button', { name: 'Replay question' }))
+    await waitFor(() => expect(QuestionAudio.instances[0].play).toHaveBeenCalledTimes(2))
+    expect(api.posts('/speech')).toHaveLength(1)
+    expect(api.fetchMock.mock.calls.filter(([, options]) => options?.method === 'POST')).toHaveLength(writes + 1)
+    expect(api.posts('/attempts')).toHaveLength(0)
+    expect(api.posts('/continue')).toHaveLength(0)
+    expect(api.posts('/diagnosis')).toHaveLength(0)
+    expect(storage).not.toHaveBeenCalled()
+    expect(api.session().current_question_index).toBe(0)
+    expect(api.session().current_question_latest_attempt_number).toBe(0)
+    unmount()
+    expect(revokeURL).toHaveBeenCalledExactlyOnceWith('blob:question')
+  },
+)
+
+test.each(['Submit Attempt', 'Retry', 'Cancel Retry', 'Continue'])(
+  '%s immediately disposes voice through its existing interview lifecycle without automatic synthesis', async (action) => {
+    const api = mockSessionApi()
+    const { revokeURL } = stubQuestionAudio()
+    api.intercept((url) => url.endsWith('/speech') ? speechResponse() : undefined)
+    render(<Interview />); await start()
+    if (action !== 'Submit Attempt') await submit('Original saved answer')
+    if (action === 'Cancel Retry') await retry()
+    if (action === 'Submit Attempt') fireEvent.change(screen.getByRole('textbox', { name: 'Your answer' }), { target: { value: 'Saved answer' } })
+    await playQuestion()
+    fireEvent.click(screen.getByRole('button', { name: action }))
+    // Disposal occurs in the click handler before persistence/reconciliation settles.
+    expect(QuestionAudio.instances[0].pause).toHaveBeenCalledOnce()
+    expect(revokeURL).toHaveBeenCalledExactlyOnceWith('blob:question')
+    if (action === 'Submit Attempt') await screen.findByRole('button', { name: 'Continue' })
+    if (action === 'Retry') await screen.findByRole('textbox', { name: 'Your answer' })
+    if (action === 'Cancel Retry') await screen.findByRole('button', { name: 'Continue' })
+    if (action === 'Continue') await screen.findByText('Question 2 of 5')
+    expect(api.posts('/speech')).toHaveLength(1)
+    expect(api.posts('/attempts')).toHaveLength(1)
+    expect(api.posts('/continue')).toHaveLength(action === 'Continue' ? 1 : 0)
+  },
+)
+
+test('Continue aborts pending speech immediately; an ignored-abort response cannot play the previous question', async () => {
+  const api = mockSessionApi(adaptiveSession())
+  const { createURL } = stubQuestionAudio()
+  const pending = deferredResponse()
+  api.intercept((url) => url.endsWith('/speech') ? pending.promise : undefined)
+  render(<Interview />); await start(); await submit('Saved answer')
+  fireEvent.click(screen.getByRole('button', { name: 'Play question' }))
+  const signal = api.posts('/speech')[0][1]?.signal
+  expect((screen.getByRole('button', { name: 'Continue' }) as HTMLButtonElement).disabled).toBe(false)
+  fireEvent.click(screen.getByRole('button', { name: 'Continue' }))
+  expect(signal?.aborted).toBe(true)
+  await screen.findByText('Question 2 of 5')
+  await act(async () => pending.resolve(speechResponse()))
+  expect(createURL).not.toHaveBeenCalled()
+  expect(QuestionAudio.instances).toHaveLength(0)
+  expect(api.posts('/speech')).toHaveLength(1)
+  expect(api.posts('/continue')).toHaveLength(1)
+})
+
+test('Cancel Retry never restores an old voice clip and does not synthesize a replacement', async () => {
+  const api = mockSessionApi()
+  const { revokeURL } = stubQuestionAudio()
+  api.intercept((url) => url.endsWith('/speech') ? speechResponse() : undefined)
+  render(<Interview />); await start(); await submit('Saved answer'); await playQuestion()
+  await retry()
+  fireEvent.click(screen.getByRole('button', { name: 'Cancel Retry' }))
+  expect(screen.getByRole('button', { name: 'Play question' })).toBeDefined()
+  expect(screen.queryByRole('button', { name: 'Replay question' })).toBeNull()
+  expect(revokeURL).toHaveBeenCalledOnce()
+  expect(api.posts('/speech')).toHaveLength(1)
+  expect(api.posts('/attempts')).toHaveLength(1)
+  expect(api.posts('/diagnosis')).toHaveLength(1)
+})
+
+test.each([502, 503, 504])('voice %i is a non-mutation failure; Retry and Continue remain usable', async (status) => {
+  const api = mockSessionApi()
+  api.intercept((url) => url.endsWith('/speech') ? response({ detail: 'Voice playback is unavailable right now.' }, status) : undefined)
+  render(<Interview />); await start(); await submit('Saved answer')
+  fireEvent.click(screen.getByRole('button', { name: 'Play question' }))
+  await screen.findByText('Voice playback is unavailable right now.')
+  expect(screen.queryByText('Authentication is temporarily unavailable. Please try again.')).toBeNull()
+  expect(screen.queryByRole('button', { name: 'Recheck saved state' })).toBeNull()
+  expect((screen.getByRole('button', { name: 'Retry' }) as HTMLButtonElement).disabled).toBe(false)
+  expect((screen.getByRole('button', { name: 'Continue' }) as HTMLButtonElement).disabled).toBe(false)
+  expect(api.posts('/speech')).toHaveLength(1)
+  expect(api.posts('/attempts')).toHaveLength(1)
+  expect(api.posts('/continue')).toHaveLength(0)
+})
+
+test('restored saved review exposes Play without synthesizing or requesting diagnosis', async () => {
+  const api = mockSessionApi()
+  api.append('Saved current answer')
+  await restore(api)
+  await screen.findByRole('button', { name: 'Play question' })
+  expect(api.posts('/speech')).toHaveLength(0)
+  expect(api.posts('/diagnosis')).toHaveLength(0)
+})
+
+test('session restart disposes old voice immediately without synthesizing for the new session', async () => {
+  const api = mockSessionApi()
+  const { revokeURL } = stubQuestionAudio()
+  api.intercept((url, options) => {
+    if (url.endsWith('/speech')) return speechResponse()
+    if (url.endsWith('/attempts') && options?.method === 'POST') return response({ detail: 'Cannot submit this answer.' }, 400)
+  })
+  render(<Interview />); await start()
+  fireEvent.change(screen.getByRole('textbox', { name: 'Your answer' }), { target: { value: 'Unaccepted answer' } })
+  fireEvent.click(screen.getByRole('button', { name: 'Submit Attempt' }))
+  const restart = await screen.findByRole('button', { name: 'Start New Interview' })
+  await playQuestion()
+  fireEvent.click(restart)
+  expect(QuestionAudio.instances[0].pause).toHaveBeenCalledOnce()
+  expect(revokeURL).toHaveBeenCalledOnce()
+  await waitFor(() => expect(api.creations()).toBe(2))
+  await screen.findByRole('textbox', { name: 'Your answer' })
+  expect(api.posts('/speech')).toHaveLength(1)
+  expect(api.session().id).toBe('session-2')
+  expect(screen.queryByRole('button', { name: 'Replay question' })).toBeNull()
 })

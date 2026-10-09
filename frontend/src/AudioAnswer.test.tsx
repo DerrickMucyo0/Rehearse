@@ -10,7 +10,7 @@ import type { Attempt, InterviewSession, SemanticDiagnosis, SpeakingMetrics } fr
 import type { DeliveryMetrics } from './deliveryMetrics'
 import { deliveryUnavailableText, TIMED_PAUSES_EXPLANATION, TIMED_PAUSES_LIMITATION } from './deliveryMetrics'
 
-const session: InterviewSession = { id: 'session-1', scenario_type: 'job_interview', question_engine: 'deterministic-v1', total_questions: 5, status: 'active', current_question_index: 0, current_question: 'Question', current_question_latest_attempt_number: 0, questions: ['Question', 'Second', 'Third', 'Fourth', 'Fifth'], answers: [] }
+const session: InterviewSession = { id: 'session-1', scenario_type: 'job_interview', interviewer_persona_id: 'recruiter', question_engine: 'deterministic-v1', total_questions: 5, status: 'active', current_question_index: 0, current_question: 'Question', current_question_latest_attempt_number: 0, questions: ['Question', 'Second', 'Third', 'Fourth', 'Fifth'], answers: [] }
 const readHistoryDetail = historyApi.getHistoryDetail
 
 function legacyCompletedHistoryDetail(id: string): HistoryDetail {
@@ -92,6 +92,20 @@ function accepted() {
   return new Response(JSON.stringify({ status: 'accepted', session_id: session.id, question_index: 0,
     filename: 'answer-1.webm', content_type: 'audio/webm;codecs=opus', size_bytes: 5 }))
 }
+
+test('recording invalidates voice synchronously before microphone acquisition', async () => {
+  const stopVoice = vi.fn()
+  getUserMedia.mockImplementation(() => {
+    expect(stopVoice).toHaveBeenCalledOnce()
+    return Promise.resolve(media)
+  })
+  render(<AudioAnswer session={session} disabled={false} hasAnswer={false} onTranscript={vi.fn()}
+    onInvalidateMeasurement={vi.fn()} onTranscribing={vi.fn()} onBeforeRecording={stopVoice} />)
+  fireEvent.click(screen.getByRole('button', { name: 'Record Answer' }))
+  expect(stopVoice).toHaveBeenCalledOnce()
+  await screen.findByRole('button', { name: 'Stop Recording' })
+  expect(getUserMedia).toHaveBeenCalledOnce()
+})
 
 // Deterministic mocked backend: saving appends, while Continue alone advances.
 function interviewFetch({ active = session, transcriptions = [], submissionError = null }: {

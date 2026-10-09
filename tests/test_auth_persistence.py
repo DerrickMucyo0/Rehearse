@@ -60,10 +60,10 @@ def auth_revision_metadata():
         if table.name != "oidc_login_transactions":
             table.to_metadata(metadata)
     sessions = metadata.tables[StoredInterviewSession.__tablename__]
-    for name in ("scenario_type", "question_engine"):
+    for name in ("scenario_type", "question_engine", "interviewer_persona_id"):
         sessions._columns.remove(sessions.c[name])
     for name in (
-        "ck_sessions_scenario_type", "ck_sessions_question_engine",
+        "ck_sessions_scenario_type", "ck_sessions_question_engine", "ck_sessions_interviewer_persona",
         "ck_sessions_question_snapshot", "ck_sessions_completion",
     ):
         constraint = next(item for item in sessions.constraints if item.name == name)

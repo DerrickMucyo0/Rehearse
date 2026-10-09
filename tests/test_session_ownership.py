@@ -535,7 +535,10 @@ def test_all_session_and_history_routes_use_owned_authenticated_dependencies():
         session_routes.start_session, session_routes.get_session, session_routes.submit_attempt,
         session_routes.get_attempts, session_routes.continue_question, session_routes.get_comparison,
     }
-    providers = {session_routes.accept_audio, session_routes.transcribe_audio, session_routes.diagnose_attempt}
+    providers = {
+        session_routes.accept_audio, session_routes.transcribe_audio,
+        session_routes.diagnose_attempt, session_routes.speak_question,
+    }
     seen_core, seen_providers, seen_history = set(), set(), set()
     for route in iter_route_contexts(app.routes):
         if not hasattr(route, "dependant"):
@@ -556,7 +559,9 @@ def test_all_session_and_history_routes_use_owned_authenticated_dependencies():
             assert session_routes.get_session_service in dependencies
             assert auth_http.require_authenticated_principal in dependencies
             assert auth_http.get_auth_session_store in dependencies
-            if route.endpoint in (session_routes.transcribe_audio, session_routes.diagnose_attempt):
+            if route.endpoint in (
+                session_routes.transcribe_audio, session_routes.diagnose_attempt, session_routes.speak_question,
+            ):
                 assert auth_http.require_authenticated_principal in direct
                 assert auth_http.get_auth_session_store in direct
                 assert signature.parameters["principal"].annotation == auth_http.AuthenticatedPrincipalDependency
@@ -568,7 +573,7 @@ def test_all_session_and_history_routes_use_owned_authenticated_dependencies():
             assert auth_http.require_authenticated_principal in dependencies
             assert auth_http.get_auth_session_store in dependencies
     assert seen_core == core and len(seen_core) == 6
-    assert seen_providers == providers and len(seen_providers) == 3
+    assert seen_providers == providers and len(seen_providers) == 4
     assert seen_history == {
         ("/api/history/summaries", ("GET",)), ("/api/history/summaries", ("POST",)),
         ("/api/sessions/{session_id}/history-detail", ("GET",)),

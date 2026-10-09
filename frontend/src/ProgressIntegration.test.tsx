@@ -26,7 +26,7 @@ const semanticDiagnosis: SemanticDiagnosis = {
 }
 function response(value: unknown, status = 200) { return new Response(JSON.stringify(value), { status }) }
 function initialSession(id = SESSION_ID): InterviewSession {
-  return { id, scenario_type: 'job_interview', question_engine: 'deterministic-v1', total_questions: 5, status: 'active', current_question_index: 0, current_question: questions[0],
+  return { id, scenario_type: 'job_interview', interviewer_persona_id: null, question_engine: 'deterministic-v1', total_questions: 5, status: 'active', current_question_index: 0, current_question: questions[0],
     current_question_latest_attempt_number: 0, questions, answers: [] }
 }
 function deferred<T>() {
@@ -149,8 +149,9 @@ function mockAppApi(initial = initialSession()) {
     if (url === '/api/auth/me') return response({ user_id: USER_ID, request_context: 'context-A' })
     if (url === '/api/auth/logout') return new Response(null, { status: 204 })
     if (url === '/api/sessions' && options?.method === 'POST') {
+      const body = JSON.parse(options.body as string) as { interviewer_persona_id: 'recruiter' | 'manager' | 'hr' }
       creations += 1
-      session = initialSession()
+      session = { ...initialSession(), interviewer_persona_id: body.interviewer_persona_id }
       if (initial.question_engine === 'live-ai-roleplay-v1') session = { ...session, question_engine: initial.question_engine, questions: questions.slice(0, 1) }
       known.set(session.id, session)
       return response(session, 201)
@@ -808,7 +809,7 @@ test('linked delivery reaches History and Progress only after finalization witho
   await openLoadedHistory()
   fireEvent.click(screen.getByRole('button', { name: 'Open session' }))
   await screen.findByRole('heading', { name: 'Session detail' })
-  fireEvent.click(screen.getByRole('button', { name: 'Question 1' }))
+  fireEvent.click(await screen.findByRole('button', { name: 'Question 1' }))
   await screen.findByText('Edited delivery review answer')
   expect(screen.getByRole('region', { name: 'Timed pauses' }).textContent).toContain('Pause count')
   expect(api.posts('/transcriptions')).toHaveLength(1)

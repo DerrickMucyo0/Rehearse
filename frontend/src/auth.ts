@@ -202,6 +202,18 @@ export async function readProtectedJson(response: Response): Promise<unknown> {
   }
 }
 
+export async function readProtectedBlob(response: Response): Promise<Blob> {
+  assertProtectedResponseCurrent(response)
+  try {
+    const value = await response.blob()
+    assertProtectedResponseCurrent(response)
+    return value
+  } catch (error) {
+    assertProtectedResponseCurrent(response)
+    throw error
+  }
+}
+
 export async function logoutAuth(): Promise<void> {
   try {
     const response = await protectedFetch('/api/auth/logout', { method: 'POST', signal: AbortSignal.timeout(10_000) })

@@ -40,6 +40,7 @@ JOB_QUESTIONS = (
 )
 INVALID_SCENARIOS = (None, "", "interview", "Job_interview", "job_interview ",
                      " public_speaking", "salary_negotiation\x00", 1, True, [], {})
+INVALID_PERSONAS = (None, "", "University Recruiter", "Recruiter", "manager ", 1, True, [], {})
 
 
 def test_catalog_has_only_four_deterministic_immutable_five_question_sets():
@@ -76,8 +77,22 @@ def test_direct_start_validates_scenario_before_opening_a_transaction(value):
         service.start(value)
 
 
+@pytest.mark.parametrize("persona_id", [None, "", "University Recruiter", "manager ", True, 1, []])
+def test_direct_adaptive_start_validates_persona_before_opening_a_transaction(persona_id):
+    class Factory:
+        def begin(self):
+            raise AssertionError("Invalid personas must not open a transaction.")
+
+    principal = AuthenticatedPrincipal(user_id=uuid4(), auth_session_id=uuid4(), request_context="test")
+    service = InterviewSessionService(Factory(), principal)
+    with pytest.raises(ValueError, match="^Unsupported interviewer persona\\.$"):
+        service.start_adaptive("job_interview", persona_id)
+
+
 def test_start_request_defaults_and_stored_mapping_match_legacy_job_selection():
-    assert StartSessionRequest().model_dump() == {"scenario_type": "job_interview"}
+    assert StartSessionRequest().model_dump() == {
+        "scenario_type": "job_interview", "interviewer_persona_id": "recruiter",
+    }
     table = StoredInterviewSession.__table__
     column = table.c.scenario_type
     assert isinstance(column.type, Text) and column.type.collation == "C"
@@ -102,9 +117,10 @@ class OfflineSessionService:
     def __init__(self):
         self.calls = []
 
-    def start_adaptive(self, scenario_type="job_interview"):
-        self.calls.append(scenario_type)
+    def start_adaptive(self, scenario_type="job_interview", interviewer_persona_id="recruiter"):
+        self.calls.append((scenario_type, interviewer_persona_id))
         return InterviewSession(id=uuid4(), scenario_type=scenario_type,
+                                interviewer_persona_id=interviewer_persona_id,
                                 question_engine="live-ai-roleplay-v1",
                                 questions=list(questions_for_scenario(scenario_type)[:1]))
 
@@ -165,8 +181,9 @@ def test_creation_accepts_bodyless_empty_and_each_explicit_scenario(offline_clie
     assert response.status_code == 201
     session = response.json()
     expected = "job_interview" if body is None else body.get("scenario_type", "job_interview")
-    assert service.calls == [expected]
+    assert service.calls == [(expected, "recruiter")]
     assert session["scenario_type"] == expected
+    assert session["interviewer_persona_id"] == "recruiter"
     assert session["question_engine"] == "live-ai-roleplay-v1"
     assert session["total_questions"] == 5
     assert session["questions"] == list(questions_for_scenario(expected)[:1])
@@ -182,6 +199,24 @@ def test_creation_accepts_bodyless_empty_and_each_explicit_scenario(offline_clie
 def test_invalid_or_extra_creation_fields_return_422_without_starting(offline_client, body):
     client, service = offline_client
     response = client.post("/api/sessions", json=body)
+    assert response.status_code == 422
+    assert service.calls == []
+
+
+@pytest.mark.parametrize("persona_id", ["recruiter", "manager", "hr"])
+def test_creation_persists_the_selected_interviewer_persona(offline_client, persona_id):
+    client, service = offline_client
+    response = client.post("/api/sessions", json={"scenario_type": "job_interview",
+                                                  "interviewer_persona_id": persona_id})
+    assert response.status_code == 201
+    assert response.json()["interviewer_persona_id"] == persona_id
+    assert service.calls == [("job_interview", persona_id)]
+
+
+@pytest.mark.parametrize("persona_id", INVALID_PERSONAS)
+def test_creation_rejects_unknown_persona_without_starting(offline_client, persona_id):
+    client, service = offline_client
+    response = client.post("/api/sessions", json={"interviewer_persona_id": persona_id})
     assert response.status_code == 422
     assert service.calls == []
 

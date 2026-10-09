@@ -62,6 +62,7 @@ def test_every_backend_data_route_is_authenticated_and_only_health_is_public():
         ("/api/sessions/{session_id}/questions/{question_index}/attempts", "POST"),
         ("/api/sessions/{session_id}/questions/{question_index}/attempts", "GET"),
         ("/api/sessions/{session_id}/questions/{question_index}/continue", "POST"),
+        ("/api/sessions/{session_id}/questions/{question_index}/speech", "POST"),
         ("/api/sessions/{session_id}/questions/{question_index}/comparison", "GET"),
         ("/api/sessions/{session_id}/questions/{question_index}/attempts/{attempt_number}/diagnosis", "POST"),
         ("/api/sessions/{session_id}/audio", "POST"),

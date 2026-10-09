@@ -5,6 +5,7 @@ from uuid import uuid4
 
 import pytest
 from sqlalchemy import event, select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.auth import AuthenticatedPrincipal
@@ -88,9 +89,12 @@ def test_adaptive_prefix_and_latest_answers_are_durable_for_all_scenarios(
             assert context is not None
             assert context.next_question_number == index + 2
             assert context.scenario_type == scenario
+            assert context.interviewer_persona_id == "recruiter"
             assert [turn.question_number for turn in context.turns] == list(range(1, index + 2))
             assert [turn.answer for turn in context.turns] == finalized + [f"Latest answer {index + 1}."]
-            assert set(context.model_dump()) == {"context_version", "scenario_type", "next_question_number", "turns"}
+            assert set(context.model_dump()) == {
+                "context_version", "scenario_type", "interviewer_persona_id", "next_question_number", "turns",
+            }
             assert all(set(turn.model_dump()) == {"question_number", "question", "answer"} for turn in context.turns)
         else:
             assert snapshot.context is None
@@ -151,6 +155,24 @@ def test_ungenerated_question_reads_return_not_found_without_placeholders(
     ):
         with pytest.raises(SessionNotFound):
             operation()
+
+
+@pytest.mark.parametrize("persona_id", ["recruiter", "manager", "hr"])
+def test_selected_persona_is_persisted_for_restore_context_and_immutable(
+        sessions, postgres_session_factory, persona_id):
+    created = sessions.start_adaptive("job_interview", persona_id)
+    assert created.interviewer_persona_id == persona_id
+    assert sessions.get(created.id).interviewer_persona_id == persona_id
+    submit(sessions, created.id)
+    snapshot = prepare(sessions, created.id)
+    assert snapshot.context.interviewer_persona_id == persona_id
+    with pytest.raises(IntegrityError) as caught:
+        with postgres_session_factory.begin() as database:
+            database.execute(update(StoredInterviewSession).where(
+                StoredInterviewSession.id == created.id,
+            ).values(interviewer_persona_id="hr" if persona_id != "hr" else "manager"))
+    assert caught.value.orig.sqlstate == "23514"
+    assert sessions.get(created.id).interviewer_persona_id == persona_id
 
 
 def test_prepare_validates_submission_revision_and_returns_frozen_facts(sessions, postgres_session_factory):

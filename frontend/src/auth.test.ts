@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, expect, test, vi } from 'vitest'
 import { AUTH_CONTEXT_HEADER, AUTH_UNAVAILABLE_MESSAGE, AuthBoundaryError, assertProtectedResponseCurrent,
-  bootstrapAuth, getAuthState, logoutAuth, protectedFetch, readProtectedJson, reloadSignIn, signIn, subscribeAuth } from './auth'
+  bootstrapAuth, getAuthState, logoutAuth, protectedFetch, readProtectedBlob, readProtectedJson, reloadSignIn, signIn, subscribeAuth } from './auth'
 
 const userA = '4b12df9e-1dbe-418e-b5c1-82b720211d82'
 const userB = '144b50e1-0183-428c-943f-1850df006b66'
@@ -151,7 +151,7 @@ test.each([[401, 'signed_out'], [403, 'stale']] as const)(
   },
 )
 
-test.each(['/api/sessions', '/api/sessions/A/questions/0/attempts/1/diagnosis', '/api/history/summaries'])(
+test.each(['/api/sessions', '/api/sessions/A/questions/0/attempts/1/diagnosis', '/api/sessions/A/questions/0/speech', '/api/history/summaries'])(
   'authentication 503 on %s preserves exact auth generation and reports unavailability without replay', async (path) => {
     const mock = await authenticate()
     const before = getAuthState()
@@ -357,6 +357,54 @@ test.each(['success', 'parse failure'] as const)('late A body %s cannot populate
   expect(await pending).toBeInstanceOf(AuthBoundaryError)
   expect(getAuthState()).toEqual(newer)
   expect(() => assertProtectedResponseCurrent(owned)).toThrow(AuthBoundaryError)
+})
+
+test('protected binary reading retains exact response ownership without another request', async () => {
+  const mock = await authenticate()
+  const response = new Response('MP3 audio', { headers: { 'Content-Type': 'audio/mpeg' } })
+  mock.mockResolvedValue(response)
+  const owned = await protectedFetch('/api/sessions/A/questions/0/speech', { method: 'POST' })
+  const audio = await readProtectedBlob(owned)
+  expect(audio.size).toBe(9)
+  expect(audio.type).toBe('audio/mpeg')
+  expect(mock).toHaveBeenCalledTimes(1)
+  expect(mock.mock.calls[0][1]).toMatchObject({ credentials: 'same-origin', cache: 'no-store', method: 'POST' })
+  expect(new Headers(mock.mock.calls[0][1].headers).get(AUTH_CONTEXT_HEADER)).toBe('context-A')
+  await expect(readProtectedBlob(new Response('unowned'))).rejects.toBeInstanceOf(AuthBoundaryError)
+})
+
+test.each(['success', 'body failure'] as const)('late A binary %s cannot cross into B', async (outcome) => {
+  const mock = await authenticate()
+  const body = deferred<Blob>()
+  const response = new Response('MP3 audio', { headers: { 'Content-Type': 'audio/mpeg' } })
+  vi.spyOn(response, 'blob').mockReturnValue(body.promise)
+  mock.mockResolvedValueOnce(response).mockResolvedValueOnce(json({ user_id: userB, request_context: 'context-B' }))
+  const owned = await protectedFetch('/api/sessions/A/questions/0/speech', { method: 'POST' })
+  const pending = readProtectedBlob(owned).catch((cause: unknown) => cause)
+  await bootstrapAuth()
+  const newer = getAuthState()
+  if (outcome === 'success') body.resolve(new Blob(['private A audio']))
+  else body.reject(new Error('private binary transport detail'))
+  expect(await pending).toBeInstanceOf(AuthBoundaryError)
+  expect(getAuthState()).toEqual(newer)
+  expect(mock).toHaveBeenCalledTimes(2)
+})
+
+test.each(['success', 'body failure'] as const)('cancelled binary %s is discarded after headers resolve', async (outcome) => {
+  const mock = await authenticate()
+  const controller = new AbortController()
+  const body = deferred<Blob>()
+  const response = new Response('MP3 audio', { headers: { 'Content-Type': 'audio/mpeg' } })
+  vi.spyOn(response, 'blob').mockReturnValue(body.promise)
+  mock.mockResolvedValue(response)
+  const owned = await protectedFetch('/api/sessions/A/questions/0/speech', { method: 'POST', signal: controller.signal })
+  const pending = readProtectedBlob(owned).catch((cause: unknown) => cause)
+  controller.abort()
+  if (outcome === 'success') body.resolve(new Blob(['late audio']))
+  else body.reject(new Error('private binary transport detail'))
+  expect(await pending).toMatchObject({ name: 'AbortError' })
+  expect(getAuthState().status).toBe('authenticated')
+  expect(mock).toHaveBeenCalledTimes(1)
 })
 
 test.each(['success', 'failure'] as const)('older bootstrap %s never overwrites newer identity', async (outcome) => {

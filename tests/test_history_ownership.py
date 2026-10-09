@@ -777,6 +777,7 @@ def test_all_persisted_routes_require_authentication_and_health_remains_public(m
         ("/api/sessions/{session_id}/questions/{question_index}/attempts", "POST"),
         ("/api/sessions/{session_id}/questions/{question_index}/attempts", "GET"),
         ("/api/sessions/{session_id}/questions/{question_index}/continue", "POST"),
+        ("/api/sessions/{session_id}/questions/{question_index}/speech", "POST"),
         ("/api/sessions/{session_id}/questions/{question_index}/comparison", "GET"),
         ("/api/sessions/{session_id}/questions/{question_index}/attempts/{attempt_number}/diagnosis", "POST"),
         ("/api/sessions/{session_id}/audio", "POST"),
@@ -821,7 +822,7 @@ def test_all_persisted_routes_require_authentication_and_health_remains_public(m
             assert auth_http.get_auth_session_store in calls
     assert observed == expected
     assert len(health_routes) == 1
-    assert len(data_routes) == 12
+    assert len(data_routes) == 13
     history = [route for route in data_routes if route.path == "/api/history/summaries" or route.path.endswith("/history-detail")]
     assert len(history) == 3
     assert {method for route in history if route.path == "/api/history/summaries" for method in route.methods} == {"GET", "POST"}

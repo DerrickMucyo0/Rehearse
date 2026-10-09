@@ -1,12 +1,15 @@
-import { assertProtectedResponseCurrent, isAuthBoundaryError, protectedFetch, readProtectedJson } from './auth'
+import { assertProtectedResponseCurrent, isAuthBoundaryError, protectedFetch, readProtectedBlob, readProtectedJson } from './auth'
 import { DELIVERY_TIMING_REASONS, validLiveDeliveryMetrics } from './deliveryMetrics'
 import type { DeliveryMetrics, DeliveryTimingReason } from './deliveryMetrics'
 import { isScenarioType } from './scenarios'
 import type { ScenarioType } from './scenarios'
+import { isInterviewerPersonaId } from './interviewerPersonas'
+import type { InterviewerPersonaId } from './interviewerPersonas'
 
 export interface InterviewSession {
   id: string
   scenario_type: ScenarioType
+  interviewer_persona_id?: InterviewerPersonaId | null
   question_engine: QuestionEngine
   total_questions: 5
   status: 'active' | 'completed'
@@ -136,6 +139,16 @@ export class SemanticDiagnosisError extends Error {
   }
 }
 
+export class VoicePlaybackError extends Error {
+  readonly status: number | null
+
+  constructor(status: number | null = null) {
+    super('Voice playback is unavailable right now.')
+    this.name = 'VoicePlaybackError'
+    this.status = status
+  }
+}
+
 export class RoleplayUnavailableError extends ApiError {
   constructor() {
     super('Interviewer is unavailable right now. Try Continue again.', 503)
@@ -159,6 +172,7 @@ function nullableString(value: unknown): value is string | null {
 function validSession(value: unknown): value is InterviewSession {
   if (!(object(value) && typeof value.id === 'string' &&
     isScenarioType(value.scenario_type) && isQuestionEngine(value.question_engine) && value.total_questions === 5 &&
+    (!Object.hasOwn(value, 'interviewer_persona_id') || value.interviewer_persona_id === null || isInterviewerPersonaId(value.interviewer_persona_id)) &&
     (value.status === 'active' || value.status === 'completed') &&
     nonnegativeInteger(value.current_question_index) && nullableString(value.current_question) &&
     nonnegativeInteger(value.current_question_latest_attempt_number) &&
@@ -232,9 +246,14 @@ export function getSession(id: string): Promise<InterviewSession> {
   return request(`/api/sessions/${id}`, (value): value is InterviewSession => validSession(value) && value.id === id)
 }
 
-export function startInterview(scenarioType: ScenarioType = 'job_interview'): Promise<InterviewSession> {
+export function startInterview(
+  scenarioType: ScenarioType = 'job_interview', interviewerPersonaId: InterviewerPersonaId = 'recruiter',
+): Promise<InterviewSession> {
   if (!isScenarioType(scenarioType)) return Promise.reject(new ApiError('The request was not accepted. Choose a practice scenario.', 422))
-  return request('/api/sessions', validSession, jsonBody({ scenario_type: scenarioType }))
+  if (!isInterviewerPersonaId(interviewerPersonaId)) return Promise.reject(new ApiError('Choose a valid interviewer.', 422))
+  return request('/api/sessions', (value): value is InterviewSession =>
+    validSession(value) && value.interviewer_persona_id === interviewerPersonaId,
+  jsonBody({ scenario_type: scenarioType, interviewer_persona_id: interviewerPersonaId }))
 }
 
 export function submitAttempt(session: InterviewSession, answer: string, measurementId: string | null = null): Promise<AttemptSubmission> {
@@ -242,6 +261,7 @@ export function submitAttempt(session: InterviewSession, answer: string, measure
     object(value) && validAttempt(value.attempt) && validSession(value.session) &&
     value.session.id === session.id && value.session.current_question_index === session.current_question_index &&
     value.session.question_engine === session.question_engine && value.session.scenario_type === session.scenario_type &&
+    value.session.interviewer_persona_id === session.interviewer_persona_id &&
     value.session.questions.length === session.questions.length && value.session.questions.every((text, index) => text === session.questions[index]) &&
     value.session.answers.length === session.answers.length && value.session.answers.every((text, index) => text === session.answers[index]) &&
     value.attempt.question_index === session.current_question_index &&
@@ -256,6 +276,7 @@ export function continueQuestion(session: InterviewSession, signal?: AbortSignal
   return request(`${questionPath(session)}/continue`, (value): value is InterviewSession =>
     validSession(value) && value.id === session.id && value.current_question_index === session.current_question_index + 1 &&
     value.question_engine === session.question_engine && value.scenario_type === session.scenario_type &&
+    value.interviewer_persona_id === session.interviewer_persona_id &&
     value.current_question_latest_attempt_number === 0 &&
     value.questions.length === session.questions.length + Number(generates) &&
     session.questions.every((text, index) => value.questions[index] === text) &&
@@ -280,6 +301,46 @@ function validSemanticDiagnosis(value: unknown): value is SemanticDiagnosis {
 }
 
 const SEMANTIC_DIAGNOSIS_TIMEOUT_MS = 135_000
+
+const QUESTION_SPEECH_TIMEOUT_MS = 75_000
+const MAX_QUESTION_SPEECH_BYTES = 2 * 1024 * 1024
+
+export async function requestQuestionSpeech(
+  sessionId: string,
+  questionIndex: number,
+  signal: AbortSignal,
+): Promise<Blob> {
+  const timeout = AbortSignal.timeout(QUESTION_SPEECH_TIMEOUT_MS)
+  const checkCancellation = () => {
+    if (signal.aborted) throw new DOMException('Voice request cancelled.', 'AbortError')
+    if (timeout.aborted) throw new VoicePlaybackError()
+  }
+  checkCancellation()
+  let response: Response
+  try {
+    // This POST reads synthesized speech; it is not a persisted interview write.
+    response = await protectedFetch(`/api/sessions/${sessionId}/questions/${questionIndex}/speech`, {
+      method: 'POST', signal: AbortSignal.any([signal, timeout]),
+    })
+  } catch (error) {
+    if (isAuthBoundaryError(error)) throw error
+    checkCancellation()
+    throw new VoicePlaybackError()
+  }
+  checkCancellation()
+  assertProtectedResponseCurrent(response)
+  const mediaType = response.headers.get('Content-Type')?.split(';')[0].trim().toLowerCase()
+  if (response.status !== 200 || mediaType !== 'audio/mpeg') throw new VoicePlaybackError(response.status)
+  let audio: Blob
+  try { audio = await readProtectedBlob(response) } catch (error) {
+    if (isAuthBoundaryError(error)) throw error
+    checkCancellation()
+    throw new VoicePlaybackError(response.status)
+  }
+  checkCancellation()
+  if (audio.size === 0 || audio.size > MAX_QUESTION_SPEECH_BYTES) throw new VoicePlaybackError(response.status)
+  return audio
+}
 
 export async function getSemanticDiagnosis(
   sessionId: string,

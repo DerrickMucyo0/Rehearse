@@ -46,8 +46,13 @@ function Workspace({ auth }: { auth: AuthenticatedState }) {
     }
   }
 
-  return <>
-    <button type="button" onClick={() => void logout()} disabled={logoutBusy}>{logoutBusy ? 'Signing out…' : 'Logout'}</button>
+  return <section className="workspace" aria-label="Rehearse workspace">
+    <div className="workspace-toolbar">
+      <p className="workspace-label"><span className="status-dot" /> Your practice space</p>
+      <button className="logout-button" type="button" onClick={() => void logout()} disabled={logoutBusy}>
+        {logoutBusy ? 'Signing out…' : 'Log out'}
+      </button>
+    </div>
     {auth.notice && <p role="alert">{auth.notice}</p>}
     {logoutError && <p role="alert">{logoutError}</p>}
     <nav className="app-nav" aria-label="Main navigation">
@@ -59,10 +64,10 @@ function Workspace({ auth }: { auth: AuthenticatedState }) {
         </button>
       ))}
     </nav>
-    {practiceBusy && <p role="status">Finish the current Practice operation before navigating.</p>}
+    {practiceBusy && <p className="navigation-notice" role="status">Finish the current Practice operation before navigating.</p>}
     {/* Idle drafts remain mounted only within this authenticated workspace. */}
     <div id="practice-panel" hidden={section !== 'practice'}>
-      <Interview onNavigationBusyChange={updateNavigationLock} onHistoryFactsChange={invalidateHistory} />
+      <Interview active={section === 'practice'} onNavigationBusyChange={updateNavigationLock} onHistoryFactsChange={invalidateHistory} />
     </div>
     {section === 'history' && <div id="history-panel">
       <History hydration={hydration} onPractice={() => navigate('practice')} />
@@ -71,7 +76,7 @@ function Workspace({ auth }: { auth: AuthenticatedState }) {
       <ProgressDashboard history={hydration.history} onRetry={hydration.retry} onReload={hydration.reload}
         onLoadMore={hydration.loadMore} onPractice={() => navigate('practice')} />
     </div>}
-  </>
+  </section>
 }
 
 export default function App() {
@@ -103,9 +108,20 @@ export default function App() {
     return () => { active = false; window.clearTimeout(timeout); controller.abort() }
   }, [])
 
-  return <main>
-    <h1>Rehearse</h1>
-    <p>Practice. Diagnose. Drill. Improve.</p>
+  return <div className="app-page" id="top">
+    <header className="site-header">
+      <a className="brand" href="#top" aria-label="Rehearse home">
+        <span className="brand-mark" aria-hidden="true">R</span>
+        <span>Rehearse</span>
+      </a>
+      <span className="header-note">A calmer way to practice the hard moments</span>
+    </header>
+    <main className="app-main">
+      <section className="app-intro" aria-labelledby="app-title">
+        <p className="eyebrow">COMMUNICATION PRACTICE</p>
+        <h1 id="app-title">Practice. Diagnose. Drill. Improve.</h1>
+        <p className="intro-copy">Build confidence for interviews, presentations, thesis defenses, and important conversations.</p>
+      </section>
     {(!bootstrapped || auth.status === 'loading') && <p role="status">Checking sign-in…</p>}
     {bootstrapped && auth.status === 'signed_out' && <section aria-label="Sign in">
       <p>Sign in to practice and view your history.</p>
@@ -120,6 +136,10 @@ export default function App() {
       <button type="button" onClick={() => void bootstrapAuth()}>Try again</button>
     </section>}
     {bootstrapped && auth.status === 'authenticated' && <Workspace key={auth.generation} auth={auth} />}
-    <p className="backend-status" role="status">{status}</p>
-  </main>
+    </main>
+    <footer className="site-footer">
+      <span>Private practice, at your pace</span>
+      <p className="backend-status" role="status">{status}</p>
+    </footer>
+  </div>
 }

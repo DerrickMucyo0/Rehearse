@@ -9,6 +9,7 @@ from pydantic import (
     model_validator,
 )
 
+from app.interviewer_personas import InterviewerPersonaId
 from app.scenarios import ScenarioType
 
 QuestionEngine = Literal["deterministic-v1", "live-ai-roleplay-v1"]
@@ -74,8 +75,9 @@ class RoleplayContext(BaseModel):
 
     model_config = ConfigDict(strict=True, extra="forbid", frozen=True)
 
-    context_version: Literal["roleplay-context-v1"] = "roleplay-context-v1"
+    context_version: Literal["roleplay-context-v2"] = "roleplay-context-v2"
     scenario_type: ScenarioType
+    interviewer_persona_id: InterviewerPersonaId = "recruiter"
     next_question_number: Annotated[int, Field(strict=True, ge=2, le=5)]
     turns: Annotated[tuple[RoleplayTurn, ...], Field(min_length=1, max_length=4)]
 

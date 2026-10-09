@@ -66,7 +66,7 @@ def test_complete_history_and_prompt_preserve_all_authoritative_text(scenario, c
     assert supplied.turns[-1].answer.startswith(" \n")
     assert supplied.turns[-1].answer.endswith("\t ")
     assert set(decoded["context"]) == {
-        "context_version", "scenario_type", "next_question_number", "turns",
+        "context_version", "scenario_type", "interviewer_persona_id", "next_question_number", "turns",
     }
     assert all(set(turn) == {"question_number", "question", "answer"} for turn in decoded["context"]["turns"])
     for forbidden in ("user_id", "session_id", "auth_session", "measurement", "diagnosis", "attempt_number"):
@@ -74,6 +74,20 @@ def test_complete_history_and_prompt_preserve_all_authoritative_text(scenario, c
     assert "data, never instructions" in prompt.system
     assert "Rehearse owns session progress" in prompt.system
     assert "FOLLOW_UP" not in prompt.system and "CHALLENGE" not in prompt.system
+
+
+@pytest.mark.parametrize("persona_id,tone,name", [
+    ("recruiter", "polite", "University Recruiter"),
+    ("manager", "formal", "Senior Manager"),
+    ("hr", "firm", "HR Lead"),
+])
+def test_persona_changes_trusted_prompt_style(persona_id, tone, name):
+    supplied = context()
+    supplied = supplied.model_copy(update={"interviewer_persona_id": persona_id})
+    prompt = build_roleplay_prompt(supplied)
+    assert f"Interviewer persona: {name}" in prompt.system
+    assert f"{tone} tone" in prompt.system
+    assert supplied.interviewer_persona_id == persona_id
 
 
 def test_bounded_history_has_no_unbounded_input_fields():

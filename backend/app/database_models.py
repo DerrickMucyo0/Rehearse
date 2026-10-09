@@ -19,6 +19,7 @@ from sqlalchemy.types import TypeDecorator
 
 from app.scenarios import ScenarioType, questions_for_scenario
 from app.roleplay import QuestionEngine
+from app.interviewer_personas import InterviewerPersonaId, persona_for
 
 MEASUREMENT_VERSION = "speaking-metrics-v1"
 UNLINKED_MEASUREMENT_RETENTION = timedelta(hours=24)
@@ -179,6 +180,10 @@ class StoredInterviewSession(Base):
             name="ck_sessions_question_engine",
         ),
         CheckConstraint(
+            "interviewer_persona_id IS NULL OR interviewer_persona_id IN ('recruiter', 'manager', 'hr')",
+            name="ck_sessions_interviewer_persona",
+        ),
+        CheckConstraint(
             "CASE WHEN jsonb_typeof(questions) = 'array' "
             "THEN ((question_engine = 'deterministic-v1' AND jsonb_array_length(questions) = 5) OR "
             "(question_engine = 'live-ai-roleplay-v1' AND jsonb_array_length(questions) BETWEEN 1 AND 5)) "
@@ -218,6 +223,9 @@ class StoredInterviewSession(Base):
     scenario_type: Mapped[ScenarioType] = mapped_column(
         Text(collation="C"), nullable=False, default="job_interview", server_default="job_interview",
     )
+    interviewer_persona_id: Mapped[InterviewerPersonaId | None] = mapped_column(
+        Text(collation="C"), nullable=True,
+    )
     current_question_index: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
     status: Mapped[str] = mapped_column(Text, default="active", server_default="active")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
@@ -239,6 +247,12 @@ class StoredInterviewSession(Base):
     @validates("scenario_type")
     def validate_scenario_type(self, key, value):
         questions_for_scenario(value)
+        return value
+
+    @validates("interviewer_persona_id")
+    def validate_interviewer_persona_id(self, key, value):
+        if value is not None:
+            persona_for(value)
         return value
 
 

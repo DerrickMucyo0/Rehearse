@@ -1,5 +1,5 @@
-import { useId } from 'react'
-import type { AttemptComparison as Comparison, ComparisonMetrics, DeliveryComparison, DeliverySideReason, MetricChange } from './interviewApi'
+import { useEffect, useId, useState } from 'react'
+import type { Attempt, AttemptComparison as Comparison, ComparisonMetrics, DeliveryComparison, DeliverySideReason, MetricChange } from './interviewApi'
 import { deliveryUnavailableText, formatDeliveryDuration, TIMED_PAUSES_EXPLANATION, TIMED_PAUSES_LIMITATION } from './deliveryMetrics'
 
 type SideReason = NonNullable<MetricChange['before_unavailable_reason']>
@@ -30,6 +30,7 @@ const metrics: { key: keyof ComparisonMetrics; label: string; decimals: 0 | 1 }[
   { key: 'timed_utterance_span_seconds', label: 'Speaking duration', decimals: 1 },
   { key: 'estimated_words_per_minute', label: 'Words per minute', decimals: 1 },
 ]
+const noAttempts: Attempt[] = []
 
 function formatValue(value: number, decimals: 0 | 1): string {
   return value.toFixed(decimals)
@@ -72,10 +73,38 @@ function deliveryDelta(value: number, duration: boolean): string {
   return `${value > 0 ? '+' : '-'}${duration ? formatDeliveryDuration(Math.abs(value)) : Math.abs(value)}`
 }
 
-export default function AttemptComparison({ comparison }: { comparison: Comparison }) {
+interface Props {
+  comparison: Comparison
+  attempts?: Attempt[]
+  onCompare?: (before: number, after: number) => void
+  isLoading?: boolean
+  error?: string
+}
+
+export default function AttemptComparison({ comparison, attempts = noAttempts, onCompare, isLoading = false, error = '' }: Props) {
   const headingId = useId()
   const data = comparison.comparison
+  const [beforeAttemptNumber, setBeforeAttemptNumber] = useState<number | null>(
+    comparison.before_attempt?.attempt_number ?? attempts[0]?.attempt_number ?? null,
+  )
+  const [afterAttemptNumber, setAfterAttemptNumber] = useState<number | null>(
+    comparison.after_attempt?.attempt_number ?? attempts.at(-1)?.attempt_number ?? null,
+  )
+
+  useEffect(() => {
+    setBeforeAttemptNumber(comparison.before_attempt?.attempt_number ?? attempts[0]?.attempt_number ?? null)
+    setAfterAttemptNumber(comparison.after_attempt?.attempt_number ?? attempts.at(-1)?.attempt_number ?? null)
+  }, [comparison.before_attempt?.attempt_number, comparison.after_attempt?.attempt_number, attempts])
+
   if (data === null) return null
+
+  const beforeOptions = attempts.filter((attempt) => afterAttemptNumber !== null && attempt.attempt_number < afterAttemptNumber)
+  const afterOptions = attempts.filter((attempt) => beforeAttemptNumber !== null && attempt.attempt_number > beforeAttemptNumber)
+  const hasValidSelection = beforeAttemptNumber !== null && afterAttemptNumber !== null && beforeAttemptNumber < afterAttemptNumber
+  const selectionChanged = hasValidSelection && (
+    beforeAttemptNumber !== comparison.before_attempt?.attempt_number ||
+    afterAttemptNumber !== comparison.after_attempt?.attempt_number
+  )
 
   return <section className="attempt-comparison" aria-labelledby={headingId}>
     <h3 id={headingId}>Before / After comparison</h3>
@@ -83,6 +112,37 @@ export default function AttemptComparison({ comparison }: { comparison: Comparis
       Before: Attempt {comparison.before_attempt?.attempt_number}.
       {' '}After: Attempt {comparison.after_attempt?.attempt_number}.
     </p>
+    {onCompare && attempts.length > 1 && <div className="comparison-controls" aria-busy={isLoading}>
+      <fieldset disabled={isLoading}>
+        <legend>Choose attempts to compare</legend>
+        <div className="comparison-selects">
+          <label htmlFor={`${headingId}-before`}>Before attempt
+            <select id={`${headingId}-before`} value={beforeAttemptNumber ?? ''}
+              onChange={(event) => setBeforeAttemptNumber(Number(event.target.value))}>
+              {beforeOptions.map((attempt) => <option key={attempt.id} value={attempt.attempt_number}>
+                Attempt {attempt.attempt_number}{attempt.measurement_id ? ' (speaking metrics available)' : ' (no speaking measurement)'}
+              </option>)}
+            </select>
+          </label>
+          <label htmlFor={`${headingId}-after`}>After attempt
+            <select id={`${headingId}-after`} value={afterAttemptNumber ?? ''}
+              onChange={(event) => setAfterAttemptNumber(Number(event.target.value))}>
+              {afterOptions.map((attempt) => <option key={attempt.id} value={attempt.attempt_number}>
+                Attempt {attempt.attempt_number}{attempt.measurement_id ? ' (speaking metrics available)' : ' (no speaking measurement)'}
+              </option>)}
+            </select>
+          </label>
+        </div>
+      </fieldset>
+      <button type="button" onClick={() => {
+        if (beforeAttemptNumber !== null && afterAttemptNumber !== null && beforeAttemptNumber < afterAttemptNumber) {
+          onCompare(beforeAttemptNumber, afterAttemptNumber)
+        }
+      }} disabled={!selectionChanged || isLoading || !hasValidSelection}>
+        {isLoading ? 'Comparing…' : 'Compare attempts'}
+      </button>
+      {error && <p role="alert">{error}</p>}
+    </div>}
     <table className="comparison-table">
       <caption>Speaking duration is shown in seconds.</caption>
       <thead><tr>
